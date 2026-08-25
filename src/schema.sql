@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS patchsets (
     to_recipients TEXT,
     cc_recipients TEXT,
     baseline_id INTEGER,
+    baseline_part_index INTEGER, -- part that supplied baseline_id; NULL if unknown
     model_name TEXT,
+    mr_url TEXT,
+    mr_title TEXT,
+    mr_number INTEGER,
     prompts_git_hash TEXT,
     baseline_logs TEXT,
     failed_reason TEXT,
@@ -80,6 +84,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     target_review_count INTEGER DEFAULT 1,
     provider TEXT,
     embargo_until INTEGER,
+    embargo_release_started_at INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
@@ -92,11 +97,15 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
 CREATE TABLE IF NOT EXISTS patches (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER NOT NULL,
-    message_id TEXT NOT NULL UNIQUE,
+    message_id TEXT NOT NULL,
     part_index INTEGER,
     diff TEXT,
+    status TEXT,
+    apply_error TEXT,
+    git_patch_id TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
-    FOREIGN KEY(message_id) REFERENCES messages(message_id)
+    FOREIGN KEY(message_id) REFERENCES messages(message_id),
+    UNIQUE(patchset_id, message_id)
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
@@ -184,6 +193,7 @@ CREATE INDEX IF NOT EXISTS idx_patchsets_cover_message_id ON patchsets(cover_let
 
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_patches_patchset_id ON patches(patchset_id);
+CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id ON patches(git_patch_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 
 CREATE INDEX IF NOT EXISTS idx_messages_day ON messages(strftime('%Y-%m-%d', date, 'unixepoch'));
@@ -271,3 +281,5 @@ CREATE TABLE IF NOT EXISTS patchwork_outbox (
 CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(status);
 
 
+CREATE INDEX IF NOT EXISTS idx_reviews_patch_status ON reviews(patch_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL;
