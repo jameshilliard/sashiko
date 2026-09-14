@@ -4,6 +4,15 @@ kind: Component
 # ENVIRONMENT-SPECIFIC CONFIGURATION EXAMPLE
 # Copy this to 'kustomization.yaml' and modify IDs.
 # This file is ignored by git.
+#
+# The base manifest expects a 'sashiko-secrets' Secret in the sashiko
+# namespace holding LLM_API_KEY and SASHIKO__SERVER__JWT_SECRET; a container
+# referencing a missing key never starts. Generate the latter once and keep
+# it, because replacing it invalidates every session and sign-in link:
+#
+#   SECRET=$(openssl rand -hex 32)
+#   kubectl -n sashiko patch secret sashiko-secrets --type=merge \
+#     -p "{\"stringData\":{\"SASHIKO__SERVER__JWT_SECRET\":\"$SECRET\"}}"
 
 patches:
   # 1. Deployment: Update image

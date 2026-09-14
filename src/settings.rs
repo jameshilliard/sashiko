@@ -16,7 +16,14 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// The name of the file holding the server's local operator token.
+///
+/// The leading dot keeps it out of a casual listing of the state directory,
+/// which is where an operator would otherwise be tempted to copy it from.
+pub const LOCAL_TOKEN_FILE_NAME: &str = ".sashiko-local-token";
+
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SubsystemMapping {
     pub pattern: String,
@@ -24,6 +31,7 @@ pub struct SubsystemMapping {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SubsystemsSettings {
     #[serde(default)]
@@ -31,15 +39,33 @@ pub struct SubsystemsSettings {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ProjectSettings {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub attribution: Option<String>,
+}
+
+impl ProjectSettings {
+    pub fn attribution(&self) -> &str {
+        if let Some(ref attr) = self.attribution {
+            attr.as_str()
+        } else if !self.domain.is_empty() {
+            self.domain.as_str()
+        } else {
+            "sashiko"
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ForgeSettings {
     #[serde(default)]
@@ -56,6 +82,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct DatabaseSettings {
     pub url: String,
@@ -63,6 +90,7 @@ pub struct DatabaseSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct NntpSettings {
     pub server: String,
@@ -70,6 +98,7 @@ pub struct NntpSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct SmtpSettings {
     pub server: String,
@@ -87,12 +116,23 @@ fn default_dry_run() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct MailingListsSettings {
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     pub track: Vec<String>,
 }
 
+/// Reads a list written either as a TOML array or as one comma separated
+/// string.
+///
+/// The second form exists for the environment, which has no arrays: a
+/// deployment that sets a list through SASHIKO__* would otherwise fail to
+/// start with "invalid type: string, expected a sequence", and its only
+/// recourse would be to bake the value into Settings.toml.
+///
+/// Empty entries are dropped, so a trailing comma and an empty variable both
+/// mean what they look like rather than naming a list with a blank member.
 fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -137,6 +177,7 @@ fn default_max_input_tokens() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ClaudeSettings {
     #[serde(default = "default_prompt_caching")]
@@ -156,6 +197,7 @@ fn default_claude_max_tokens() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GeminiSettings {
     #[serde(default)]
@@ -164,6 +206,7 @@ pub struct GeminiSettings {
 
 #[cfg(feature = "bedrock")]
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct BedrockSettings {
     /// AWS region for Bedrock API calls (e.g. "us-east-1").
@@ -195,6 +238,7 @@ fn default_prompt_caching() -> bool {
 
 #[cfg(feature = "vertex")]
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct VertexSettings {
     /// GCP project ID. Falls back to ANTHROPIC_VERTEX_PROJECT_ID env var.
@@ -219,6 +263,7 @@ fn default_vertex_max_tokens() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct OpenAiCompatSettings {
     #[serde(default)]
@@ -230,6 +275,36 @@ pub struct OpenAiCompatSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct VllmSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Should match the server-side `--max-model-len`.
+    #[serde(default)]
+    pub context_window_size: Option<usize>,
+    /// Completion token limit. Leave unset to let vLLM generate up to the
+    /// remaining context (`max_model_len - prompt_tokens`).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Enable or disable thinking for reasoning models (e.g. Qwen3) via
+    /// `chat_template_kwargs`. Leave unset for the model default.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Enforce JSON responses with guided decoding (`response_format`).
+    /// Disabled by default because not every vLLM backend supports it;
+    /// without it the JSON requirement is injected into the system prompt.
+    #[serde(default)]
+    pub guided_json: bool,
+    /// Forward tool definitions to the server. Disabled by default because a
+    /// server started without `--enable-auto-tool-choice` and
+    /// `--tool-call-parser` rejects requests carrying tools with HTTP 400.
+    #[serde(default)]
+    pub enable_tools: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct OllamaSettings {
     #[serde(default)]
@@ -243,6 +318,7 @@ pub struct OllamaSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct KiroCliSettings {
     #[serde(default = "default_kiro_cli_binary")]
@@ -262,6 +338,7 @@ fn default_kiro_cli_context_window() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ClaudeCliSettings {
     /// Effort level passed to `claude --effort`. Valid values per Claude Code:
@@ -271,6 +348,21 @@ pub struct ClaudeCliSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct CodexCliSettings {
+    /// Reasoning effort passed as `codex exec -c model_reasoning_effort=<v>`.
+    /// Valid values: "none", "minimal", "low", "medium", "high", "xhigh",
+    /// "max". Leave unset for the account default. A `-c` override outranks
+    /// `~/.codex/config.toml`, but not an enterprise-managed requirements
+    /// layer, which substitutes its own value whatever the origin. A run
+    /// whose effort that layer substitutes fails.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct DevinCliSettings {
     /// Path to a Devin declarative agent config file (JSON or YAML) passed via
@@ -286,6 +378,7 @@ pub struct DevinCliSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
@@ -317,8 +410,10 @@ pub struct AiSettings {
     pub vertex: Option<VertexSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
     pub ollama: Option<OllamaSettings>,
+    pub vllm: Option<VllmSettings>,
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
+    pub codex_cli: Option<CodexCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,
 }
 
@@ -338,16 +433,209 @@ fn default_max_interactions() -> usize {
     100
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Ingest,
+    Cancel,
+    Review,
+}
+
+impl Permission {
+    /// Whether a caller holding the server's local token may exercise this
+    /// capability without presenting an identity.
+    ///
+    /// The token exists so a developer running the server can drive it without
+    /// configuring a JWT secret, and it is tolerable only where the blast
+    /// radius is that local instance. Authority over a Linux kernel bug is
+    /// deliberately not a Permission: it is resolved per bug by BugPrincipal,
+    /// which never reaches this path, so no amount of local access opens the
+    /// bug database.
+    ///
+    /// The match is exhaustive rather than defaulted so that a capability
+    /// added later is not reachable until someone writes it down here.
+    pub fn granted_by_local_token(self) -> bool {
+        match self {
+            Permission::Ingest => true,
+            Permission::Cancel => true,
+            Permission::Review => true,
+        }
+    }
+}
+
+/// Access Control List settings utilizing fine-grained capability endpoints.
+/// By default (if omitted), all vectors are safely initialized empty (Fail-Closed).
+/// Users must explicitly be added to the necessary capability lists to perform mutations.
+/// The `blocklist` explicitly denies all capabilities, overriding any grants.
+///
+/// Every list reads a comma separated string as well as an array, because who
+/// holds a capability is deployment state rather than a property of the
+/// program: an image ships one Settings.toml and each deployment has to be
+/// able to name its own operators through the environment.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct AclSettings {
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub admins: Vec<String>,
+    /// The kernel security list. Reads and comments on every bug, and reads
+    /// the raw analysis transcripts, without gaining any of the capabilities
+    /// below.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub security: Vec<String>,
+    /// Principals allowed to file a bug over HTTP. Empty means only operators
+    /// can, which is the shipped configuration.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub bug_reporters: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub ingest: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub cancel: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub review: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub blocklist: Vec<String>,
+}
+
+/// Matches an address against a capability list.
+///
+/// Both sides are trimmed and compared case insensitively: the list is written
+/// by hand in a configuration file and the address arrives from a sign-in
+/// form, so a stray space on either side must not decide who gets in or,
+/// worse, let a blocklisted address slip past.
+fn list_contains(list: &[String], email: &str) -> bool {
+    let email = email.trim();
+    list.iter().any(|e| e.trim().eq_ignore_ascii_case(email))
+}
+
+impl AclSettings {
+    pub fn is_blocklisted(&self, email: &str) -> bool {
+        list_contains(&self.blocklist, email)
+    }
+
+    /// Whether the address is an operator. Operators are never blocklisted
+    /// implicitly; the caller checks the blocklist first.
+    pub fn is_admin(&self, email: &str) -> bool {
+        list_contains(&self.admins, email)
+    }
+
+    /// Whether the address is on the kernel security list.
+    pub fn is_security(&self, email: &str) -> bool {
+        list_contains(&self.security, email)
+    }
+
+    /// Whether the address may file a bug over HTTP.
+    pub fn is_bug_reporter(&self, email: &str) -> bool {
+        list_contains(&self.bug_reporters, email)
+    }
+
+    /// Whether the address appears in any capability list.
+    ///
+    /// This answers "is this somebody the operator has configured", which is
+    /// the question a sign-in request asks. It deliberately covers every list,
+    /// including the ones that grant nothing beyond bug access, because an
+    /// address that can do something must be able to sign in and do it.
+    pub fn is_known_identity(&self, email: &str) -> bool {
+        !self.is_blocklisted(email)
+            && [
+                &self.admins,
+                &self.security,
+                &self.bug_reporters,
+                &self.ingest,
+                &self.cancel,
+                &self.review,
+            ]
+            .iter()
+            .any(|list| list_contains(list, email))
+    }
+
+    pub fn has_permission(&self, email: &str, perm: Permission) -> bool {
+        if self.is_blocklisted(email) {
+            return false;
+        }
+        if self.is_admin(email) {
+            return true;
+        }
+        match perm {
+            Permission::Ingest => list_contains(&self.ingest, email),
+            Permission::Cancel => list_contains(&self.cancel, email),
+            Permission::Review => list_contains(&self.review, email),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
+    /// The URL the service is reachable at from outside, without a trailing
+    /// slash.
+    ///
+    /// The bind address cannot stand in for this: the shipped host is the
+    /// wildcard "::", which renders a sign-in link nobody can open.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default)]
+    pub testing_mode: bool,
+    pub jwt_secret: Option<String>,
+    /// Prints sign-in links in full to the log.
+    ///
+    /// A sign-in link is a bearer credential, and the log is the one place it
+    /// is read by something other than its recipient: proxies, log shippers and
+    /// anyone with journal access all see it. It is therefore withheld unless
+    /// this is switched on deliberately, which is only reasonable on a
+    /// developer machine with no real users.
+    #[serde(default)]
+    pub log_sign_in_links: bool,
+
+    #[serde(default)]
+    pub acl: AclSettings,
+}
+
+impl ServerSettings {
+    /// The base URL to build a sign-in link on, without a trailing slash.
+    ///
+    /// Falls back to the bind address, which is only good enough when the link
+    /// is written to the log for a local operator to read.
+    pub fn sign_in_base_url(&self) -> String {
+        match self.public_base_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => url.trim_end_matches('/').to_string(),
+            _ => format!("http://{}:{}", self.host, self.port),
+        }
+    }
+}
+
+/// Whether a configured public base URL is usable in a message sent to
+/// somebody else.
+///
+/// A bind address is not: the wildcard forms resolve to whatever interface the
+/// process happens to be listening on, and loopback means nothing to a reader
+/// on another machine.
+fn is_reachable_base_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https") {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    // An IPv6 literal is bracketed, so only a colon outside the brackets
+    // separates the port.
+    let host = match authority.strip_prefix('[') {
+        Some(inside) => inside.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    !matches!(
+        host,
+        "" | "::" | "0.0.0.0" | "*" | "localhost" | "127.0.0.1" | "::1"
+    )
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct CustomRemoteSettings {
     pub name: String,
@@ -357,6 +645,7 @@ pub struct CustomRemoteSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GitSettings {
     pub repository_path: String,
@@ -364,6 +653,7 @@ pub struct GitSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ReviewSettings {
     pub concurrency: usize,
@@ -391,12 +681,8 @@ pub struct ReviewSettings {
     /// Conservative default; set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
-    /// Override the review tool binary path. Not read from config; set programmatically
-    /// (e.g. in tests or via environment).
     #[serde(skip)]
-    pub review_tool_override: Option<std::path::PathBuf>,
-    #[serde(skip)]
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
 }
 
 fn default_max_total_tokens() -> usize {
@@ -432,6 +718,7 @@ fn default_log_level() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct Settings {
     #[serde(default = "default_log_level")]
@@ -468,17 +755,45 @@ fn default_forge() -> ForgeSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewReviewSettings {
-    pub concurrency: Option<usize>,
+    pub concurrency: usize,
+    #[serde(default = "default_review_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
-    pub review: Option<LocalReviewReviewSettings>,
+    pub review: LocalReviewReviewSettings,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         Self::from_file("Settings")
+    }
+
+    /// Refuses a configuration that would mail sign-in links nobody can open.
+    ///
+    /// Without SMTP the link is written to the log for a local operator to
+    /// read, so the base URL is optional. With SMTP it is the only thing
+    /// standing between a maintainer and a dead link, and a deployment that
+    /// fails to start is far kinder than one that silently mails
+    /// http://:::8080/ at three in the morning.
+    pub fn validate_sign_in_delivery(&self) -> Result<(), String> {
+        if self.smtp.is_none() {
+            return Ok(());
+        }
+        match self.server.public_base_url.as_deref() {
+            Some(url) if is_reachable_base_url(url) => Ok(()),
+            Some(url) => Err(format!(
+                "server.public_base_url is {:?}, which names a bind address rather than a host a \
+                 recipient can reach. Set it to the URL the service is served at",
+                url
+            )),
+            None => Err(
+                "server.public_base_url must be set when SMTP is configured, because sign-in \
+                 links are mailed and the bind address does not name a reachable host"
+                    .to_string(),
+            ),
+        }
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -516,6 +831,33 @@ impl Settings {
         }
 
         PathBuf::from(".config/sashiko.toml")
+    }
+
+    /// The file the server writes its local operator token to.
+    ///
+    /// The path is derived rather than configured so that a local tool finds
+    /// the token without being told where to look. The database is the one
+    /// thing every participant already agrees on: a client that reads a
+    /// different Settings.toml than the server would talk to a different
+    /// database too, and is by definition not local to it.
+    ///
+    /// A remote database names no directory, so the token falls back to the
+    /// working directory, which is where the configuration was read from.
+    pub fn local_token_path(&self) -> PathBuf {
+        let url = self.database.url.trim();
+        let dir = if url.contains("://") {
+            Path::new("")
+        } else {
+            Path::new(url).parent().unwrap_or(Path::new(""))
+        };
+
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+
+        dir.join(LOCAL_TOKEN_FILE_NAME)
     }
 
     pub fn local_review() -> Result<Self, ConfigError> {
@@ -557,6 +899,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_production_settings_is_valid() {
+        let path = "Settings.toml";
+        if Path::new(path).exists() {
+            let _ = Settings::from_file("Settings")
+                .expect("Production 'Settings.toml' failed to parse");
+        }
+    }
+
+    #[test]
+    fn test_project_settings_attribution_and_domain() {
+        let default_proj = ProjectSettings::default();
+        assert_eq!(default_proj.domain, "");
+        assert_eq!(default_proj.attribution(), "sashiko");
+
+        let toml_default: ProjectSettings = toml::from_str("name = \"Test\"").unwrap();
+        assert_eq!(toml_default.domain, "");
+        assert_eq!(toml_default.attribution(), "sashiko");
+
+        let toml_domain: ProjectSettings = toml::from_str("domain = \"sashiko.dev\"").unwrap();
+        assert_eq!(toml_domain.domain, "sashiko.dev");
+        assert_eq!(toml_domain.attribution(), "sashiko.dev");
+
+        let toml_attr: ProjectSettings =
+            toml::from_str("domain = \"custom.org\"\nattribution = \"custom-team\"").unwrap();
+        assert_eq!(toml_attr.attribution(), "custom-team");
+    }
+
+    /// concurrency is required for local reviews exactly as it is for the
+    /// daemon, so an absent [review] section is an error rather than a guess
+    /// at how much machine the review has to itself.
+    #[test]
+    fn test_local_review_requires_a_review_section() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let ai = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n";
+
+        std::fs::write(&path, ai).unwrap();
+        assert!(Settings::local_review_from_file(&path).is_err());
+
+        std::fs::write(&path, format!("{}\n[review]\nconcurrency = 8\n", ai)).unwrap();
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.review.concurrency, 8);
+        // timeout_seconds keeps a default, as it does for the daemon.
+        assert_eq!(settings.review.timeout_seconds, 3600);
+    }
+
+    /// `sashiko init` writes this template, so it has to satisfy the shape a
+    /// local review reads or the two commands disagree out of the box.
+    #[test]
+    fn test_init_template_satisfies_local_review() {
+        Settings::local_review_from_file("docs/examples/Settings.example.toml")
+            .expect("init template must parse as local review settings");
+    }
+
+    #[test]
     fn test_local_review_path_prefers_current_directory() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("Settings.toml"), "").unwrap();
@@ -586,5 +983,304 @@ mod tests {
                 std::env::remove_var("XDG_CONFIG_HOME");
             }
         }
+    }
+
+    #[test]
+    fn test_acl_default_fails_closed() {
+        let acl = AclSettings::default();
+        let email = "user@example.com";
+        assert!(!acl.is_blocklisted(email));
+        assert!(!acl.has_permission(email, Permission::Ingest));
+        assert!(!acl.has_permission(email, Permission::Cancel));
+        assert!(!acl.has_permission(email, Permission::Review));
+    }
+
+    #[test]
+    fn test_acl_admin_grants_all_permissions() {
+        let acl = AclSettings {
+            admins: vec!["admin@example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.has_permission("admin@example.com", Permission::Ingest));
+        assert!(acl.has_permission("admin@example.com", Permission::Cancel));
+        assert!(acl.has_permission("admin@example.com", Permission::Review));
+    }
+
+    #[test]
+    fn test_acl_granular_capabilities() {
+        let acl = AclSettings {
+            ingest: vec!["bot@example.com".to_string()],
+            cancel: vec!["cron@example.com".to_string()],
+            review: vec!["reviewer@example.com".to_string()],
+            ..Default::default()
+        };
+
+        assert!(acl.has_permission("bot@example.com", Permission::Ingest));
+        assert!(!acl.has_permission("bot@example.com", Permission::Cancel));
+        assert!(!acl.has_permission("bot@example.com", Permission::Review));
+
+        assert!(acl.has_permission("reviewer@example.com", Permission::Review));
+        assert!(!acl.has_permission("reviewer@example.com", Permission::Ingest));
+    }
+
+    #[test]
+    fn test_acl_blocklist_preempts_all_capabilities_and_admin() {
+        let acl = AclSettings {
+            admins: vec!["rogue_admin@example.com".to_string()],
+            ingest: vec!["rogue_admin@example.com".to_string()],
+            cancel: vec!["rogue_admin@example.com".to_string()],
+            review: vec!["rogue_admin@example.com".to_string()],
+            blocklist: vec!["rogue_admin@example.com".to_string()],
+            ..Default::default()
+        };
+
+        assert!(acl.is_blocklisted("rogue_admin@example.com"));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Ingest));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Cancel));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Review));
+    }
+
+    #[test]
+    fn test_acl_blocklist_case_insensitivity() {
+        let acl = AclSettings {
+            admins: vec!["User@Example.COM".to_string()],
+            blocklist: vec!["User@Example.COM".to_string()],
+            ..Default::default()
+        };
+
+        assert!(acl.is_blocklisted("user@example.com"));
+        assert!(acl.is_blocklisted("USER@EXAMPLE.COM"));
+        assert!(acl.is_blocklisted("uSeR@eXaMpLe.CoM"));
+        assert!(!acl.has_permission("user@example.com", Permission::Review));
+        assert!(!acl.has_permission("USER@EXAMPLE.COM", Permission::Review));
+    }
+
+    #[test]
+    fn test_acl_deserialization_with_blocklist() {
+        let toml_blocklist = r#"
+            admins = ["alice@example.com"]
+            blocklist = ["mallory@example.com"]
+        "#;
+        let acl: AclSettings = toml::from_str(toml_blocklist).expect("deserialization failed");
+        assert_eq!(acl.blocklist, vec!["mallory@example.com"]);
+        assert!(acl.is_blocklisted("mallory@example.com"));
+    }
+
+    #[test]
+    fn test_security_list_grants_no_capabilities() {
+        let acl = AclSettings {
+            security: vec!["gregkh@linuxfoundation.org".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.is_security("gregkh@linuxfoundation.org"));
+        // Membership is about bugs. It must not leak into the capabilities
+        // that spend money or move patches around.
+        for perm in [Permission::Ingest, Permission::Cancel, Permission::Review] {
+            assert!(!acl.has_permission("gregkh@linuxfoundation.org", perm));
+        }
+        assert!(!acl.is_admin("gregkh@linuxfoundation.org"));
+        assert!(!acl.is_bug_reporter("gregkh@linuxfoundation.org"));
+    }
+
+    #[test]
+    fn test_bug_reporters_defaults_to_nobody() {
+        let acl = AclSettings::default();
+        assert!(!acl.is_bug_reporter("tool@example.com"));
+
+        let acl = AclSettings {
+            bug_reporters: vec!["tool@example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.is_bug_reporter("tool@example.com"));
+        assert!(!acl.is_security("tool@example.com"));
+    }
+
+    #[test]
+    fn test_every_configured_list_may_sign_in() {
+        let acl = AclSettings {
+            admins: vec!["operator@example.org".to_string()],
+            security: vec!["gregkh@linuxfoundation.org".to_string()],
+            bug_reporters: vec!["tool@example.org".to_string()],
+            ingest: vec!["bot@example.org".to_string()],
+            cancel: vec!["cron@example.org".to_string()],
+            review: vec!["reviewer@example.org".to_string()],
+            blocklist: vec!["mallory@example.org".to_string()],
+        };
+
+        // An address that can do something has to be able to sign in and do
+        // it, whichever list put it there.
+        for known in [
+            "operator@example.org",
+            "GregKH@LinuxFoundation.org",
+            "tool@example.org",
+            "bot@example.org",
+            "cron@example.org",
+            " reviewer@example.org ",
+        ] {
+            assert!(acl.is_known_identity(known), "{} cannot sign in", known);
+        }
+
+        assert!(!acl.is_known_identity("mallory@example.org"));
+        assert!(!acl.is_known_identity("stranger@example.org"));
+        assert!(!AclSettings::default().is_known_identity("anyone@example.org"));
+    }
+
+    #[test]
+    fn test_list_matching_tolerates_surrounding_whitespace() {
+        let acl = AclSettings {
+            security: vec![" gregkh@linuxfoundation.org ".to_string()],
+            blocklist: vec!["  mallory@example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.is_security("gregkh@linuxfoundation.org"));
+        // A space in the configuration file must not let a denied address
+        // through.
+        assert!(acl.is_blocklisted("mallory@example.com"));
+        assert!(acl.is_blocklisted(" mallory@example.com "));
+    }
+
+    #[test]
+    fn test_acl_rejects_unknown_keys() {
+        // The lists are the whole security model, so a typo has to be loud.
+        let toml = r#"
+            admins = ["alice@example.com"]
+            securty = ["typo@example.com"]
+        "#;
+        assert!(toml::from_str::<AclSettings>(toml).is_err());
+    }
+
+    #[test]
+    fn test_reachable_base_url_rejects_bind_addresses() {
+        for good in [
+            "https://sashiko.example.org",
+            "https://sashiko.example.org/",
+            "http://review.example.org:8080",
+            "https://[2001:db8::1]:8443",
+        ] {
+            assert!(is_reachable_base_url(good), "{} rejected", good);
+        }
+        // A bind address, a loopback address and a bare host are all things a
+        // recipient on another machine cannot open.
+        for bad in [
+            "http://::8080",
+            "http://[::]:8080",
+            "http://0.0.0.0:8080",
+            "https://localhost:8080",
+            "http://127.0.0.1:8080",
+            "sashiko.example.org",
+            "ftp://sashiko.example.org",
+            "",
+        ] {
+            assert!(!is_reachable_base_url(bad), "{} accepted", bad);
+        }
+    }
+
+    #[test]
+    fn test_sign_in_base_url_drops_the_trailing_slash() {
+        let mut server = ServerSettings {
+            host: "::".to_string(),
+            port: 8080,
+            public_base_url: Some("https://sashiko.example.org/".to_string()),
+            read_only: false,
+            testing_mode: false,
+            jwt_secret: None,
+            log_sign_in_links: false,
+            acl: AclSettings::default(),
+        };
+        assert_eq!(server.sign_in_base_url(), "https://sashiko.example.org");
+
+        // With nothing configured the link never leaves the machine, so a
+        // best-effort address is enough.
+        server.public_base_url = None;
+        assert_eq!(server.sign_in_base_url(), "http://:::8080");
+    }
+
+    #[test]
+    fn test_sign_in_link_logging_is_off_unless_asked_for() {
+        // A configuration that never mentions the switch must not print
+        // credentials, because that is the configuration everyone deploys.
+        let server: ServerSettings = toml::from_str("host = \"::\"\nport = 8080").unwrap();
+        assert!(!server.log_sign_in_links);
+
+        let opted_in: ServerSettings =
+            toml::from_str("host = \"::\"\nport = 8080\nlog_sign_in_links = true").unwrap();
+        assert!(opted_in.log_sign_in_links);
+    }
+
+    #[test]
+    fn test_startup_refuses_to_mail_links_nobody_can_open() {
+        let mut settings = Settings::new().unwrap();
+
+        // Shipped configuration has no SMTP, so the link is logged and the
+        // base URL is nobody's problem.
+        assert!(settings.smtp.is_none());
+        assert!(settings.validate_sign_in_delivery().is_ok());
+
+        settings.smtp = Some(SmtpSettings {
+            server: "smtp.example.org".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "sashiko@example.org".to_string(),
+            reply_to: None,
+            dry_run: true,
+        });
+        assert!(settings.validate_sign_in_delivery().is_err());
+
+        settings.server.public_base_url = Some("http://[::]:8080".to_string());
+        assert!(settings.validate_sign_in_delivery().is_err());
+
+        settings.server.public_base_url = Some("https://sashiko.example.org".to_string());
+        assert!(settings.validate_sign_in_delivery().is_ok());
+    }
+
+    #[test]
+    fn test_local_token_path_follows_the_database() {
+        let mut settings = Settings::new().unwrap();
+
+        settings.database.url = "sashiko.db".to_string();
+        assert_eq!(
+            settings.local_token_path(),
+            Path::new(".").join(LOCAL_TOKEN_FILE_NAME)
+        );
+
+        settings.database.url = "/var/lib/sashiko/sashiko.db".to_string();
+        assert_eq!(
+            settings.local_token_path(),
+            Path::new("/var/lib/sashiko").join(LOCAL_TOKEN_FILE_NAME)
+        );
+
+        // A remote database names no directory to share, so the token sits
+        // where the configuration was read from instead.
+        settings.database.url = "libsql://sashiko.example.turso.io".to_string();
+        assert_eq!(
+            settings.local_token_path(),
+            Path::new(".").join(LOCAL_TOKEN_FILE_NAME)
+        );
+    }
+
+    /// An environment variable is always a string, so a list spelled that way
+    /// has to mean the same thing as the array a file writes.
+    #[test]
+    fn test_acl_lists_read_a_string_as_well_as_an_array() {
+        let from_env: AclSettings = serde_json::from_str(
+            r#"{"admins": "first@example.org, second@example.org", "security": ""}"#,
+        )
+        .unwrap();
+        assert_eq!(from_env.admins, ["first@example.org", "second@example.org"]);
+        assert!(
+            from_env.security.is_empty(),
+            "an empty variable grants nothing"
+        );
+
+        let from_file: AclSettings =
+            serde_json::from_str(r#"{"admins": ["first@example.org"]}"#).unwrap();
+        assert_eq!(from_file.admins, ["first@example.org"]);
+
+        // An omitted list stays fail-closed rather than becoming a list with
+        // one blank member that matches a caller presenting no address.
+        let omitted: AclSettings = serde_json::from_str("{}").unwrap();
+        assert!(omitted.admins.is_empty());
+        assert!(!omitted.is_admin(""));
     }
 }

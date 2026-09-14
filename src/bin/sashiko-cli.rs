@@ -17,7 +17,9 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
+use sashiko::auth::LocalToken;
 use sashiko::settings::Settings;
+use sashiko::utils::utf8_prefix;
 use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -225,19 +227,24 @@ async fn main() -> Result<()> {
         .unwrap();
 
     // Load settings, falling back to defaults if file missing/invalid
-    let base_url = cli.server.unwrap_or_else(|| {
-        Settings::new()
-            .map(|s| {
-                if s.server.host.contains(':') {
-                    format!("http://[::1]:{}", s.server.port)
-                } else {
-                    format!("http://{}:{}", s.server.host, s.server.port)
-                }
-            })
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    let base_url = cli.server.unwrap_or_else(|| match Settings::new() {
+        Ok(s) => {
+            if s.server.host.contains(':') {
+                format!("http://[::1]:{}", s.server.port)
+            } else {
+                format!("http://{}:{}", s.server.host, s.server.port)
+            }
+        }
+        Err(e) => {
+            if e.to_string().contains("not found") {
+                "http://127.0.0.1:8080".to_string()
+            } else {
+                panic!("Failed to parse Settings.toml: {}", e);
+            }
+        }
     });
 
-    let client = Client::new();
+    let client = build_client();
 
     if let Err(e) = run_command(cli.command, &client, &base_url, cli.format).await {
         print_colored(Color::Red, "Error: ");
@@ -260,6 +267,41 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Builds the HTTP client, presenting the local server's token when one is
+/// readable.
+///
+/// The token is attached as a default header rather than at each call site,
+/// because every mutating command needs it and the ones that forget only fail
+/// once a server stops trusting the loopback interface by itself.
+///
+/// A server elsewhere ignores the header, and a missing or stale file is not
+/// worth a word: the request may still be authorized for another reason, and
+/// the refusal that follows otherwise says so.
+fn build_client() -> Client {
+    let token = Settings::new()
+        .ok()
+        .and_then(|settings| LocalToken::read_from(&settings.local_token_path()).ok());
+
+    let Some(token) = token else {
+        return Client::new();
+    };
+
+    let Ok(mut value) =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.secret()))
+    else {
+        return Client::new();
+    };
+    value.set_sensitive(true);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, value);
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| Client::new())
 }
 
 async fn run_command(
@@ -556,11 +598,7 @@ async fn handle_list(
                     print_colored(status_color, &format!("{:<18}", status_str));
 
                     let subject = item.subject.unwrap_or_else(|| "(no subject)".to_string());
-                    let subject_display = if subject.len() > 48 {
-                        format!("{}...", &subject[..45])
-                    } else {
-                        subject
-                    };
+                    let subject_display = format_subject(&subject);
 
                     let date_display = if let Some(ts) = item.date {
                         format_timestamp(ts)
@@ -587,6 +625,14 @@ async fn handle_list(
     }
 
     Ok(())
+}
+
+fn format_subject(subject: &str) -> String {
+    if subject.len() > 48 {
+        format!("{}...", utf8_prefix(subject, 45))
+    } else {
+        subject.to_string()
+    }
 }
 
 fn review_has_issues(review: &Value) -> bool {
@@ -1539,8 +1585,8 @@ async fn handle_local(
         let review_json =
             serde_json::to_string(&review_input).context("Failed to serialize review input")?;
 
-        // Locate sashiko-review binary
-        let review_bin = find_review_binary()?;
+        // Locate worker binary
+        let (worker_bin, worker_subcmd) = find_worker_command()?;
 
         // Build subprocess args
         let baseline_ref = if let Some(b) = &baseline {
@@ -1570,7 +1616,11 @@ async fn handle_local(
         eprintln!();
 
         // Spawn review subprocess
-        let mut child = tokio::process::Command::new(&review_bin)
+        let mut cmd = tokio::process::Command::new(&worker_bin);
+        if let Some(subcmd) = worker_subcmd {
+            cmd.arg(subcmd);
+        }
+        let mut child = cmd
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1578,7 +1628,7 @@ async fn handle_local(
             .env("SASHIKO_LOG_PLAIN", "1")
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("Failed to start review binary: {:?}", review_bin))?;
+            .with_context(|| format!("Failed to start worker binary: {:?}", worker_bin))?;
 
         // Write input to stdin
         if let Some(mut stdin) = child.stdin.take() {
@@ -1706,34 +1756,47 @@ fn eprint_phase(current: usize, total: usize, msg: &str) {
     eprint!("[{}/{}] {}", current, total, msg);
 }
 
-fn find_review_binary() -> Result<PathBuf> {
+fn find_worker_command() -> Result<(PathBuf, Option<&'static str>)> {
     // Try same directory as current executable
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let candidate = dir.join("sashiko");
+        if candidate.exists() {
+            return Ok((candidate, Some("worker")));
+        }
+        if let Some(parent) = dir.parent() {
+            let candidate = parent.join("sashiko");
+            if candidate.exists() {
+                return Ok((candidate, Some("worker")));
+            }
+        }
         let candidate = dir.join("sashiko-review");
         if candidate.exists() {
-            return Ok(candidate);
-        }
-        // Also check for "review" (cargo build output name)
-        let candidate = dir.join("review");
-        if candidate.exists() {
-            return Ok(candidate);
+            return Ok((candidate, None));
         }
     }
 
-    // Try PATH
+    // Try PATH for sashiko
+    if let Ok(output) = std::process::Command::new("which").arg("sashiko").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((PathBuf::from(path), Some("worker")));
+    }
+
+    // Try PATH for sashiko-review
     if let Ok(output) = std::process::Command::new("which")
         .arg("sashiko-review")
         .output()
         && output.status.success()
     {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok(PathBuf::from(path));
+        return Ok((PathBuf::from(path), None));
     }
 
     Err(anyhow::anyhow!(
-        "Cannot find sashiko-review binary.\n\
-         Build it with: cargo build --bin review\n\
+        "Cannot find sashiko binary.\n\
+         Build it with: cargo build --bin sashiko\n\
          Or specify its location in PATH."
     ))
 }
@@ -1988,6 +2051,13 @@ fn format_timestamp(ts: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_format_subject_handles_multibyte_cutoff() {
+        let subject = format!("{}🙂rest", "a".repeat(44));
+
+        assert_eq!(format_subject(&subject), format!("{}...", "a".repeat(44)));
+    }
 
     #[test]
     fn test_count_severities_mixed() {

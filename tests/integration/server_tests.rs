@@ -1,13 +1,13 @@
 //! Integration tests that spin up a real HTTP server and exercise the API.
 //!
 //! These tests are marked `#[ignore]` so they only run via `make integration-test`
-//! (i.e. `cargo test --release -- --ignored`). They are included in the tag-release
+//! (i.e. `cargo test --all-features --test integration_tests -- --ignored`). They are included in the tag-release
 //! CI workflow but skipped during normal `make test` / PR checks.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use sashiko::api::build_router;
+use sashiko::api::{ServerOptions, build_router};
 use sashiko::db::Database;
 use sashiko::events::Event;
 use sashiko::fetcher::FetchRequest;
@@ -91,9 +91,11 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
         Arc::clone(&db),
         event_tx,
         fetch_tx,
-        /* allow_all_submit */ true,
-        /* smtp_enabled */ false,
-        /* dry_run */ true,
+        ServerOptions {
+            allow_all_submit: true,
+            dry_run: true,
+            ..Default::default()
+        },
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

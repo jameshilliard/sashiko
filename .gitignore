@@ -16,3 +16,6 @@ email_policy.toml
 *.skill
 .gemini/
 .claude/
+benchmark_results*.json
+.sashiko-local-token
+

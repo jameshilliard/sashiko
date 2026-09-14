@@ -430,22 +430,13 @@ impl GenAiClient for GeminiClient {
     }
 }
 
-pub struct StdioGeminiClient {
-    registry: std::sync::Arc<crate::ai::IpcRegistry>,
-    writer: std::sync::Arc<crate::ai::AtomicWriter>,
-    reader_started: std::sync::atomic::AtomicBool,
-}
+// The registry and writer are process-wide, so holding them in fields would
+// only cache what the accessors already return.
+pub struct StdioGeminiClient;
 
 impl StdioGeminiClient {
     pub fn new() -> Self {
-        let registry = std::sync::Arc::new(crate::ai::IpcRegistry::new());
-        let writer = std::sync::Arc::new(crate::ai::AtomicWriter::new());
-
-        Self {
-            registry,
-            writer,
-            reader_started: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self
     }
 }
 
@@ -458,14 +449,10 @@ impl Default for StdioGeminiClient {
 #[async_trait]
 impl AiProvider for StdioGeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        if !self
-            .reader_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            crate::ai::start_stdin_reader(std::sync::Arc::downgrade(&self.registry));
-        }
+        crate::ai::ensure_stdin_reader();
 
-        let tx_id = self.registry.next_id();
+        let registry = crate::ai::ipc_registry();
+        let tx_id = registry.next_id();
         let envelope = json!({
             "type": "ai_request",
             "tx_id": tx_id,
@@ -474,9 +461,9 @@ impl AiProvider for StdioGeminiClient {
 
         let line = serde_json::to_string(&envelope)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.registry.register(tx_id, tx).await;
+        registry.register(tx_id, tx).await?;
 
-        self.writer.write_line(&line).await?;
+        crate::ai::ipc_writer().write_line(&line).await?;
 
         match rx.await {
             Ok(Ok(resp)) => Ok(resp),
@@ -583,20 +570,28 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                 });
             }
             AiRole::Tool => {
-                // Gemini expects a 'function' role for tool responses
+                // Gemini expects a 'function' role for tool responses.
+                // Consecutive tool responses must be merged into a single turn with multiple parts.
+                let part = Part::FunctionResponse {
+                    function_response: FunctionResponse {
+                        name: msg
+                            .tool_call_id
+                            .context("Tool message missing tool_call_id")?,
+                        response: serde_json::from_str(
+                            &msg.content.unwrap_or_else(|| "{}".to_string()),
+                        )
+                        .unwrap_or(json!({})),
+                    },
+                };
+                if let Some(last) = contents.last_mut()
+                    && last.role == "function"
+                {
+                    last.parts.push(part);
+                    continue;
+                }
                 contents.push(Content {
                     role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponse {
-                            name: msg
-                                .tool_call_id
-                                .context("Tool message missing tool_call_id")?,
-                            response: serde_json::from_str(
-                                &msg.content.unwrap_or_else(|| "{}".to_string()),
-                            )
-                            .unwrap_or(json!({})),
-                        },
-                    }],
+                    parts: vec![part],
                 });
             }
         }
@@ -815,6 +810,11 @@ impl AiProvider for GeminiClient {
             context_window_size: 1_000_000, // Gemini 1.5 Pro default
         }
     }
+
+    fn cache_identity(&self) -> String {
+        // base_url separates two endpoints serving the same model name.
+        crate::ai::cache_identity_with(&self.model, &[("base_url", Some(self.base_url.as_str()))])
+    }
 }
 
 #[cfg(test)]
@@ -825,6 +825,20 @@ mod tests {
         DEFAULT_RETRY_AFTER, ToolCall,
     };
     use serde_json::json;
+
+    #[test]
+    fn cache_identity_tracks_base_url() {
+        let client = |base_url: &str| GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            client: RwLock::new(Client::new()),
+        };
+        assert_ne!(
+            client("https://generativelanguage.googleapis.com").cache_identity(),
+            client("https://proxy.invalid").cache_identity()
+        );
+    }
 
     #[test]
     fn test_quota_exceeded_classifies_as_rate_limit() {
@@ -1246,5 +1260,40 @@ mod tests {
             normalized["properties"]["files"]["items"]["properties"]["start_line"]["type"],
             "INTEGER"
         );
+    }
+
+    #[test]
+    fn test_translate_ai_request_merges_consecutive_tool_responses() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res1\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res2\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_2".to_string()),
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "function");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        Ok(())
     }
 }

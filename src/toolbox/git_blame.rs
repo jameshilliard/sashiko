@@ -64,9 +64,16 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
             .ok_or_else(|| anyhow!("Missing revision"))?;
         let revision_virt = context.virtualize_ref(revision_raw);
         let revision = revision_virt.as_str();
+        // The revision sits before the "--", where git still reads options, so
+        // a leading dash turns a model-chosen string into a flag. Patches come
+        // from a public list and can steer the model, so this is reachable.
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision name: {}", revision));
+        }
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
+
         let start_line = args["start_line"].as_u64();
         let end_line = args["end_line"].as_u64();
 

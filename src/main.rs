@@ -14,7 +14,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sashiko::db::Database;
-use sashiko::events::{Event, ParsedArticle};
+use sashiko::events::{Event, MessageSource, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, print_worker_json, result_has_error,
@@ -66,9 +66,9 @@ struct Cli {
     #[arg(long)]
     enable_unsafe_all_submit: bool,
 
-    /// Debug feature: select which stages from 1-7 to run
+    /// Debug feature: run only these analysis stages, by name
     #[arg(long, hide = true, value_delimiter = ',')]
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -133,9 +133,9 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         color: ColorMode,
 
-        /// Select which stages from 1-7 to run
+        /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
-        stages: Option<Vec<u8>>,
+        stages: Option<Vec<String>>,
     },
 
     /// Internal worker mode for JSON-over-stdio review execution
@@ -185,9 +185,9 @@ enum Commands {
         #[arg(long)]
         custom_prompt: Option<String>,
 
-        /// Select which stages from 1-7 to run
+        /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
-        stages: Option<Vec<u8>>,
+        stages: Option<Vec<String>>,
     },
 }
 
@@ -216,18 +216,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine log level
     // 1. CLI --debug takes precedence (implies "info")
-    // 2. Settings log_level
-    // 3. Fallback to "warn" (if settings failed)
+    // 2. Review command defaults to "warn" (unless --debug)
+    // 3. Settings log_level
+    // 4. Worker command defaults to "info" (worker logs progress on stderr)
+    // 5. Fallback to "warn" (if settings failed)
     let is_review = matches!(cli.command, Some(Commands::Review { .. }));
+    let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
     let log_level = if cli.debug {
         "info"
     } else if is_review {
         "warn"
+    } else if let Ok(s) = &settings_result {
+        &s.log_level
+    } else if is_worker {
+        "info"
     } else {
-        match &settings_result {
-            Ok(s) => &s.log_level,
-            Err(_) => "warn",
-        }
+        "warn"
     };
 
     // Initialize tracing with EnvFilter
@@ -237,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine formatting features independently
     let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
-    let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
+    let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stderr().is_terminal();
 
     let builder = fmt()
         .with_env_filter(env_filter)
@@ -309,6 +313,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 stages,
             } => {
+                std::panic::set_hook(Box::new(|info| {
+                    eprintln!("CRITICAL ERROR: Panic detected: {}", info);
+                }));
+
                 let result = run_worker_from_stdin(WorkerOptions {
                     settings_path: None,
                     baseline: baseline.clone(),
@@ -325,15 +333,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     scratch_clone: false,
                     current_tree: false,
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    serde_json::json!({
-                        "patchset_id": 0,
-                        "error": e.to_string()
-                    })
-                });
-                print_worker_json(&result).map_err(Box::<dyn std::error::Error>::from)?;
-                return Ok(());
+                .await;
+
+                match result {
+                    Ok(val) => {
+                        print_worker_json(&val).map_err(Box::<dyn std::error::Error>::from)?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let err_val = serde_json::json!({
+                            "patchset_id": 0,
+                            "error": e.to_string()
+                        });
+                        let _ = print_worker_json(&err_val);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
@@ -370,9 +385,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Selected stages via --stages flag: {:?}", stages);
     }
 
+    if let Err(reason) = settings.validate_sign_in_delivery() {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
+
+    // Load and initialize authoritative immutable MAINTAINERS index from top-of-trunk
+    let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
+    let maintainers_index = match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(
+        &linux_repo_path,
+    ) {
+        Ok(idx) => {
+            info!(
+                "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
+                idx.len()
+            );
+            Arc::new(idx)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
+                e
+            );
+            Arc::new(sashiko::maintainers::MaintainersIndex::new())
+        }
+    };
+    sashiko::maintainers::init_global_maintainers(maintainers_index);
 
     // Create internal task queues
     // raw_tx -> Parser -> parsed_tx -> DB Worker
@@ -388,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Spawn FetchAgent
-    tokio::spawn(async move {
+    let fetch_handle = tokio::spawn(async move {
         fetch_agent.run().await;
     });
 
@@ -444,11 +486,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _permit = permit; // Hold permit until task completion
 
                 match event {
-                    Event::IngestionFailed { article_id, error } => {
+                    Event::IngestionFailed {
+                        article_id,
+                        error,
+                        source,
+                    } => {
                         if let Err(e) = tx
                             .send(ParsedArticle {
                                 group: "error".to_string(),
                                 article_id,
+                                source,
                                 metadata: None,
                                 patch: None,
                                 baseline: None,
@@ -458,6 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mr_url: None,
                                 mr_title: None,
                                 mr_number: None,
+                                receipt: None,
                             })
                             .await
                         {
@@ -514,10 +562,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             part_index: index,
                         });
 
+                        let source = if group.starts_with("git-import") {
+                            MessageSource::GitImport
+                        } else {
+                            MessageSource::GitFetch
+                        };
+
                         if let Err(e) = tx
                             .send(ParsedArticle {
                                 group,
                                 article_id,
+                                source,
                                 metadata: Some(metadata),
                                 patch,
                                 baseline: base_commit,
@@ -527,6 +582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mr_url,
                                 mr_title,
                                 mr_number,
+                                receipt: None,
                             })
                             .await
                         {
@@ -535,10 +591,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Event::RawMboxSubmitted {
                         raw,
+                        submission_id,
+                        source,
                         group,
                         baseline,
                         skip_subjects,
                         only_subjects,
+                        submitted_at,
                     } => {
                         let messages = sashiko::ingestor::split_mbox(raw.as_bytes());
                         let count = messages.len();
@@ -569,18 +628,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             match parse_result {
                                 Ok(Ok((metadata, patch_opt))) => {
-                                    // Override group "api-submit" -> "manual" to avoid synthetic ID logic
-                                    let effective_group = if group_clone == "api-submit" {
-                                        "manual".to_string()
-                                    } else {
-                                        group_clone
-                                    };
+                                    // Do not override group "api-submit" to allow grouping logic to trigger
+                                    let effective_group = group_clone;
 
                                     if let Err(e) = tx_clone
                                         .send(ParsedArticle {
                                             group: effective_group,
-                                            article_id: msg_id,
-                                            metadata: Some(metadata),
+                                            article_id: submission_id.clone(),
+                                            source,
+                                            metadata: {
+                                                let mut m = metadata;
+                                                if submitted_at.is_some() {
+                                                    m.received_date = submitted_at;
+                                                }
+                                                Some(m)
+                                            },
                                             patch: patch_opt,
                                             baseline: baseline_clone,
                                             failed_error: None,
@@ -589,6 +651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             mr_url: None,
                                             mr_title: None,
                                             mr_number: None,
+                                            receipt: None,
                                         })
                                         .await
                                     {
@@ -610,6 +673,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         content,
                         raw,
                         baseline,
+                        mut receipt,
                     } => {
                         // Standard raw parsing logic
                         let bytes = match raw {
@@ -629,7 +693,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(cutoff) = cutoff_timestamp
                                     && metadata.date < cutoff
                                 {
-                                    // info!("Skipping fetched article {} (date {} < cutoff {})", article_id, metadata.date, cutoff);
+                                    // Dropping this article is a decision, not
+                                    // a failure, so the mark may move past it.
+                                    if let Some(receipt) = receipt.as_mut() {
+                                        receipt.settle();
+                                    }
                                     return;
                                 }
 
@@ -637,6 +705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .send(ParsedArticle {
                                         group,
                                         article_id,
+                                        source: MessageSource::Nntp,
                                         metadata: Some(metadata),
                                         patch: patch_opt,
                                         baseline,
@@ -646,6 +715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         mr_url: None,
                                         mr_title: None,
                                         mr_number: None,
+                                        receipt,
                                     })
                                     .await
                                 {
@@ -653,9 +723,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Ok(Err(e)) => {
-                                info!("Parse error for {}: {}", article_id, e);
+                                // Parsing the same bytes again would fail the
+                                // same way, so holding the mark back would
+                                // wedge the group on this one article.
+                                if let Some(receipt) = receipt.as_mut() {
+                                    receipt.settle();
+                                }
+                                warn!("Dropping unparseable article {}: {}", article_id, e);
                             }
                             Err(e) => {
+                                // A parser panic is just as repeatable as a
+                                // parse error, so the article is dropped for
+                                // the same reason.
+                                if let Some(receipt) = receipt.as_mut() {
+                                    receipt.settle();
+                                }
                                 error!("Join error in parser: {}", e);
                             }
                         }
@@ -669,7 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DB Worker (Transactional Batching)
     let worker_db = db.clone();
     let mapping = settings.subsystems.mapping.clone();
-    let _db_worker_handle = tokio::spawn(async move {
+    let db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
         let mut buffer = Vec::with_capacity(100);
@@ -677,8 +759,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total_ingested = 0;
         let mut total_errors = 0;
 
-        let policy =
-            sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml").unwrap_or_default();
+        let policy = sashiko::email_policy::EmailPolicyConfig::load("email_policy.toml")
+            .expect("Failed to parse email_policy.toml");
 
         loop {
             let count = parsed_rx.recv_many(&mut buffer, 100).await;
@@ -686,9 +768,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            for article in buffer.drain(..) {
+            for mut article in buffer.drain(..) {
+                let mut receipt = article.receipt.take();
                 match process_parsed_article(&worker_db, article, &policy, &mapping).await {
-                    ProcessStatus::Ingested => total_ingested += 1,
+                    ProcessStatus::Ingested => {
+                        // The article is on disk, so the fetch loop may finally
+                        // move its mark past it.
+                        if let Some(receipt) = receipt.as_mut() {
+                            receipt.settle();
+                        }
+                        total_ingested += 1;
+                    }
+                    // The receipt is dropped unsettled, which reports the
+                    // article as lost and keeps the mark below it.
                     ProcessStatus::Error => total_errors += 1,
                 }
                 total_processed += 1;
@@ -751,35 +843,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
-    let allow_all_submit = cli.enable_unsafe_all_submit;
-    let smtp_enabled = settings.smtp.is_some();
-    let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
-    tokio::spawn(async move {
-        if let Err(e) = sashiko::api::run_server(
-            api_settings,
-            api_db,
-            api_tx,
-            api_fetch_tx,
-            allow_all_submit,
-            smtp_enabled,
-            dry_run,
-        )
-        .await
+    let local_token_path = settings.local_token_path();
+    let local_token = publish_local_token(&local_token_path);
+    let server_options = sashiko::api::ServerOptions {
+        allow_all_submit: cli.enable_unsafe_all_submit,
+        smtp_enabled: settings.smtp.is_some(),
+        dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
+        local_token,
+    };
+    let api_handle = tokio::spawn(async move {
+        if let Err(e) =
+            sashiko::api::run_server(api_settings, api_db, api_tx, api_fetch_tx, server_options)
+                .await
         {
             error!("Web API fatal error: {}", e);
         }
     });
 
     // Start Email Worker
-    if let Some(smtp_settings) = settings.smtp.clone() {
-        let email_worker = sashiko::worker::email::EmailWorker::new(db.clone(), smtp_settings);
-        tokio::spawn(async move {
+    let email_handle = if let Some(smtp_settings) = settings.smtp.clone() {
+        let email_worker = sashiko::worker::email::EmailWorker::new(
+            db.clone(),
+            smtp_settings,
+            settings.server.log_sign_in_links,
+        );
+
+        Some(tokio::spawn(async move {
             email_worker.run().await;
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Start Patchwork Worker (processes API check entries when they exist)
-    {
+    let patchwork_handle = {
         let pw_policy_path = settings.review.email_policy_path.clone();
         let pw_max_retries = settings.review.max_retries;
         let patchwork_worker = sashiko::worker::patchwork::PatchworkWorker::new(
@@ -789,10 +886,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         tokio::spawn(async move {
             patchwork_worker.run().await;
-        });
-    }
+        })
+    };
 
+    let bug_worker_handle = {
+        let provider =
+            sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
+        let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
+            db.clone(),
+            provider,
+            settings.git.repository_path.clone(),
+        );
+        tokio::spawn(async move {
+            bug_worker.run().await;
+        })
+    };
     // Initialize custom remotes
+    // Start Background Compressor Worker
+    let compressor_handle = tokio::spawn(sashiko::worker::compressor::run_compressor(db.clone()));
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 
     // Clean up stale worktree directories on disk first
@@ -811,6 +922,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to ensure submodule config compatibility: {}", e);
     }
 
+    // Auto-maintenance repacks in the background while the sync worker
+    // keeps fetching, which can leave a commit-graph naming objects the
+    // repack removed.
+    if let Err(e) = sashiko::git_ops::ensure_gc_disabled(&repo_path).await {
+        error!("Failed to disable git auto-maintenance: {}", e);
+    }
+
+    // Recover the object store the way the worktrees above are
+    // recovered.  The write brings the graph up to the refs the last
+    // run left behind, and drops a graph that outlived the objects it
+    // names rather than reporting it.
+    //
+    // The walk visits every reachable commit, which runs to minutes
+    // on a tree the size of Linux.  Awaiting it here held the sync
+    // worker and the reviewer off for that long on every restart.
+    // Run it beside those workers instead.  The repack worker
+    // rewrites the pack directory.  Both passes take the object-store
+    // lock, so it cannot run underneath the walk.
+    let graph_repo_path = repo_path.clone();
+    let commit_graph_handle = tokio::spawn(async move {
+        if let Err(e) = sashiko::git_ops::write_commit_graph(&graph_repo_path).await {
+            error!("Failed to write the commit-graph: {}", e);
+        }
+    });
+
     if let Some(custom_remotes) = &settings.git.custom_remotes {
         for remote in custom_remotes {
             info!(
@@ -827,21 +963,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Git Sync Worker
-    {
+    let sync_handle = {
         let sync_worker = sashiko::worker::sync::GitSyncWorker::new(repo_path.clone());
         tokio::spawn(async move {
             sync_worker.run().await;
-        });
-    }
+        })
+    };
+
+    // Start Repack Worker
+    let repack_handle = {
+        let repack_worker = sashiko::worker::repack::RepackWorker::new(repo_path.clone());
+        tokio::spawn(async move {
+            repack_worker.run().await;
+        })
+    };
 
     // Start Reviewer Service
     let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
-    tokio::spawn(async move {
+    let reviewer_handle = tokio::spawn(async move {
         reviewer.start().await;
     });
 
     let metrics_db = db.clone();
-    tokio::spawn(async move {
+    let metrics_repo_path = repo_path.clone();
+    let metrics_handle = tokio::spawn(async move {
         loop {
             if let Ok(pending) = metrics_db.count_pending_patches().await {
                 sashiko::metrics::set_pending_patches(pending);
@@ -855,19 +1000,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
                 sashiko::metrics::set_patchsets(patchsets);
             }
+            match sashiko::git_ops::pack_stats(&metrics_repo_path).await {
+                Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
+                Err(e) => warn!("Failed to count packs in the review repository: {}", e),
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });
 
     // Keep the main thread running
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
 
-    // Abort handles
+    // Abort all background task handles
+    fetch_handle.abort();
     ingestor_handle.abort();
     parser_handle.abort();
+    db_worker_handle.abort();
+    api_handle.abort();
+    if let Some(h) = email_handle {
+        h.abort();
+    }
+    patchwork_handle.abort();
+    bug_worker_handle.abort();
+    compressor_handle.abort();
+    commit_graph_handle.abort();
+    sync_handle.abort();
+    repack_handle.abort();
+    reviewer_handle.abort();
+    metrics_handle.abort();
 
-    Ok(())
+    // A token from a dead server authenticates nothing, since the next one
+    // draws a new secret, but leaving the file behind invites a local tool to
+    // present a credential nobody honours and puzzle over the refusal.
+    if let Err(e) = std::fs::remove_file(&local_token_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove the local token at {}: {}",
+            local_token_path.display(),
+            e
+        );
+    }
+
+    info!("Shutdown complete.");
+    std::process::exit(0);
+}
+
+/// Publishes the credential local tooling presents to this process.
+///
+/// A failure is a warning rather than a fatal error: a read-only state
+/// directory is a legitimate deployment, and the server remains fully usable
+/// through sign-in links. Only the convenience of local tooling is lost, so it
+/// says so plainly rather than refusing to start.
+fn publish_local_token(path: &Path) -> Option<sashiko::auth::LocalToken> {
+    let token = match sashiko::auth::LocalToken::generate() {
+        Ok(token) => token,
+        Err(e) => {
+            warn!("Failed to generate the local token: {}", e);
+            return None;
+        }
+    };
+
+    match token.write_to(path) {
+        Ok(()) => {
+            // The path is logged and the secret is not, because the log is read
+            // by more people and processes than the file is.
+            info!("Local tooling may authenticate with {}", path.display());
+            Some(token)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to write the local token to {}: {}. Local tools will have to \
+                 authenticate like any other caller.",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
 fn handle_init_command(
@@ -932,10 +1155,10 @@ struct PatchState {
     index: i64,
     subject: String,
     status: PatchStatus,
-    planned_stages: Vec<u8>,
-    active_stages: std::collections::BTreeSet<u8>,
+    planned_stages: Vec<String>,
+    active_stages: std::collections::BTreeSet<String>,
     completed_stages: usize,
-    active_stage_turns: std::collections::HashMap<u8, usize>,
+    active_stage_turns: std::collections::HashMap<String, usize>,
 }
 
 fn get_terminal_width() -> usize {
@@ -970,21 +1193,10 @@ struct ProgressState {
     color_choice: ColorChoice,
 }
 
-fn stage_short_name(stage: u8) -> &'static str {
-    match stage {
-        1 => "Goal Analysis",
-        2 => "Implementation",
-        3 => "Execution Flow",
-        4 => "Resource Mgmt",
-        5 => "Locking & Sync",
-        6 => "Security Audit",
-        7 => "Hardware Review",
-        8 => "Deduplication",
-        9 => "Conflict Resolution",
-        10 => "Severity Estimation",
-        11 => "Report Generation",
-        _ => "Unknown",
-    }
+/// Display label for a stage. Held in the stage tables so that adding a stage
+/// needs no edit here.
+fn stage_short_name(stage: &str) -> &'static str {
+    sashiko::workflows::linux_patch_review::stage_short_label(stage).unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -1063,15 +1275,15 @@ fn render_progress(state: &mut ProgressState) {
                 if p.active_stages.is_empty() {
                     "Reviewing...".to_string()
                 } else {
-                    let mut stages_with_turns: Vec<(u8, usize)> = p
+                    let mut stages_with_turns: Vec<(&String, usize)> = p
                         .active_stages
                         .iter()
-                        .map(|&st| {
-                            let turn = p.active_stage_turns.get(&st).cloned().unwrap_or(0);
+                        .map(|st| {
+                            let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
                             (st, turn)
                         })
                         .collect();
-                    stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
+                    stages_with_turns.sort_by_key(|a| std::cmp::Reverse(a.1));
 
                     let (top_stage, top_turn) = stages_with_turns[0];
                     let stage_name = stage_short_name(top_stage);
@@ -1141,7 +1353,11 @@ fn render_progress(state: &mut ProgressState) {
             .values()
             .map(|p| {
                 if p.planned_stages.is_empty() {
-                    11
+                    // Nothing resolved yet: assume every stage will run, which
+                    // is what the fan-out settles on when the planner is not
+                    // narrowing it.
+                    sashiko::workflows::linux_patch_review::ANALYSIS_STAGES.len()
+                        + sashiko::workflows::linux_patch_review::CONSOLIDATION_STAGES.len()
                 } else {
                     p.planned_stages.len()
                 }
@@ -1204,7 +1420,7 @@ async fn handle_review_command(
     prompts: PathBuf,
     format: OutputFormat,
     color: ColorMode,
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let color_choice = match color {
         ColorMode::Always => ColorChoice::Always,
@@ -1219,6 +1435,11 @@ async fn handle_review_command(
     };
 
     let repo_path = current_git_toplevel()?;
+    if sashiko::maintainers::get_global_maintainers().is_none()
+        && let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
+    {
+        sashiko::maintainers::init_global_maintainers(Arc::new(idx));
+    }
     eprintln!("Reviewing: {}", input);
     eprintln!("Using prompts: {}", prompts.display());
 
@@ -1630,6 +1851,7 @@ async fn process_parsed_article(
     let ParsedArticle {
         group,
         article_id,
+        source,
         metadata,
         patch,
         baseline,
@@ -1639,12 +1861,17 @@ async fn process_parsed_article(
         mr_url,
         mr_title,
         mr_number,
+        // The caller settles the receipt, because only it knows whether the
+        // whole batch made it through.
+        receipt: _,
     } = article;
+
+    let root_msg_id = resolve_root_msg_id(source, &article_id);
 
     // Handle ingestion failure
     if let Some(err) = failed_error {
         info!("Handling ingestion failure for {}: {}", article_id, err);
-        if let Err(e) = worker_db.update_patchset_error(&article_id, &err).await {
+        if let Err(e) = worker_db.update_patchset_error(&root_msg_id, &err).await {
             error!("Failed to update patchset error in DB: {}", e);
         }
         return ProcessStatus::Ingested; // Successfully handled the failure event
@@ -1715,12 +1942,6 @@ async fn process_parsed_article(
         } else if group == "git-fetch" || group == "api-submit" {
             // Group these by article_id (which is the range or single SHA/local_id)
             // For singletons, the message itself is the root.
-            let root_msg_id = if metadata.total == 1 {
-                metadata.message_id.clone()
-            } else {
-                format!("{}@sashiko.local", article_id)
-            };
-
             match worker_db
                 .ensure_thread_for_message(&root_msg_id, metadata.date)
                 .await
@@ -1891,7 +2112,6 @@ async fn process_parsed_article(
     );
     */
 
-    let root_msg_id = format!("{}@sashiko.local", article_id);
     let cover_letter_id = if group == "git-fetch" {
         // Always use root_msg_id for git-fetch to match the placeholder ID
         Some(root_msg_id.as_str())
@@ -1931,14 +2151,14 @@ async fn process_parsed_article(
                     format!("!{}: {}", number, title),
                     metadata.author.clone(),
                     metadata.total,
-                    true,
+                    is_strict_author(source, metadata.total),
                 )
             } else {
                 (
                     metadata.subject.clone(),
                     metadata.author.clone(),
                     metadata.total,
-                    !group.starts_with("git-import"),
+                    is_strict_author(source, metadata.total),
                 )
             }
         } else {
@@ -1946,7 +2166,7 @@ async fn process_parsed_article(
                 metadata.subject.clone(),
                 metadata.author.clone(),
                 metadata.total,
-                !group.starts_with("git-import"),
+                is_strict_author(source, metadata.total),
             )
         };
 
@@ -1971,7 +2191,10 @@ async fn process_parsed_article(
                 metadata.message_id.as_str(),
                 &subject,
                 &author,
-                metadata.date,
+                // Use server-side timestamp (received_date) when available,
+                // falling back to the email's Date: header. This prevents
+                // stale mbox timestamps from skewing queue ordering.
+                metadata.received_date.unwrap_or(metadata.date),
                 total_parts,
                 PARSER_VERSION,
                 &metadata.to,
@@ -2006,12 +2229,24 @@ async fn process_parsed_article(
                 }
 
                 if let Some(patch) = patch_opt {
+                    let git_patch_id =
+                        match sashiko::prerequisites::calculate_git_patch_id(&patch.diff).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to calculate stable patch ID for {}: {}",
+                                    patch.message_id, e
+                                );
+                                None
+                            }
+                        };
                     match worker_db
-                        .create_patch(
+                        .create_patch_with_git_patch_id(
                             patchset_id,
                             &patch.message_id,
                             patch.part_index,
                             &patch.diff,
+                            git_patch_id.as_deref(),
                         )
                         .await
                     {
@@ -2196,6 +2431,28 @@ fn calculate_embargo_hours(
         *delays_to_consider.iter().min().unwrap()
     } else {
         policy.defaults.embargo_hours.unwrap_or(0)
+    }
+}
+
+fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
+    match source {
+        MessageSource::Nntp
+        | MessageSource::ApiFetchThread
+        | MessageSource::GitArchive
+        | MessageSource::ApiInject => article_id.to_string(),
+        MessageSource::GitFetch | MessageSource::GitImport => {
+            format!("{}@sashiko.local", article_id)
+        }
+    }
+}
+
+fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
+    match source {
+        MessageSource::GitImport | MessageSource::GitArchive => false,
+        MessageSource::GitFetch if total_parts > 1 => false,
+        MessageSource::ApiInject if total_parts > 1 => false,
+        MessageSource::ApiFetchThread if total_parts > 1 => false,
+        _ => true,
     }
 }
 
@@ -2622,5 +2879,48 @@ mod tests {
         settings.forge.disable_nntp = true; // This is the default
         let should_start_ingestor = !(settings.forge.enabled && settings.forge.disable_nntp);
         assert!(!should_start_ingestor);
+    }
+
+    #[test]
+    fn test_resolve_root_msg_id() {
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::Nntp, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::ApiFetchThread, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitArchive, "foo@bar.com"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::ApiInject, "sashiko-123"),
+            "sashiko-123"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitFetch, "abc123_sha"),
+            "abc123_sha@sashiko.local"
+        );
+        assert_eq!(
+            resolve_root_msg_id(MessageSource::GitImport, "range_a_b"),
+            "range_a_b@sashiko.local"
+        );
+    }
+
+    #[test]
+    fn test_is_strict_author() {
+        assert!(is_strict_author(MessageSource::Nntp, 1));
+        assert!(is_strict_author(MessageSource::Nntp, 6));
+        assert!(!is_strict_author(MessageSource::ApiFetchThread, 6)); // Lenient for series
+        assert!(!is_strict_author(MessageSource::GitFetch, 6)); // Lenient for series
+        assert!(is_strict_author(MessageSource::GitFetch, 1)); // Strict for singleton
+
+        assert!(!is_strict_author(MessageSource::GitImport, 6));
+        assert!(!is_strict_author(MessageSource::GitArchive, 6));
+
+        assert!(is_strict_author(MessageSource::ApiInject, 1)); // Strict for singleton
+        assert!(!is_strict_author(MessageSource::ApiInject, 6)); // Lenient for series
     }
 }

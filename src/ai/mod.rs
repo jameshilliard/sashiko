@@ -292,6 +292,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
+        return e.ai_error_class();
+    }
     AiErrorClass::Fatal
 }
 
@@ -313,7 +316,7 @@ pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
 }
 
 /// Token usage statistics for an AI interaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiUsage {
     /// Number of tokens in the input prompt.
     pub prompt_tokens: usize,
@@ -321,9 +324,24 @@ pub struct AiUsage {
     pub completion_tokens: usize,
     /// Total tokens used (prompt + completion).
     pub total_tokens: usize,
-    /// Optional number of tokens served from cache.
+    /// Number of tokens served from cache.  A breakdown of `prompt_tokens`
+    /// rather than an addend: a consumer subtracts it to get uncached input.
+    /// A provider whose API reports the cached prefix outside its prompt
+    /// total folds it in before filling these fields.  None when the
+    /// provider reports no cache hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<usize>,
+}
+
+impl AiUsage {
+    pub fn accumulate(&mut self, other: &AiUsage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+        if let Some(other_cached) = other.cached_tokens {
+            *self.cached_tokens.get_or_insert(0) += other_cached;
+        }
+    }
 }
 
 /// Information about the capabilities and constraints of an AI provider.
@@ -360,6 +378,37 @@ pub trait AiProvider: Send + Sync {
     fn cache_stats(&self) -> Option<CacheStats> {
         None
     }
+
+    /// Describes the configuration that shapes a response but travels outside
+    /// the request: the model, and any provider knob such as a reasoning
+    /// effort level. The response cache mixes this into its key, so changing
+    /// one of these settings misses the entries recorded under the old one
+    /// instead of replaying them.
+    fn cache_identity(&self) -> String {
+        self.get_capabilities().model_name
+    }
+}
+
+/// Appends the knobs a provider applies outside the request to its model name,
+/// forming the identity `cache_identity` returns. A knob left unset
+/// contributes nothing, so a provider configured with none of them keys its
+/// entries on the bare model name.
+///
+/// Keying on an identity at all invalidates every entry recorded before one
+/// existed, whose hash covered the request alone. That costs one re-run of
+/// the backlog on the first run after the upgrade, and the stale rows age out
+/// with the TTL sweep.
+pub fn cache_identity_with(model: &str, knobs: &[(&str, Option<&str>)]) -> String {
+    let mut identity = model.to_string();
+    for (name, value) in knobs {
+        if let Some(value) = value {
+            identity.push('|');
+            identity.push_str(name);
+            identity.push('=');
+            identity.push_str(value);
+        }
+    }
+    identity
 }
 
 /// Creates an AI provider, optionally wrapping it with a local response cache.
@@ -502,6 +551,30 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 think_mode,
             )?))
         }
+        "vllm" => {
+            let model = ai.model.clone();
+            let cfg = ai.vllm.as_ref();
+            let base_url = cfg
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(vllm::VllmClient::default_base_url);
+            let context_window = cfg
+                .and_then(|c| c.context_window_size)
+                .unwrap_or_else(|| vllm::VllmClient::default_context_window_for_model(&model));
+            let max_tokens = cfg.and_then(|c| c.max_tokens);
+            let enable_thinking = cfg.and_then(|c| c.enable_thinking);
+            let guided_json = cfg.map(|c| c.guided_json).unwrap_or(false);
+            let enable_tools = cfg.map(|c| c.enable_tools).unwrap_or(false);
+            Ok(Arc::new(vllm::VllmClient::new(
+                base_url,
+                model,
+                context_window,
+                max_tokens,
+                ai.api_timeout_secs,
+                enable_thinking,
+                guided_json,
+                enable_tools,
+            )?))
+        }
         "claude-cli" => {
             let cfg = ai.claude_cli.as_ref();
             Ok(Arc::new(claude_cli::ClaudeCliProvider {
@@ -525,6 +598,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: ai.model.clone(),
+            effort: ai.codex_cli.as_ref().and_then(|c| c.effort.clone()),
         })),
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
             model: ai.model.clone(),
@@ -575,16 +649,19 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod concurrency_limited_provider;
 pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;
 pub mod kiro_cli;
+pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
 pub mod proxy;
@@ -592,8 +669,10 @@ pub mod quota;
 pub mod session;
 pub mod token_budget;
 pub mod truncator;
+pub mod vector_search;
 #[cfg(feature = "vertex")]
 pub mod vertex;
+pub mod vllm;
 pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
 
 /// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
@@ -627,6 +706,12 @@ pub(crate) struct IpcEnvelope {
 
 pub(crate) struct IpcRegistry {
     next_tx_id: std::sync::atomic::AtomicU64,
+    // Set by abort_all() when the reader stops.  Both the store and the load
+    // in register() happen under the pending lock, so a registration racing
+    // the shutdown either lands before the drain and is aborted by it, or
+    // observes the flag and fails instead of waiting for a reply that can no
+    // longer arrive.
+    closed: std::sync::atomic::AtomicBool,
     pending: tokio::sync::Mutex<
         std::collections::HashMap<
             u64,
@@ -639,8 +724,15 @@ impl IpcRegistry {
     pub fn new() -> Self {
         Self {
             next_tx_id: std::sync::atomic::AtomicU64::new(1),
+            closed: std::sync::atomic::AtomicBool::new(false),
             pending: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Advisory check for callers that want to skip work on a dead channel.
+    /// register() makes the authoritative decision under the pending lock.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn next_id(&self) -> u64 {
@@ -652,8 +744,14 @@ impl IpcRegistry {
         &self,
         tx_id: u64,
         tx: tokio::sync::oneshot::Sender<Result<AiResponse, RemoteAiError>>,
-    ) {
+    ) -> Result<(), RemoteAiError> {
         let mut map = self.pending.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            });
+        }
         if map.insert(tx_id, tx).is_some() {
             eprintln!(
                 "CRITICAL PROTOCOL ERROR: Duplicate transaction ID {} registered!",
@@ -661,6 +759,7 @@ impl IpcRegistry {
             );
             std::process::exit(1);
         }
+        Ok(())
     }
 
     pub async fn dispatch(&self, tx_id: u64, result: Result<AiResponse, RemoteAiError>) {
@@ -678,6 +777,7 @@ impl IpcRegistry {
 
     pub async fn abort_all(&self, err: RemoteAiError) {
         let mut map = self.pending.lock().await;
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         for (_tx_id, sender) in map.drain() {
             let _ = sender.send(Err(err.clone()));
         }
@@ -717,7 +817,49 @@ impl Default for AtomicWriter {
     }
 }
 
-pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
+// Concurrent reviews each build a fresh provider.  A registry per provider
+// would restart tx_ids at 1 and add a second reader on the shared stdin, so
+// a response could land in a registry that never issued that id.
+static IPC_REGISTRY: std::sync::OnceLock<Arc<IpcRegistry>> = std::sync::OnceLock::new();
+static IPC_WRITER: std::sync::OnceLock<Arc<AtomicWriter>> = std::sync::OnceLock::new();
+// Holding the join handle rather than a "started" flag lets
+// ensure_stdin_reader() tell a running reader from one that has stopped --
+// stdin EOF, a read error, or the runtime it was spawned on being dropped --
+// and replace it, so a later request never waits on a reply that nothing is
+// left to deliver.
+static IPC_READER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn ipc_registry() -> Arc<IpcRegistry> {
+    IPC_REGISTRY
+        .get_or_init(|| Arc::new(IpcRegistry::new()))
+        .clone()
+}
+
+pub(crate) fn ipc_writer() -> Arc<AtomicWriter> {
+    IPC_WRITER
+        .get_or_init(|| Arc::new(AtomicWriter::new()))
+        .clone()
+}
+
+/// Spawns the stdin reader unless one is already running on this runtime.
+pub(crate) fn ensure_stdin_reader() {
+    let registry = ipc_registry();
+
+    // Once the channel has closed it stays closed, so a replacement reader
+    // would do nothing but hit EOF again.  register() reports the failure.
+    if registry.is_closed() {
+        return;
+    }
+
+    let mut reader = IPC_READER.lock().unwrap();
+    if matches!(reader.as_ref(), Some(handle) if !handle.is_finished()) {
+        return;
+    }
+    *reader = Some(start_stdin_reader(registry));
+}
+
+pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let stdin = tokio::io::stdin();
@@ -725,20 +867,12 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
         let mut lines = reader.lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            let active_registry = match registry.upgrade() {
-                Some(r) => r,
-                None => {
-                    tracing::info!("IPC Registry dropped, shutting down stdin reader task.");
-                    break;
-                }
-            };
-
             if let Ok(envelope) = serde_json::from_str::<IpcEnvelope>(&line) {
                 match envelope.msg_type.as_str() {
                     "ai_response" => {
                         if let Ok(payload) = serde_json::from_value::<AiResponse>(envelope.payload)
                         {
-                            active_registry.dispatch(envelope.tx_id, Ok(payload)).await;
+                            registry.dispatch(envelope.tx_id, Ok(payload)).await;
                         } else {
                             eprintln!(
                                 "CRITICAL PROTOCOL ERROR: Failed to parse payload as AiResponse for tx_id {}",
@@ -751,7 +885,7 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
                         if let Ok(payload) =
                             serde_json::from_value::<RemoteAiErrorPayload>(envelope.payload)
                         {
-                            active_registry
+                            registry
                                 .dispatch(envelope.tx_id, Err(payload.into_error()))
                                 .await;
                         } else {
@@ -776,15 +910,13 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
             }
         }
 
-        if let Some(active_registry) = registry.upgrade() {
-            active_registry
-                .abort_all(RemoteAiError {
-                    message: "IPC channel disconnected (stdin closed)".to_string(),
-                    class: AiErrorClass::Fatal,
-                })
-                .await;
-        }
-    });
+        registry
+            .abort_all(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            })
+            .await;
+    })
 }
 
 #[cfg(test)]
@@ -1158,5 +1290,76 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    // Providers built for concurrent reviews share one tx_id namespace.
+    // next_id() is deliberately not called here: the counter is process-wide,
+    // and advancing it would make any test that asserts a concrete tx_id
+    // depend on the order the test threads happen to run in.
+    #[test]
+    fn test_ipc_singletons_are_shared() {
+        assert!(Arc::ptr_eq(&ipc_registry(), &ipc_registry()));
+        assert!(Arc::ptr_eq(&ipc_writer(), &ipc_writer()));
+    }
+
+    // A request issued after the reader stopped fails instead of waiting for
+    // a reply that can no longer arrive.  Uses its own registry so the
+    // process-wide one is not closed for every other test in the binary.
+    #[tokio::test]
+    async fn test_register_after_disconnect_fails() {
+        let registry = IpcRegistry::new();
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        registry
+            .register(1, tx)
+            .await
+            .expect("an open registry accepts a registration");
+
+        registry
+            .abort_all(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            })
+            .await;
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = registry
+            .register(2, tx)
+            .await
+            .expect_err("a closed registry rejects a registration");
+        assert!(matches!(err.class, AiErrorClass::Fatal));
+    }
+
+    #[test]
+    fn test_ai_usage_accumulate() {
+        let mut u1 = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(30),
+        };
+        let u2 = AiUsage {
+            prompt_tokens: 200,
+            completion_tokens: 80,
+            total_tokens: 280,
+            cached_tokens: Some(70),
+        };
+        u1.accumulate(&u2);
+        assert_eq!(u1.prompt_tokens, 300);
+        assert_eq!(u1.completion_tokens, 130);
+        assert_eq!(u1.total_tokens, 430);
+        assert_eq!(u1.cached_tokens, Some(100));
+
+        let u3 = AiUsage {
+            prompt_tokens: 50,
+            completion_tokens: 20,
+            total_tokens: 70,
+            cached_tokens: None,
+        };
+        u1.accumulate(&u3);
+        assert_eq!(u1.prompt_tokens, 350);
+        assert_eq!(u1.completion_tokens, 150);
+        assert_eq!(u1.total_tokens, 500);
+        assert_eq!(u1.cached_tokens, Some(100));
     }
 }

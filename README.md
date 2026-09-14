@@ -6,7 +6,7 @@
 
 > **Sashiko** (刺し子, literally "little stabs") is a form of decorative reinforcement stitching from Japan. Originally used to reinforce points of wear or to repair worn places or tears with patches, here it represents our mission to reinforce the Linux kernel through automated, intelligent patch review.
 
-Sashiko is an agentic Linux kernel code review system. It uses a set Linux kernel-specific prompts and a special protocol to review proposed Linux kernel changes. Sashiko can ingest patches from mailing lists or local git. It's fully self contained (doesn't use any external agentic cli tools) and can work with various LLM providers.
+Sashiko is an agentic Linux kernel code review system. It uses a set of Linux kernel-specific prompts and a special protocol to review proposed Linux kernel changes. Sashiko can ingest patches from mailing lists or local git. It's fully self contained (doesn't use any external agentic cli tools) and can work with various LLM providers.
 
 If you are a kernel maintainer, please see our [Guide for Kernel Maintainers](MAINTAINERS_GUIDE.md) for information on interacting with Sashiko.
 
@@ -32,17 +32,28 @@ Please, note that as with any other LLM-based tools, Sashiko's output is probabi
 Sashiko uses a multi-stage review protocol to evaluate patches thoroughly from multiple perspectives, mimicking a team of specialized reviewers.
 
 ### Review Stages
-1.  **Stage 1: Analyze commit main goal.** Focuses on the big picture, architectural flaws, UAPI breakages, and conceptual correctness.
-2.  **Stage 2: High-level implementation verification.** Verifies if the code matches the commit message claims, checking for missing pieces, undocumented side-effects, and API contract violations.
-3.  **Stage 3: Execution flow verification.** Traces C code execution flow, checking for logic errors, missing return checks, unhandled error paths, and off-by-one errors.
-4.  **Stage 4: Resource management.** Analyzes memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
-5.  **Stage 5: Locking and synchronization.** Investigates concurrency issues, deadlocks, RCU rule violations, and thread-safety.
-6.  **Stage 6: Security audit.** Audits for buffer overflows, OOB reads/writes, TOCTOU races, and information leaks (like copying uninitialized memory).
-7.  **Stage 7: Hardware engineer's review.** Specifically reviews driver and hardware code for correct register accesses, DMA mapping, memory barriers, and state machine constraints.
-8.  **Stage 8: Deduplication and Consolidation.** Consolidates feedback from stages 1-7, merges duplicates, and groups overlapping issues.
-9.  **Stage 9: Concern/dismissed-concern conflict resolution.** Compares consolidated concerns against consolidated dismissed concerns and keeps only concerns that survive concrete code-based conflict checks.
-10. **Stage 10: Verification and severity estimation.** Validates the remaining concerns, filters false positives, and estimates severity.
-11. **Stage 11: Report generation.** Converts confirmed findings into a polite, standard, inline-commented LKML email reply.
+
+Stages are identified by name. The analysis stages run in parallel; the
+consolidation stages then run in sequence over what they produced.
+
+**Analysis stages.** `goal`, `implementation` and `execution-flow` always run.
+The planning stage decides which of the rest a patch warrants, and `--stages`
+overrides that choice by name.
+
+- **goal** -- the big picture: architectural flaws, UAPI breakages, and conceptual correctness.
+- **implementation** -- whether the code matches the commit message's claims, checking for missing pieces, undocumented side-effects, and API contract violations.
+- **execution-flow** -- traces C code execution, checking for logic errors, missing return checks, unhandled error paths, and off-by-one errors.
+- **resources** -- memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
+- **locking** -- concurrency issues, deadlocks, RCU rule violations, and thread-safety.
+- **security** -- buffer overflows, OOB reads/writes, TOCTOU races, and information leaks (like copying uninitialized memory).
+- **hardware** -- driver and hardware code: register accesses, DMA mapping, memory barriers, and state machine constraints.
+
+**Consolidation stages**, in order:
+
+- **deduplication** -- consolidates feedback from the analysis stages, merges duplicates, and groups overlapping issues.
+- **conflict-resolution** -- compares consolidated concerns against consolidated dismissed concerns and keeps only concerns that survive concrete code-based conflict checks.
+- **verification** -- validates the remaining concerns, filters false positives, and estimates severity.
+- **report** -- converts confirmed findings into a polite, standard, inline-commented LKML email reply.
 
 
 Also Sashiko is using per-subsystem and generic prompts, initially developed by Chris Mason:
@@ -198,6 +209,12 @@ For the full command reference, see the [CLI Reference](docs/sashiko-cli.md).
 Sashiko includes a benchmark tool to evaluate review quality against known
 bugs. See the [Benchmarking Guide](docs/benchmarking.md) for setup and
 usage.
+
+## Security & Data Privacy
+
+Sashiko implements stateless JWT-based authorization and login via sign-in links.
+API mutations are strictly controlled by a fine-grained, capability-based Access Control List (ACL) configured in `Settings.toml` (`[server.acl]`). Administrators assign user identities directly to specific capability arrays (`ingest`, `cancel`, `review`), adhering strictly to the principle of least privilege. Two further arrays cover the Linux kernel bug tracker: `security` lists the kernel security list, whose members read and comment on every bug and read the raw AI transcripts without gaining any other capability, and `bug_reporters` lists the principals permitted to file a bug over HTTP, which ships empty so that only admins can. Authority over an individual bug is not a capability array: it is resolved per request from MAINTAINERS, so a maintainer reaches exactly the bugs filed against the subsystems they are listed for. In addition, an explicit `blocklist` array denies access unconditionally, taking precedence over every capability, over admin rights and over every bypass. If the ACL configuration is omitted or the arrays are empty, the server transparently falls back to a completely secure, "Fail-Closed" mode where no remote mutations are permitted.
+The server operates without persistent traditional user accounts and retains **no user data** aside from the explicit comments, actions, and review history metadata submitted directly onto the hosted bugs.
 
 ## Communication
 

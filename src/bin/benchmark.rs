@@ -19,6 +19,7 @@ use futures::stream::StreamExt;
 use regex::Regex;
 use reqwest::Client;
 use sashiko::ai::{AiProvider, LlmSession, SessionRunner, ValidationError, create_provider};
+use sashiko::auth::LocalToken;
 use sashiko::db::Database;
 use sashiko::settings::Settings;
 use serde::{Deserialize, Serialize};
@@ -127,8 +128,27 @@ async fn main() -> Result<()> {
         };
         let client = Client::new();
 
+        // The server writes this on every start, so a benchmark run on the
+        // same machine authenticates without being configured. Its absence is
+        // not fatal here: a server started with --enable-unsafe-all-submit
+        // accepts the submissions anyway, and the refusal below reports the
+        // missing credential far more precisely than a guess would.
+        let local_token_path = settings.local_token_path();
+        let local_token = match LocalToken::read_from(&local_token_path) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                warn!(
+                    "Submitting without a local token ({}: {})",
+                    local_token_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
         // --- Phase 1: Ingestion ---
         info!("--- Phase 1: Ingesting Patches ---");
+        let mut refusals = Vec::new();
         for entry in &benchmark_entries {
             info!("Submitting commit: {}", entry.commit);
             let payload = SubmitRequest::Remote {
@@ -136,24 +156,57 @@ async fn main() -> Result<()> {
                 repo: repo_url.clone(),
             };
 
-            let res = client.post(&target_url).json(&payload).send().await;
-            match res {
+            let mut request = client.post(&target_url).json(&payload);
+            if let Some(token) = &local_token {
+                request = request.bearer_auth(token.secret());
+            }
+
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    info!("Successfully submitted {}", entry.commit);
+                }
                 Ok(response) => {
-                    if response.status().is_success() {
-                        info!("Successfully submitted {}", entry.commit);
-                    } else {
-                        let status = response.status();
-                        let text = response.text().await.unwrap_or_default();
-                        error!(
-                            "Failed to submit {}: Status {} Body: {}",
-                            entry.commit, status, text
-                        );
-                    }
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    error!(
+                        "Failed to submit {}: Status {} Body: {}",
+                        entry.commit, status, body
+                    );
+                    refusals.push((entry.commit.clone(), status.to_string()));
                 }
                 Err(e) => {
                     error!("Failed to send request for {}: {}", entry.commit, e);
+                    refusals.push((entry.commit.clone(), e.to_string()));
                 }
             }
+        }
+
+        // A patch that was never accepted never appears in the database, so
+        // carrying on would spend the run waiting for something that cannot
+        // arrive. Stop here and say what went wrong instead.
+        if !refusals.is_empty() {
+            let refused_ingest = refusals
+                .iter()
+                .any(|(_, reason)| reason.contains("401") || reason.contains("403"));
+            let hint = if refused_ingest {
+                format!(
+                    "\nThe server refused the credential. It publishes one at {} on every \
+                     start: check that it is running as this user, from this directory, and \
+                     that the file is current.",
+                    local_token_path.display()
+                )
+            } else {
+                String::new()
+            };
+
+            anyhow::bail!(
+                "{} of {} submissions were rejected, so the run cannot proceed. First: {} ({}){}",
+                refusals.len(),
+                total_entries,
+                refusals[0].0,
+                refusals[0].1,
+                hint
+            );
         }
 
         // --- Phase 2: Wait for Reviews to Finish ---
@@ -292,7 +345,7 @@ async fn main() -> Result<()> {
     info!("Missed: {}", missed_count);
     info!("Not Reviewed/Found: {}", not_reviewed_count);
     info!("Skipped (No Description): {}", skipped_count);
-    info!("Total Concerns (Before Stage 8): {}", total_concerns);
+    info!("Total Concerns (Before Deduplication): {}", total_concerns);
     info!("Total Findings (Final Report): {}", total_findings);
 
     if valid_metric_count > 0 {
@@ -451,7 +504,7 @@ async fn process_entry(
             tokens_out = row.get::<i64>(1).unwrap_or(0) as u32;
             let int_created_at = row.get::<i64>(2).unwrap_or(0);
 
-            if let Ok(Some(output_raw)) = row.get::<Option<String>>(3)
+            if let Ok(Some(output_raw)) = sashiko::compression::get_compressed_string_opt(&row, 3)
                 && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output_raw)
                 && let Some(count) = parsed.get("concerns_count").and_then(|v| v.as_u64())
             {
@@ -502,6 +555,20 @@ async fn process_entry(
 
             findings_text.push_str(&format!("- [Severity {}] {}\n", severity, msg));
             if let Some(e) = explanation {
+                findings_text.push_str(&format!("  Explanation: {}\n", e));
+            }
+            findings_count += 1;
+        }
+    }
+
+    if let Ok(bugs) = db.list_bugs_for_review(review_id).await {
+        for (bug, _) in bugs {
+            findings_text.push_str(&format!(
+                "- [Severity {}] {}\n",
+                bug.severity().as_str(),
+                bug.problem()
+            ));
+            if let Some(e) = bug.severity_explanation() {
                 findings_text.push_str(&format!("  Explanation: {}\n", e));
             }
             findings_count += 1;

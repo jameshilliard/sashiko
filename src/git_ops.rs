@@ -384,6 +384,119 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Checks whether a specific file path exists in git at a specific commit (or HEAD).
+pub async fn git_file_exists_at(repo_path: &Path, file_path: &str, commit: Option<&str>) -> bool {
+    let target = commit.unwrap_or("HEAD");
+    let obj = format!("{}:{}", target, file_path);
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["cat-file", "-e", &obj])
+        .output()
+        .await;
+
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// Traces Git history to check if a file was renamed or moved across commits,
+/// returning its latest path at the given commit or top-of-trunk.
+pub async fn git_find_file_rename(
+    repo_path: &Path,
+    file_path: &str,
+    target_commit: Option<&str>,
+) -> Option<String> {
+    if !repo_path.exists() {
+        return None;
+    }
+
+    // 1. If file already exists at target, return as-is
+    if git_file_exists_at(repo_path, file_path, target_commit).await {
+        return Some(file_path.to_string());
+    }
+
+    // 2. Trace forward renames (up to 5 steps) via git show -M on the commit modifying the file
+    let mut current_file = file_path.to_string();
+    for _ in 0..5 {
+        let last_commit_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["log", "-n", "1", "--format=%H", "--", &current_file])
+            .output()
+            .await
+            .ok()?;
+
+        if !last_commit_output.status.success() {
+            break;
+        }
+
+        let commit_sha = String::from_utf8_lossy(&last_commit_output.stdout)
+            .trim()
+            .to_string();
+        if commit_sha.is_empty() {
+            break;
+        }
+
+        let diff_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["show", "-M", "--name-status", "--format=", &commit_sha])
+            .output()
+            .await
+            .ok()?;
+
+        if !diff_output.status.success() {
+            break;
+        }
+
+        let diff_str = String::from_utf8_lossy(&diff_output.stdout);
+        let mut renamed_to = None;
+        for line in diff_str.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 3 && parts[0].starts_with('R') && parts[1] == current_file {
+                renamed_to = Some(parts[2].to_string());
+                break;
+            }
+        }
+
+        if let Some(next_path) = renamed_to {
+            current_file = next_path;
+            if git_file_exists_at(repo_path, &current_file, target_commit).await {
+                return Some(current_file);
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 3. Fallback: check git log --follow backwards
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .arg("log")
+        .arg("--follow")
+        .arg("--name-only")
+        .arg("--format=format:")
+        .arg(file_path);
+
+    let Ok(output) = cmd.output().await else {
+        return None;
+    };
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if git_file_exists_at(repo_path, trimmed, target_commit).await {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 #[allow(dead_code)]
 pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     info!("Pruning git worktrees in {:?}", repo_path);
@@ -430,6 +543,263 @@ pub async fn ensure_submodule_config_compat(repo_path: &Path) -> Result<()> {
     } else {
         info!("Successfully unset core.worktree in {:?}", repo_path);
     }
+    Ok(())
+}
+
+/// Turns off git's own maintenance of the shared repository.
+///
+/// Auto-maintenance detaches from the fetch that triggers it and
+/// repacks while the sync worker keeps fetching, so it can discard
+/// objects a later fetch still names.  Nothing runs gc in its place,
+/// so the packs the repository accumulates are the cost of this.
+///
+/// Every key is attempted whatever the ones before it did, since a
+/// key left at its default is a piece of maintenance still running,
+/// and the error names all of them.  The caller logs and carries on
+/// either way, so the rest of the daemon runs whether or not this
+/// took.
+pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
+    const KEYS: &[(&str, &str)] = &[
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+        ("gc.writeCommitGraph", "false"),
+        ("fetch.writeCommitGraph", "false"),
+    ];
+
+    let mut failures = Vec::new();
+    for (key, value) in KEYS {
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["config", key, value])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            failures.push(format!(
+                "{} {}: {}",
+                key,
+                value,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(anyhow!("git config failed for {}", failures.join("; ")));
+    }
+
+    Ok(())
+}
+
+/// Locates a directory under the object store.  It follows the object
+/// directory rather than $GIT_DIR, which is why git resolves it
+/// instead of this function joining the two.
+async fn object_dir(repo_path: &Path, name: &str) -> Result<PathBuf> {
+    let relative = format!("objects/{}", name);
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", "--git-path", &relative])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-path {} failed: {}",
+            relative,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo_path.join(path))
+    }
+}
+
+/// Removes the commit-graph, whole or chained.  The graph is built
+/// from the object database and holds nothing else, so removing it
+/// costs slower revision walks and loses no history.
+///
+/// This takes no object-store lock.  A write ends in a rename, so a
+/// removal racing one leaves either a fresh graph or none, and both
+/// are states the repository is already prepared for.  A fetch
+/// recovering from a stale graph calls here holding a remote lock,
+/// and waiting out a walk under that lock costs more than the race
+/// does.  Callers already holding the lock, such as
+/// write_commit_graph, depend on this staying out.
+pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
+    let info_dir = object_dir(repo_path, "info").await?;
+
+    let graph = info_dir.join("commit-graph");
+    match tokio::fs::remove_file(&graph).await {
+        Ok(()) => info!("Removed commit-graph {:?}", graph),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to remove {:?}: {}", graph, e)),
+    }
+
+    let chain = info_dir.join("commit-graphs");
+    match tokio::fs::remove_dir_all(&chain).await {
+        Ok(()) => info!("Removed commit-graph chain {:?}", chain),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("Failed to remove {:?}: {}", chain, e)),
+    }
+
+    Ok(())
+}
+
+/// Runs one `git commit-graph write`, returning git's own output.
+async fn run_commit_graph_write(repo_path: &Path) -> Result<std::process::Output> {
+    Ok(Command::new("git")
+        .current_dir(repo_path)
+        .args(["commit-graph", "write", "--reachable"])
+        .output()
+        .await?)
+}
+
+/// Counts the pack files in the object store and the bytes they take
+/// up.  Reads the pack directory rather than asking git, so the cost
+/// does not follow the number of loose objects.
+pub async fn pack_stats(repo_path: &Path) -> Result<(usize, u64)> {
+    let pack_dir = object_dir(repo_path, "pack").await?;
+
+    let mut entries = match tokio::fs::read_dir(&pack_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(anyhow!("Failed to read {:?}: {}", pack_dir, e)),
+    };
+
+    let mut packs = 0usize;
+    let mut bytes = 0u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            packs += 1;
+            if let Ok(meta) = entry.metadata().await {
+                bytes += meta.len();
+            }
+        }
+    }
+
+    Ok((packs, bytes))
+}
+
+/// Rebuilds the commit-graph from the current object database,
+/// dropping a graph that turns the write away and walking again.
+///
+/// The graph records what the object database holds at the moment of
+/// the walk.  A fetch running beside it costs the graph only the
+/// commits that fetch installs.  A repack is what leaves an entry
+/// with no object behind it, and the object-store lock this takes is
+/// what keeps one out.
+///
+/// The walk consults the graph already in place, so one naming lost
+/// objects fails the write the way it fails a fetch.  Nothing else
+/// here needs that graph, so drop it and rebuild from the object
+/// database alone.  This is the only pass that writes a graph, and
+/// git's verify passes a graph that is merely behind the refs, so
+/// the write cannot be made conditional on one.
+pub async fn write_commit_graph(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+
+    info!("Writing commit-graph for {:?}", repo_path);
+    let started = std::time::Instant::now();
+
+    let mut output = run_commit_graph_write(repo_path).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if is_stale_commit_graph(&stderr) {
+            warn!(
+                "Commit-graph in {:?} outlived the objects it names; dropping it",
+                repo_path
+            );
+            drop_commit_graph(repo_path).await?;
+            output = run_commit_graph_write(repo_path).await?;
+        }
+    }
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git commit-graph write failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!(
+        "Wrote commit-graph for {:?} in {:.1}s",
+        repo_path,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Rebuilds the commit-graph in the background once a recovery has
+/// removed it.
+///
+/// A recovery leaves the repository walking history with no graph
+/// until something writes one back.  The walk takes minutes and every
+/// caller holds a fetch lock, so none of them can wait for it.  A
+/// rebuild already under way stands in for a later one, since it
+/// reads the object database as it finds it.  Call from a tokio
+/// runtime.
+pub fn schedule_commit_graph_rebuild(repo_path: &Path) {
+    static REBUILD_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    let lock = REBUILD_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone();
+    let repo_path = repo_path.to_path_buf();
+
+    tokio::spawn(async move {
+        let Ok(_guard) = lock.try_lock() else {
+            info!("A commit-graph rebuild is already running; skipping this one");
+            return;
+        };
+        if let Err(e) = write_commit_graph(&repo_path).await {
+            error!("Failed to rebuild the commit-graph: {}", e);
+        }
+    });
+}
+
+/// Rolls the pack directory up into a geometric progression and
+/// writes a multi-pack index over the result.
+///
+/// Loose objects join the rollup.  A fetch carrying fewer objects
+/// than transfer.unpackLimit writes them loose rather than as a pack,
+/// so they are most of what accumulates here.
+///
+/// The pass takes no reachability walk, so it removes no object.  A
+/// commit-graph entry, a worktree, or a scratch clone borrowing from
+/// this store still finds what it named.  Disk goes unreclaimed for
+/// the same reason: an object no ref can reach is rolled up with the
+/// rest.
+pub async fn repack_repository(repo_path: &Path) -> Result<()> {
+    let lock = get_object_store_lock();
+    let _guard = lock.lock().await;
+
+    info!("Repacking {:?}", repo_path);
+    let started = std::time::Instant::now();
+
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["repack", "--geometric=2", "-d", "--write-midx"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git repack failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!(
+        "Repacked {:?} in {:.1}s",
+        repo_path,
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -510,6 +880,88 @@ fn get_worktree_lock() -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
+/// The lock every pass that walks or rewrites the shared object
+/// store takes: the commit-graph verify, the commit-graph write, and
+/// the repack.  Two writes collide on
+/// objects/info/commit-graph.lock and one of them dies.  A verify
+/// beside a write reads a graph the write is halfway through
+/// replacing.  A walk beside a repack reads the pack directory the
+/// repack is replacing.
+///
+/// Each pass runs to minutes on a tree the size of Linux, so a
+/// caller can wait that long for the lock.  None of them holds a
+/// fetch lock.
+fn get_object_store_lock() -> Arc<AsyncMutex<()>> {
+    static OBJECT_STORE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+    OBJECT_STORE_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// Git's two wordings for a commit-graph that names a commit the
+/// object database does not hold.  Fetch-pack's negotiation emits
+/// the first.  The second comes from the generic commit parse, which
+/// ref negotiation, a pruning fetch, and the connectivity check all
+/// reach instead.
+const STALE_COMMIT_GRAPH: &[&str] = &[
+    "in the commit graph file but not in the object database",
+    "exists in commit-graph but not in the object database",
+];
+
+/// True when git turned an operation away over a commit-graph that
+/// outlived the objects it names.  Every path that reads the graph
+/// fails this way until the graph is dropped, so a caller that
+/// fetches has a retry worth making.
+pub fn is_stale_commit_graph(message: &str) -> bool {
+    STALE_COMMIT_GRAPH
+        .iter()
+        .any(|wording| message.contains(wording))
+}
+
+/// The least the retry after a graph drop is given, whatever the
+/// first attempt spent.  Fetch-pack rejects the graph before it opens
+/// a connection, but the wording the commit parse emits can arrive
+/// after a long transfer, which leaves nothing of the shared budget.
+/// A retry handed that reports a timeout instead of the recovery it
+/// was, and the graph outlives the cycle.
+const GRAPH_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Runs one fetch, returning git's complaint rather than an error
+/// value, since the caller decides which failures are worth a retry.
+async fn fetch_remote(
+    repo_path: &Path,
+    name: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    let fetch_future = Command::new("git")
+        .current_dir(repo_path)
+        .args(GIT_PROTOCOL_RESTRICTIONS)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+
+    match tokio::time::timeout(timeout, fetch_future).await {
+        Ok(Ok(fetch)) => {
+            if fetch.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to fetch remote {}: {}",
+                    name,
+                    String::from_utf8_lossy(&fetch.stderr).trim()
+                ))
+            }
+        }
+        Ok(Err(e)) => Err(format!("Failed to execute git fetch for {}: {}", name, e)),
+        Err(_) => Err(format!(
+            "Git fetch for {} timed out after {} seconds",
+            name,
+            timeout.as_secs()
+        )),
+    }
+}
+
 pub async fn ensure_remote(
     repo_path: &Path,
     name: &str,
@@ -586,11 +1038,31 @@ pub async fn ensure_remote(
         std::fs::create_dir_all(&timestamp_dir)?;
     }
     let timestamp_file = timestamp_dir.join(name);
+    let fail_file = timestamp_dir.join(format!("{}.fail", name));
 
     let age = std::fs::metadata(&timestamp_file)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
+
+    let fail_age = std::fs::metadata(&fail_file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
+
+    let failed_recently = match fail_age {
+        Some(a) => a < std::time::Duration::from_secs(3600),
+        None => false,
+    };
+
+    if failed_recently && !force_fetch {
+        let reason = "failed recently, backing off";
+        info!("Skipping fetch for {} ({})", name, reason);
+        return Err(anyhow::anyhow!(
+            "Remote {} failed recently, backing off",
+            name
+        ));
+    }
 
     // Check if HEAD exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
@@ -633,12 +1105,11 @@ pub async fn ensure_remote(
     if should_fetch {
         info!("Fetching remote {}", name);
 
-        let fetch_future = Command::new("git")
-            .current_dir(repo_path)
-            .args(GIT_PROTOCOL_RESTRICTIONS)
-            .args(["fetch", "--prune", "--no-tags", name])
-            .kill_on_drop(true)
-            .output();
+        let mut fetch_args = vec!["fetch", "--prune"];
+        if !url.contains("torvalds/linux.git") && !url.contains("stable/linux.git") {
+            fetch_args.push("--no-tags");
+        }
+        fetch_args.push(name);
 
         // Dynamically scale timeout: 30 minutes for heavy initial fetches, 5 minutes for routine updates
         let timeout_duration = if just_added || !head_exists {
@@ -647,68 +1118,57 @@ pub async fn ensure_remote(
             std::time::Duration::from_secs(300)
         };
 
-        match tokio::time::timeout(timeout_duration, fetch_future).await {
-            Ok(Ok(mut fetch)) => {
-                if !fetch.status.success() {
-                    let stderr = String::from_utf8_lossy(&fetch.stderr);
+        let started = std::time::Instant::now();
+        let mut attempt = fetch_remote(repo_path, name, &fetch_args, timeout_duration).await;
 
-                    // Auto-recover from bad tags
-                    if stderr.contains("fatal: bad object refs/tags/")
-                        && let Some(start) = stderr.find("refs/tags/")
-                    {
-                        let tag_path = &stderr[start..];
-                        let tag_path = tag_path.split_whitespace().next().unwrap_or("");
-                        if !tag_path.is_empty() {
-                            warn!(
-                                "Detected bad tag '{}'. Attempting to delete and retry fetch.",
-                                tag_path
-                            );
-                            let _ = Command::new("git")
-                                .current_dir(repo_path)
-                                .args(["update-ref", "-d", tag_path])
-                                .output()
-                                .await;
-
-                            // Retry the fetch once
-                            let retry_future = Command::new("git")
-                                .current_dir(repo_path)
-                                .args(GIT_PROTOCOL_RESTRICTIONS)
-                                .args(["fetch", "--prune", "--no-tags", name])
-                                .kill_on_drop(true)
-                                .output();
-
-                            if let Ok(Ok(retry_fetch)) =
-                                tokio::time::timeout(timeout_duration, retry_future).await
-                            {
-                                fetch = retry_fetch;
-                            }
-                        }
+        // Git reads the commit-graph before it opens a connection, so
+        // a graph naming lost objects fails every remote in the same
+        // way.  Drop it and let this fetch rebuild the answer from the
+        // object database.
+        let stale_graph = attempt
+            .as_ref()
+            .err()
+            .is_some_and(|message| is_stale_commit_graph(message));
+        if stale_graph {
+            warn!("Fetch for {} found a stale commit-graph; dropping it", name);
+            match drop_commit_graph(repo_path).await {
+                Ok(()) => {
+                    // Both attempts come out of the one budget.  This
+                    // holds the remote's lock, and the sync cycle
+                    // walks the remotes one at a time.  The floor is
+                    // what a first attempt that spent the budget
+                    // before it tripped leaves the retry.
+                    let remaining = timeout_duration
+                        .saturating_sub(started.elapsed())
+                        .max(GRAPH_RETRY_FLOOR);
+                    attempt = fetch_remote(repo_path, name, &fetch_args, remaining).await;
+                    match &attempt {
+                        Ok(()) => info!(
+                            "Fetch for {} succeeded once the commit-graph was gone",
+                            name
+                        ),
+                        Err(message) => warn!(
+                            "Fetch for {} fails with no commit-graph in the way: {}",
+                            name, message
+                        ),
                     }
+                    schedule_commit_graph_rebuild(repo_path);
                 }
-
-                if fetch.status.success() {
-                    fetch_ok = true;
-                } else {
-                    error_msg = format!(
-                        "Failed to fetch remote {}: {}",
-                        name,
-                        String::from_utf8_lossy(&fetch.stderr).trim()
-                    );
-                }
-            }
-            Ok(Err(e)) => {
-                error_msg = format!("Failed to execute git fetch for {}: {}", name, e);
-            }
-            Err(_) => {
-                error_msg = format!(
-                    "Git fetch for {} timed out after {} seconds",
-                    name,
-                    timeout_duration.as_secs()
-                );
+                Err(e) => warn!("Failed to drop the commit-graph: {}", e),
             }
         }
 
+        match attempt {
+            Ok(()) => fetch_ok = true,
+            Err(message) => error_msg = message,
+        }
+
         if !fetch_ok {
+            // Record failure timestamp for backoff
+            if let Ok(file) = std::fs::File::create(&fail_file) {
+                let _ = file.set_len(0);
+            }
+
             let max_stale_age = std::time::Duration::from_secs(86400); // 24 hours
             let can_fallback = head_exists
                 && match age {
@@ -727,7 +1187,8 @@ pub async fn ensure_remote(
                 return Err(anyhow::anyhow!(error_msg));
             }
         } else {
-            // Update timestamp only on success
+            // Clear any failure file and update success timestamp
+            let _ = std::fs::remove_file(&fail_file);
             if let Ok(file) = std::fs::File::create(&timestamp_file) {
                 let _ = file.set_len(0);
             }
@@ -748,11 +1209,70 @@ pub async fn ensure_remote(
             .await?;
 
         if !set_head.status.success() {
-            warn!(
-                "Failed to set-head for remote {}: {}",
-                name,
-                String::from_utf8_lossy(&set_head.stderr)
-            );
+            // Try common default branch names if --auto could not determine HEAD
+            let mut head_resolved = false;
+            for branch in ["master", "main", "for-next", "for-linus"] {
+                let branch_ref = format!("refs/remotes/{}/{}", name, branch);
+                let branch_exists = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["show-ref", "--verify", "-q", &branch_ref])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if branch_exists {
+                    let set_explicit = Command::new("git")
+                        .current_dir(repo_path)
+                        .args(GIT_PROTOCOL_RESTRICTIONS)
+                        .args(["remote", "set-head", name, branch])
+                        .output()
+                        .await?;
+                    if set_explicit.status.success() {
+                        head_resolved = true;
+                        break;
+                    }
+                }
+            }
+
+            if !head_resolved {
+                tracing::debug!(
+                    "Could not set default HEAD for remote {}: {}",
+                    name,
+                    String::from_utf8_lossy(&set_head.stderr).trim()
+                );
+            }
+        }
+
+        // If we fetched 'origin', also keep local tracking branches (master/main) in sync
+        // with origin so local branches do not become stale over time.
+        if name == "origin" {
+            for default_branch in ["master", "main"] {
+                let remote_ref = format!("refs/remotes/origin/{}", default_branch);
+                let local_ref = format!("refs/heads/{}", default_branch);
+                let remote_exists = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["show-ref", "--verify", "-q", &remote_ref])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let local_exists = Command::new("git")
+                    .current_dir(repo_path)
+                    .args(["show-ref", "--verify", "-q", &local_ref])
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if remote_exists && local_exists {
+                    let _ = Command::new("git")
+                        .current_dir(repo_path)
+                        .args(["update-ref", &local_ref, &remote_ref])
+                        .output()
+                        .await;
+                }
+            }
         }
     }
 
@@ -1057,6 +1577,46 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    #[test]
+    fn test_is_stale_commit_graph_matches_both_wordings() {
+        assert!(is_stale_commit_graph(
+            "error: You are attempting to fetch 1a2b3c, which is in the \
+             commit graph file but not in the object database."
+        ));
+        assert!(is_stale_commit_graph(
+            "fatal: commit 1a2b3c exists in commit-graph but not in the \
+             object database"
+        ));
+        assert!(!is_stale_commit_graph("fatal: couldn't find remote ref"));
+    }
+
+    #[tokio::test]
+    async fn test_pack_stats_counts_only_packs() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        // A repository that has never packed reports nothing.
+        assert_eq!(pack_stats(&repo_path).await?, (0, 0));
+
+        let pack_dir = object_dir(&repo_path, "pack").await?;
+        std::fs::create_dir_all(&pack_dir)?;
+        let mut pack = File::create(pack_dir.join("pack-abc.pack"))?;
+        pack.write_all(b"0123456789")?;
+        File::create(pack_dir.join("pack-abc.idx"))?;
+
+        let (packs, bytes) = pack_stats(&repo_path).await?;
+        assert_eq!(packs, 1);
+        assert_eq!(bytes, 10);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_git_ops_extensions() -> Result<()> {
@@ -1389,85 +1949,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_remote_bad_tag_recovery() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let local_repo_path = temp_dir.path().join("local");
-        let remote_repo_path = temp_dir.path().join("remote");
-
-        std::fs::create_dir(&local_repo_path)?;
-        std::fs::create_dir(&remote_repo_path)?;
-
-        // Init remote repo
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["init"])
-            .output()
-            .await?;
-
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["config", "user.email", "test@example.com"])
-            .output()
-            .await?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["config", "user.name", "Test"])
-            .output()
-            .await?;
-        let mut file = File::create(remote_repo_path.join("file.txt"))?;
-        writeln!(file, "test")?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["add", "file.txt"])
-            .output()
-            .await?;
-        Command::new("git")
-            .current_dir(&remote_repo_path)
-            .args(["commit", "-m", "init"])
-            .output()
-            .await?;
-
-        // Init local repo
-        Command::new("git")
-            .current_dir(&local_repo_path)
-            .args(["init"])
-            .output()
-            .await?;
-
-        // Use ensure_remote to add remote and fetch
-        ensure_remote(
-            &local_repo_path,
-            "origin",
-            remote_repo_path.to_str().unwrap(),
-            true,
-        )
-        .await?;
-
-        // Create bad tag in local repo
-        let tags_dir = local_repo_path.join(".git").join("refs").join("tags");
-        std::fs::create_dir_all(&tags_dir)?;
-        let bad_tag_path = tags_dir.join("bad-tag");
-        let mut bad_tag_file = File::create(&bad_tag_path)?;
-        writeln!(bad_tag_file, "0000000000000000000000000000000000000000")?;
-
-        // Fetch again, should auto-recover and delete the bad tag
-        ensure_remote(
-            &local_repo_path,
-            "origin",
-            remote_repo_path.to_str().unwrap(),
-            true,
-        )
-        .await?;
-
-        assert!(
-            !bad_tag_path.exists(),
-            "Bad tag should have been deleted by recovery logic"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_ensure_remote_protocol_security() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let repo_path = dir.path().to_path_buf();
@@ -1504,6 +1985,179 @@ mod tests {
             !proof_file.exists(),
             "Command should NOT have been executed!"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_failure_backoff() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        // Init local repo
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        let url = "https://127.0.0.1:9/invalid-repo.git";
+
+        // Initial fetch should attempt and fail
+        let res1 = ensure_remote(&repo_path, "invalid", url, false).await;
+        assert!(res1.is_err());
+
+        let fail_file = repo_path.join(".sashiko/fetch_timestamps/invalid.fail");
+        assert!(fail_file.exists(), "Failure timestamp file should exist");
+
+        // Subsequent non-forced fetch should skip and back off
+        let res2 = ensure_remote(&repo_path, "invalid", url, false).await;
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().to_string().contains("backing off"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_remote_syncs_local_master_branch() -> Result<()> {
+        let remote_dir = tempfile::tempdir()?;
+        let local_dir = tempfile::tempdir()?;
+
+        // Init upstream remote repo with an initial commit on master
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["init", "-b", "master"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        std::fs::write(remote_dir.path().join("file.txt"), "v1")?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["add", "file.txt"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["commit", "-m", "commit 1"])
+            .output()
+            .await?;
+
+        // Clone local repo from remote
+        Command::new("git")
+            .args([
+                "clone",
+                remote_dir.path().to_str().unwrap(),
+                local_dir.path().to_str().unwrap(),
+            ])
+            .output()
+            .await?;
+
+        // Add a second commit to upstream
+        std::fs::write(remote_dir.path().join("file.txt"), "v2")?;
+        Command::new("git")
+            .current_dir(remote_dir.path())
+            .args(["commit", "-am", "commit 2"])
+            .output()
+            .await?;
+        let upstream_sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(remote_dir.path())
+                .args(["rev-parse", "master"])
+                .output()
+                .await?
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        // Run ensure_remote on local repo for 'origin'
+        ensure_remote(
+            local_dir.path(),
+            "origin",
+            remote_dir.path().to_str().unwrap(),
+            true,
+        )
+        .await?;
+
+        // Verify local branch 'master' was updated to upstream_sha
+        let local_master_sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(local_dir.path())
+                .args(["rev-parse", "refs/heads/master"])
+                .output()
+                .await?
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(local_master_sha, upstream_sha);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_git_find_file_rename() -> Result<()> {
+        let repo_dir = TempDir::new()?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["init"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        // 1. Commit initial file
+        std::fs::write(
+            repo_dir.path().join("old_driver.c"),
+            "int old_fn() { return 0; }\n",
+        )?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["add", "old_driver.c"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["commit", "-m", "add old_driver.c"])
+            .output()
+            .await?;
+
+        // 2. Rename file via git mv and commit
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["mv", "old_driver.c", "new_driver.c"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(repo_dir.path())
+            .args(["commit", "-m", "rename to new_driver.c"])
+            .output()
+            .await?;
+
+        // 3. Verify git_find_file_rename traces old_driver.c to new_driver.c
+        let resolved = git_find_file_rename(repo_dir.path(), "old_driver.c", None).await;
+        assert_eq!(resolved, Some("new_driver.c".to_string()));
+
+        // 4. Non-existent file returns None
+        let nonexistent = git_find_file_rename(repo_dir.path(), "does_not_exist.c", None).await;
+        assert_eq!(nonexistent, None);
 
         Ok(())
     }
