@@ -19,7 +19,6 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::Command;
 
 pub struct GitFindFilesTool;
 
@@ -71,9 +70,8 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
             return Err(anyhow!("Invalid revision"));
         }
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
-            .args(["ls-tree", "-r", "--name-only", revision]);
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.args(["ls-tree", "-r", "--name-only", revision]);
 
         if let Some(p) = path_str
             && p != "."

@@ -134,8 +134,7 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .current_dir(&repo_path)
+            let status = crate::git_cmd::in_dir(&repo_path)
                 .args(args)
                 .status()
                 .unwrap();
@@ -158,8 +157,7 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         // Resolve actual HEAD~1 SHA
-        let output = std::process::Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir(&repo_path)
             .args(["rev-parse", "HEAD~1"])
             .output()
             .unwrap();
@@ -177,8 +175,7 @@ mod tests {
         assert!(content.contains(&head_minus_1));
 
         // It should NOT contain the current HEAD SHA
-        let output_current = std::process::Command::new("git")
-            .current_dir(&repo_path)
+        let output_current = crate::git_cmd::in_dir(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap();
@@ -388,6 +385,43 @@ mod tests {
     }
 
     #[test]
+    fn test_git_grep_hyphen_pattern() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        // Search for a pattern starting with a hyphen (e.g. "-ETIMEDOUT" or "--")
+        let args = json!({
+            "revision": "HEAD",
+            "pattern": "-ETIMEDOUT",
+            "path": "src/"
+        });
+
+        let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
+        // Should succeed without error even if no matches found
+        assert!(
+            result.get("content").is_some()
+                || result.get("matches").is_some()
+                || result.get("message").is_some()
+        );
+    }
+
+    #[test]
+    fn test_git_grep_invalid_revision() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "revision": "--invalid-option",
+            "pattern": "foo"
+        });
+
+        let result = rt.block_on(toolbox.call("git_grep", args));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_read_prompt() {
         let (linux_path, prompts_path) = get_test_paths();
         // Enable prompt tool by passing path
@@ -417,6 +451,31 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// read_prompt resolves the requested name against its base, so the base
+    /// has to be the prompt directory. Handed a file, every call fails while
+    /// canonicalizing, which is how a caller passing `<prompts>/tool.md` went
+    /// unnoticed: the tool is optional, so its errors look like the model
+    /// simply choosing not to use it.
+    #[test]
+    fn test_read_prompt_base_is_the_prompt_directory() {
+        let (linux_path, prompts_path) = get_test_paths();
+        let rt = Runtime::new().unwrap();
+        // A guide the workflow already loads by name, so it cannot go missing
+        // without breaking the review itself. The nested path also covers the
+        // subdirectory case, which is most of what the tool is asked for.
+        let args = json!({ "name": "subsystem/locking.md" });
+
+        let toolbox = ToolBox::new(linux_path.clone(), Some(prompts_path.clone()));
+        let result = rt
+            .block_on(toolbox.call("read_prompt", args.clone()))
+            .expect("a name under the prompt directory must resolve");
+        assert!(!result["content"].as_str().unwrap_or_default().is_empty());
+
+        // A file as the base cannot resolve anything.
+        let wrong = ToolBox::new(linux_path, Some(prompts_path.join("tool.md")));
+        assert!(rt.block_on(wrong.call("read_prompt", args)).is_err());
+    }
+
     #[test]
     fn test_git_read_files_truncation() {
         let (linux_path, _prompts_path) = get_test_paths();
@@ -426,7 +485,7 @@ mod tests {
         let args = json!({
             "revision": "HEAD",
             "files": [
-                { "path": "src/worker/prompts.rs" }
+                { "path": "Cargo.lock" }
             ]
         });
 
@@ -441,15 +500,10 @@ mod tests {
         let returned_items = res["metadata"]["returned_items"].as_u64().unwrap() as usize;
         let actual_lines = content.lines().count();
 
-        // We expect actual_lines to match returned_items, or at least be extremely close (including warning lines).
-        // Currently, returned_items is slice.len() (2448), but content only has allowed_lines (~800) lines!
         println!("returned_items metadata: {}", returned_items);
         println!("actual returned content lines: {}", actual_lines);
 
-        assert!(
-            actual_lines < 2400,
-            "Content was not truncated! (should be around 800 lines)"
-        );
+        assert!(actual_lines < 3200, "Content was not truncated!");
         assert_eq!(
             returned_items + 1,
             actual_lines,
@@ -464,9 +518,9 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         let args = json!({
-            "object": "HEAD:src/worker/prompts.rs",
+            "object": "HEAD:Cargo.lock",
             "start_line": 1,
-            "end_line": 3000
+            "end_line": 4000
         });
 
         let result = rt.block_on(toolbox.call("git_show", args)).unwrap();
@@ -479,14 +533,77 @@ mod tests {
         println!("git_show returned_items metadata: {}", returned_items);
         println!("git_show actual returned content lines: {}", actual_lines);
 
-        assert!(
-            actual_lines < 2400,
-            "Content was not truncated! (should be around 800 lines)"
-        );
+        assert!(actual_lines < 3200, "Content was not truncated!");
         assert_eq!(
             returned_items + 1,
             actual_lines,
             "git_show returned_items metadata does not match actual lines returned (accounting for warning line)!"
         );
+    }
+
+    #[test]
+    fn test_git_read_files_empty_file_with_range() {
+        // Regression: reading a file that is empty at the revision with an
+        // explicit line range must not panic. total_lines is 0 for such a
+        // file, and the bounds clamp used to invert (lower 1 > upper 0).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo_path.join("empty.txt"), "").unwrap();
+        run_git(&["add", "empty.txt"]);
+        run_git(&["commit", "-m", "Add empty file"]);
+
+        let toolbox = ToolBox::new(repo_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "revision": "HEAD",
+            "files": [
+                { "path": "empty.txt", "start_line": 1, "end_line": 5 }
+            ]
+        });
+        let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+
+        let res = &results[0];
+        assert!(res.get("error").is_none(), "unexpected error: {res:?}");
+        assert_eq!(res["content"].as_str().unwrap(), "");
+        assert_eq!(res["total_lines"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_git_read_files_with_float_line_ranges() {
+        let (linux_path, _prompts_path) = get_test_paths();
+        let toolbox = ToolBox::new(linux_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "revision": "HEAD",
+            "files": [
+                {
+                    "path": "README.md",
+                    "start_line": 3.0,
+                    "end_line": 6.0
+                }
+            ]
+        });
+
+        let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["start_line"].as_u64().unwrap(), 3);
+        assert_eq!(results[0]["end_line"].as_u64().unwrap(), 6);
     }
 }

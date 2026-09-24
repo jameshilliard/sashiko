@@ -17,7 +17,6 @@ use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitLsTool;
 
@@ -62,9 +61,8 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
             format!("{}:{}", revision, path_str)
         };
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
-            .args(["ls-tree", &tree_spec]);
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.args(["ls-tree", &tree_spec]);
 
         let output = cmd.output().await?;
         if !output.status.success() {

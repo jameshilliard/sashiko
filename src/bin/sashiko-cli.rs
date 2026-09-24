@@ -17,7 +17,10 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
+use sashiko::auth::LocalToken;
+use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
+use sashiko::utils::utf8_prefix;
 use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -25,6 +28,19 @@ use std::sync::OnceLock;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 static COLOR_CHOICE: OnceLock<ColorChoice> = OnceLock::new();
+
+/// The project this invocation is for, resolved once in `main`.
+///
+/// Held the way `COLOR_CHOICE` is, for the same reason: it comes from a global
+/// flag and is read far from where it is parsed, and threading it through every
+/// intervening signature would say nothing the flag does not already say.
+static PROJECT: OnceLock<ProjectId> = OnceLock::new();
+
+/// The resolved project. Defaults rather than panicking, because a command that
+/// never touches a project should not depend on `main` having set it.
+fn project() -> ProjectId {
+    PROJECT.get().copied().unwrap_or_default()
+}
 
 #[derive(Parser)]
 #[command(name = "sashiko-cli")]
@@ -45,6 +61,14 @@ struct Cli {
     /// When to use color: auto (default), always, never
     #[arg(long, global = true, default_value = "auto")]
     color: ColorMode,
+
+    /// The codebase to review (default: the configured project, else linux)
+    #[arg(long, global = true, env = "SASHIKO_PROJECT")]
+    project: Option<ProjectId>,
+
+    /// Bearer token for authenticating API requests
+    #[arg(long, global = true, env = "SASHIKO_API_TOKEN")]
+    token: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -192,6 +216,90 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
     },
+    /// Query and triage bugs in the Sashiko bug repository
+    Bugs {
+        #[command(subcommand)]
+        action: BugCommands,
+    },
+    /// Mint stateless API tokens for AI agents and automation
+    Token {
+        #[command(subcommand)]
+        action: TokenCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum BugCommands {
+    /// List bugs matching filters
+    List {
+        /// Filter by subsystem title
+        #[arg(long)]
+        subsystem: Option<String>,
+
+        /// Filter by minimum severity (low, medium, high, critical)
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Filter by lifecycle status (new, confirmed, fixed, dismissed, duplicate)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Full-text search query
+        #[arg(long, short = 'q')]
+        query: Option<String>,
+
+        /// Page number
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+
+        /// Items per page
+        #[arg(long, default_value_t = 20)]
+        per_page: usize,
+    },
+    /// Show full details of a bug by ID
+    Show {
+        /// Bug ID
+        id: i64,
+    },
+    /// Perform a triage action or add a comment on a bug
+    Action {
+        /// Bug ID
+        id: i64,
+
+        /// Action to perform (comment, close, dismiss, assign, mark_duplicate)
+        #[arg(long)]
+        action: String,
+
+        /// Comment text to attach
+        #[arg(long)]
+        comment: Option<String>,
+
+        /// Assignee email (for assign action)
+        #[arg(long)]
+        assignee: Option<String>,
+
+        /// Canonical bug ID (for mark_duplicate action)
+        #[arg(long)]
+        duplicate_of: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommands {
+    /// Mint a stateless API token
+    Create {
+        /// Target email address (operators only; defaults to caller's email)
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Maximum bug access level: read (default), comment, or manage
+        #[arg(long, default_value = "read")]
+        access: String,
+
+        /// Token validity in days (1..=90)
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -225,19 +333,32 @@ async fn main() -> Result<()> {
         .unwrap();
 
     // Load settings, falling back to defaults if file missing/invalid
-    let base_url = cli.server.unwrap_or_else(|| {
-        Settings::new()
-            .map(|s| {
-                if s.server.host.contains(':') {
-                    format!("http://[::1]:{}", s.server.port)
-                } else {
-                    format!("http://{}:{}", s.server.host, s.server.port)
-                }
-            })
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+    let base_url = cli.server.unwrap_or_else(|| match Settings::new() {
+        Ok(s) => {
+            if s.server.host.contains(':') {
+                format!("http://[::1]:{}", s.server.port)
+            } else {
+                format!("http://{}:{}", s.server.host, s.server.port)
+            }
+        }
+        Err(e) => {
+            if e.to_string().contains("not found") {
+                "http://127.0.0.1:8080".to_string()
+            } else {
+                panic!("Failed to parse Settings.toml: {}", e);
+            }
+        }
     });
 
-    let client = Client::new();
+    // Same precedence as the server: the flag, then what the settings file
+    // says it is for, then the default. A missing or unreadable settings file
+    // is not fatal here, since most commands only talk to a running server.
+    let configured_project = Settings::new().ok().and_then(|s| s.project.kind);
+    PROJECT
+        .set(cli.project.or(configured_project).unwrap_or_default())
+        .expect("project is set exactly once, here");
+
+    let client = build_client(cli.token.as_deref())?;
 
     if let Err(e) = run_command(cli.command, &client, &base_url, cli.format).await {
         print_colored(Color::Red, "Error: ");
@@ -260,6 +381,58 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Builds the HTTP client, presenting an explicit bearer token if supplied or
+/// the local server's token when one is readable.
+///
+/// When `explicit_token` is `Some(...)`, the local operator token file is
+/// never consulted: passing `--token ""` intentionally sheds privileges and
+/// builds an unauthenticated client, and invalid header characters fail fast.
+fn build_client(explicit_token: Option<&str>) -> Result<Client> {
+    let bearer = match explicit_token {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Client::new());
+            }
+            Some(trimmed.to_owned())
+        }
+        None => Settings::new()
+            .ok()
+            .and_then(|settings| LocalToken::read_from(&settings.local_token_path()).ok())
+            .map(|t| t.secret().to_owned()),
+    };
+
+    let Some(secret) = bearer else {
+        return Ok(Client::new());
+    };
+
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", secret))
+        .context("Invalid bearer token: contains non-ASCII or control characters")?;
+    value.set_sensitive(true);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, value);
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("Failed to construct HTTP client")
+}
+
+async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let detail = body.trim();
+    if detail.is_empty() {
+        anyhow::bail!("HTTP {}", status);
+    } else {
+        anyhow::bail!("HTTP {}: {}", status, detail);
+    }
 }
 
 async fn run_command(
@@ -340,6 +513,239 @@ async fn run_command(
                 format,
             )
             .await
+        }
+        Commands::Bugs { action } => handle_bugs(client, base_url, action, format).await,
+        Commands::Token { action } => handle_token(client, base_url, action, format).await,
+    }
+}
+
+async fn handle_bugs(
+    client: &Client,
+    base_url: &str,
+    action: BugCommands,
+    format: OutputFormat,
+) -> Result<()> {
+    match action {
+        BugCommands::List {
+            subsystem,
+            severity,
+            status,
+            query,
+            page,
+            per_page,
+        } => {
+            let mut req = client.get(format!("{}/api/bugs", base_url)).query(&[
+                ("page", page.to_string()),
+                ("per_page", per_page.to_string()),
+            ]);
+            if let Some(sub) = subsystem {
+                req = req.query(&[("subsystem", sub)]);
+            }
+            if let Some(sev) = severity {
+                req = req.query(&[("min_severity", sev)]);
+            }
+            if let Some(st) = status {
+                req = req.query(&[("lifecycle_status", st)]);
+            }
+            if let Some(q) = query {
+                req = req.query(&[("q", q)]);
+            }
+            let resp = check_response(req.send().await?).await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    let bugs = body
+                        .get("items")
+                        .or_else(|| body.get("bugs"))
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("API response missing 'items' array"))?;
+                    let total = body["total"].as_u64().unwrap_or(bugs.len() as u64);
+                    println!("Bugs ({} total):", total);
+                    for bug in bugs {
+                        let id = bug["internal_id"]
+                            .as_i64()
+                            .or_else(|| bug["id"].as_i64())
+                            .unwrap_or_default();
+                        let sev = bug["severity"].as_str().unwrap_or("unknown");
+                        let st = bug["lifecycle_status"].as_str().unwrap_or("unknown");
+                        let title = bug["title"].as_str().unwrap_or("(untitled)");
+                        println!("  #{:<6} [{:<8}] ({:<9}) {}", id, sev, st, title);
+                    }
+                }
+            }
+            Ok(())
+        }
+        BugCommands::Show { id } => {
+            let resp = check_response(
+                client
+                    .get(format!("{}/api/bug", base_url))
+                    .query(&[("id", id.to_string())])
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    let bug_id = body["internal_id"]
+                        .as_i64()
+                        .or_else(|| body["id"].as_i64())
+                        .unwrap_or(id);
+                    let title = body["title"].as_str().unwrap_or("(untitled)");
+                    let sev = body["severity"].as_str().unwrap_or("unknown");
+                    let st = body["lifecycle_status"].as_str().unwrap_or("unknown");
+                    println!("Bug #{}: {}", bug_id, title);
+                    println!("Severity: {} | Status: {}", sev, st);
+                    if let Some(desc) = body["description"]
+                        .as_str()
+                        .or_else(|| body["report"].as_str())
+                    {
+                        println!("\n{}", desc);
+                    }
+                }
+            }
+            Ok(())
+        }
+        BugCommands::Action {
+            id,
+            action,
+            comment,
+            assignee,
+            duplicate_of,
+        } => {
+            let mut map = serde_json::Map::new();
+            map.insert("action".to_string(), Value::String(action.clone()));
+            match action.as_str() {
+                "comment" => {
+                    if assignee.is_some() || duplicate_of.is_some() {
+                        anyhow::bail!(
+                            "Action 'comment' does not accept --assignee or --duplicate-of"
+                        );
+                    }
+                    let text = comment.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+                        anyhow::anyhow!("Action 'comment' requires non-empty --comment")
+                    })?;
+                    map.insert("content".to_string(), Value::String(text));
+                }
+                "close" | "dismiss" => {
+                    if assignee.is_some() || duplicate_of.is_some() {
+                        anyhow::bail!(
+                            "Action '{}' does not accept --assignee or --duplicate-of",
+                            action
+                        );
+                    }
+                    if let Some(c) = comment {
+                        map.insert("reason".to_string(), Value::String(c));
+                    }
+                }
+                "mark_duplicate" => {
+                    if assignee.is_some() {
+                        anyhow::bail!("Action 'mark_duplicate' does not accept --assignee");
+                    }
+                    let dup = duplicate_of.ok_or_else(|| {
+                        anyhow::anyhow!("Action 'mark_duplicate' requires --duplicate-of <ID>")
+                    })?;
+                    map.insert("duplicate_of_id".to_string(), Value::from(dup));
+                    if let Some(c) = comment {
+                        map.insert("reasoning".to_string(), Value::String(c));
+                    }
+                }
+                "assign" => {
+                    if duplicate_of.is_some() {
+                        anyhow::bail!("Action 'assign' does not accept --duplicate-of");
+                    }
+                    let raw = assignee.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Action 'assign' requires --assignee <EMAIL> (or --assignee \"\" to unassign)"
+                        )
+                    })?;
+                    let assignee_val = if raw.trim().is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(raw)
+                    };
+                    map.insert("assignee".to_string(), assignee_val);
+                    if let Some(c) = comment {
+                        map.insert("reason".to_string(), Value::String(c));
+                    }
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unsupported bug action '{}'. Valid actions: comment, close, dismiss, mark_duplicate, assign",
+                        action
+                    );
+                }
+            }
+            let resp = check_response(
+                client
+                    .post(format!("{}/api/bug/action", base_url))
+                    .query(&[("id", id.to_string())])
+                    .json(&Value::Object(map))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    println!("Bug #{} updated ({}).", id, action);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_token(
+    client: &Client,
+    base_url: &str,
+    action: TokenCommands,
+    format: OutputFormat,
+) -> Result<()> {
+    match action {
+        TokenCommands::Create {
+            email,
+            access,
+            days,
+        } => {
+            let mut map = serde_json::Map::new();
+            map.insert("max_bug_access".to_string(), Value::String(access));
+            map.insert("expires_in_days".to_string(), Value::from(days));
+            if let Some(em) = email {
+                map.insert("email".to_string(), Value::String(em));
+            }
+            let resp = check_response(
+                client
+                    .post(format!("{}/api/auth/token", base_url))
+                    .json(&Value::Object(map))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            let body: Value = resp.json().await?;
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                }
+                OutputFormat::Text => {
+                    let token = body
+                        .get("token")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("API response missing 'token' field"))?;
+                    println!("{}", token);
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -556,11 +962,7 @@ async fn handle_list(
                     print_colored(status_color, &format!("{:<18}", status_str));
 
                     let subject = item.subject.unwrap_or_else(|| "(no subject)".to_string());
-                    let subject_display = if subject.len() > 48 {
-                        format!("{}...", &subject[..45])
-                    } else {
-                        subject
-                    };
+                    let subject_display = format_subject(&subject);
 
                     let date_display = if let Some(ts) = item.date {
                         format_timestamp(ts)
@@ -587,6 +989,14 @@ async fn handle_list(
     }
 
     Ok(())
+}
+
+fn format_subject(subject: &str) -> String {
+    if subject.len() > 48 {
+        format!("{}...", utf8_prefix(subject, 45))
+    } else {
+        subject.to_string()
+    }
 }
 
 fn review_has_issues(review: &Value) -> bool {
@@ -1539,8 +1949,8 @@ async fn handle_local(
         let review_json =
             serde_json::to_string(&review_input).context("Failed to serialize review input")?;
 
-        // Locate sashiko-review binary
-        let review_bin = find_review_binary()?;
+        // Locate worker binary
+        let (worker_bin, worker_subcmd) = find_worker_command()?;
 
         // Build subprocess args
         let baseline_ref = if let Some(b) = &baseline {
@@ -1556,6 +1966,10 @@ async fn handle_local(
             baseline_ref,
             "--repo".to_string(),
             repo_path.to_string_lossy().to_string(),
+            // The worker resolves its own prompts, and without being told the
+            // project it resolves the default one's.
+            "--project".to_string(),
+            project().as_str().to_string(),
         ];
 
         if no_ai {
@@ -1570,7 +1984,11 @@ async fn handle_local(
         eprintln!();
 
         // Spawn review subprocess
-        let mut child = tokio::process::Command::new(&review_bin)
+        let mut cmd = tokio::process::Command::new(&worker_bin);
+        if let Some(subcmd) = worker_subcmd {
+            cmd.arg(subcmd);
+        }
+        let mut child = cmd
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1578,7 +1996,7 @@ async fn handle_local(
             .env("SASHIKO_LOG_PLAIN", "1")
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("Failed to start review binary: {:?}", review_bin))?;
+            .with_context(|| format!("Failed to start worker binary: {:?}", worker_bin))?;
 
         // Write input to stdin
         if let Some(mut stdin) = child.stdin.take() {
@@ -1590,15 +2008,29 @@ async fn handle_local(
             drop(stdin);
         }
 
-        // Stream stderr for progress in a background task
+        // Stream stderr for progress, while keeping a bounded tail of the
+        // subprocess's log lines. The progress UI consumes these lines, so
+        // without the tail a failed review would collapse to a bare "no output"
+        // message with its actual cause (a stage error, an auth/quota failure)
+        // discarded. On failure we replay the tail so the run explains itself.
+        // The worker's own progress lines (stage started, turn n/m, finished)
+        // are shown as they arrive: they are the only sign of life during the
+        // AI phase. Turn ticks overwrite one line on a terminal and are kept
+        // out of the tail, which they would otherwise fill.
         let stderr = child.stderr.take();
+        let stderr_is_terminal = std::io::stderr().is_terminal();
         let stderr_handle = tokio::spawn(async move {
+            use sashiko::local_review::PROGRESS_LINE_PREFIX;
+            use std::collections::VecDeque;
+            const STDERR_TAIL_LINES: usize = 100;
+            let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
             if let Some(stderr) = stderr {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 let mut saw_applying = false;
                 let mut saw_ai_review = false;
+                let mut turn_line_open = false;
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !saw_applying && line.contains("Applying") {
                         saw_applying = true;
@@ -1610,12 +2042,34 @@ async fn handle_local(
                         eprint_phase(3, 4, "AI review in progress...");
                         eprintln!();
                     }
+                    if let Some(progress) = line.strip_prefix(PROGRESS_LINE_PREFIX) {
+                        if progress.contains(" turn ") {
+                            if stderr_is_terminal {
+                                eprint!("\r\x1b[2K      {progress}");
+                                turn_line_open = true;
+                            }
+                            continue;
+                        }
+                        if turn_line_open {
+                            eprint!("\r\x1b[2K");
+                            turn_line_open = false;
+                        }
+                        eprintln!("      {progress}");
+                    }
                     if line.contains("AI review completed") {
                         eprint_phase(4, 4, "Review complete.");
                         eprintln!();
                     }
+                    if tail.len() == STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+                if turn_line_open {
+                    eprintln!();
                 }
             }
+            tail
         });
 
         // Capture stdout
@@ -1624,12 +2078,21 @@ async fn handle_local(
             .await
             .context("Failed to wait for review subprocess")?;
 
-        let _ = stderr_handle.await;
+        let stderr_tail = stderr_handle.await.unwrap_or_default();
 
         let exit_code = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
+        // A subprocess that failed before emitting a result, or emitted
+        // something that is not a result, has its cause in the log tail;
+        // replay it rather than reporting a bare exit code or parse error.
+        let replay_tail = || {
+            for line in &stderr_tail {
+                eprintln!("{line}");
+            }
+        };
         if stdout.trim().is_empty() {
+            replay_tail();
             return Err(anyhow::anyhow!(
                 "Review subprocess produced no output (exit code: {})",
                 exit_code
@@ -1637,8 +2100,17 @@ async fn handle_local(
         }
 
         // Parse the review output
-        let result: Value =
-            serde_json::from_str(stdout.trim()).context("Failed to parse review output JSON")?;
+        let result: Value = match serde_json::from_str(stdout.trim()) {
+            Ok(value) => value,
+            Err(err) => {
+                replay_tail();
+                return Err(anyhow::anyhow!(
+                    "Failed to parse review output JSON: {} (exit code: {})",
+                    err,
+                    exit_code
+                ));
+            }
+        };
 
         match format {
             OutputFormat::Json => {
@@ -1706,34 +2178,47 @@ fn eprint_phase(current: usize, total: usize, msg: &str) {
     eprint!("[{}/{}] {}", current, total, msg);
 }
 
-fn find_review_binary() -> Result<PathBuf> {
+fn find_worker_command() -> Result<(PathBuf, Option<&'static str>)> {
     // Try same directory as current executable
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let candidate = dir.join("sashiko");
+        if candidate.exists() {
+            return Ok((candidate, Some("worker")));
+        }
+        if let Some(parent) = dir.parent() {
+            let candidate = parent.join("sashiko");
+            if candidate.exists() {
+                return Ok((candidate, Some("worker")));
+            }
+        }
         let candidate = dir.join("sashiko-review");
         if candidate.exists() {
-            return Ok(candidate);
-        }
-        // Also check for "review" (cargo build output name)
-        let candidate = dir.join("review");
-        if candidate.exists() {
-            return Ok(candidate);
+            return Ok((candidate, None));
         }
     }
 
-    // Try PATH
+    // Try PATH for sashiko
+    if let Ok(output) = std::process::Command::new("which").arg("sashiko").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((PathBuf::from(path), Some("worker")));
+    }
+
+    // Try PATH for sashiko-review
     if let Ok(output) = std::process::Command::new("which")
         .arg("sashiko-review")
         .output()
         && output.status.success()
     {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok(PathBuf::from(path));
+        return Ok((PathBuf::from(path), None));
     }
 
     Err(anyhow::anyhow!(
-        "Cannot find sashiko-review binary.\n\
-         Build it with: cargo build --bin review\n\
+        "Cannot find sashiko binary.\n\
+         Build it with: cargo build --bin sashiko\n\
          Or specify its location in PATH."
     ))
 }
@@ -1990,6 +2475,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_format_subject_handles_multibyte_cutoff() {
+        let subject = format!("{}🙂rest", "a".repeat(44));
+
+        assert_eq!(format_subject(&subject), format!("{}...", "a".repeat(44)));
+    }
+
+    #[test]
     fn test_count_severities_mixed() {
         let findings = vec![
             json!({ "severity": "Critical", "preexisting": false }),
@@ -2057,5 +2549,53 @@ mod tests {
             "output": "{\"findings\": [{\"severity\": \"High\", \"preexisting\": true}, {\"severity\": \"Low\", \"preexisting\": false}]}"
         });
         assert!(review_has_new_issues(&r_mixed));
+    }
+
+    #[test]
+    fn test_cli_bugs_and_token_subcommand_parsing() {
+        let parsed = Cli::try_parse_from([
+            "sashiko-cli",
+            "--token",
+            "jwt-token",
+            "bugs",
+            "list",
+            "--subsystem",
+            "BTRFS FILE SYSTEM",
+            "--severity",
+            "high",
+        ])
+        .unwrap();
+        assert_eq!(parsed.token.as_deref(), Some("jwt-token"));
+        assert!(matches!(
+            parsed.command,
+            Commands::Bugs {
+                action: BugCommands::List { .. }
+            }
+        ));
+
+        let show = Cli::try_parse_from(["sashiko-cli", "bugs", "show", "42"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Commands::Bugs {
+                action: BugCommands::Show { id: 42 }
+            }
+        ));
+
+        let token_cmd = Cli::try_parse_from([
+            "sashiko-cli",
+            "token",
+            "create",
+            "--access",
+            "comment",
+            "--days",
+            "14",
+        ])
+        .unwrap();
+        assert!(matches!(
+            token_cmd.command,
+            Commands::Token {
+                action: TokenCommands::Create { days: 14, .. }
+            }
+        ));
     }
 }

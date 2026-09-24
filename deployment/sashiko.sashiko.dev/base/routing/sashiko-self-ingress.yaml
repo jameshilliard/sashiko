@@ -1,0 +1,21 @@
+# Stable IPv4 Ingress
+#
+# The address is the one that used to serve bugrepo.sashiko.dev, which
+# sashiko.sashiko.dev already resolves to. A global address can back only one
+# forwarding rule, so the bugrepo Ingress has to be deleted before this one is
+# applied. There is no IPv6 counterpart because the only reserved IPv6 address
+# belongs to the main instance.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sashiko-self-ingress
+  namespace: sashiko-self
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: "lb-ipv4-bugrepo"
+    networking.gke.io/managed-certificates: "sashiko-self-cert"
+spec:
+  defaultBackend:
+    service:
+      name: sashiko-self-service
+      port:
+        number: 8080

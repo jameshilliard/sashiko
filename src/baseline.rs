@@ -143,9 +143,7 @@ impl BaselineRegistry {
     }
 
     fn read_file_from_git(repo_path: &Path, rev: &str, file_path: &str) -> Result<String> {
-        use std::process::Command;
-        let output = Command::new("git")
-            .current_dir(repo_path)
+        let output = crate::git_cmd::in_dir(repo_path)
             .args(["show", &format!("{}:{}", rev, file_path)])
             .output()?;
 
@@ -224,10 +222,7 @@ impl BaselineRegistry {
     }
 
     fn load_git_remotes(repo_path: &Path) -> Result<HashMap<String, String>> {
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .current_dir(repo_path)
+        let output = crate::git_cmd::in_dir(repo_path)
             .args(["remote", "-v"])
             .output()?;
 
@@ -284,27 +279,11 @@ impl BaselineRegistry {
         let heuristic_candidates = self.resolve_subsystem_heuristic(files, subject);
         candidates.extend(heuristic_candidates);
 
-        // 3. Linux Next
-        // Hardcoded linux-next URL
-        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
-        candidates.push(self.resolve_url(linux_next_url, None));
-
-        // 4. Mainline
-        // Use the identified mainline remote (Linus tree or origin) as a
-        // RemoteTarget so that ensure_remote fetches it before use. A bare
-        // LocalRef("HEAD") would resolve to the local checkout, which nothing
-        // in Sashiko ever advances after fetching.
-        if let Some((url, name)) = &self.mainline_remote {
-            candidates.push(BaselineResolution::RemoteTarget {
-                url: url.clone(),
-                name: name.clone(),
-                branch: Some("master".to_string()),
-            });
-        } else {
-            candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
-        }
-
-        // 5. Custom Remotes
+        // 3. Custom Remotes
+        // Ahead of linux-next because the first candidate that applies wins,
+        // and a topic-branch series usually applies to linux-next too -- but
+        // against a stale snapshot: a daily build behind, and sharing no SHAs
+        // with the topic branch once the maintainer rebases.
         if let Some(custom_remotes) = &self.custom_remotes {
             for remote in custom_remotes {
                 // Fetch to ensure we have the latest branches (Issue 1)
@@ -351,6 +330,25 @@ impl BaselineRegistry {
             }
         }
 
+        // 4. Linux Next
+        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+        candidates.push(self.resolve_url(linux_next_url, None));
+
+        // 5. Mainline
+        // Use the identified mainline remote (Linus tree or origin) as a
+        // RemoteTarget so that ensure_remote fetches it before use. A bare
+        // LocalRef("HEAD") would resolve to the local checkout, which nothing
+        // in Sashiko ever advances after fetching.
+        if let Some((url, name)) = &self.mainline_remote {
+            candidates.push(BaselineResolution::RemoteTarget {
+                url: url.clone(),
+                name: name.clone(),
+                branch: Some("master".to_string()),
+            });
+        } else {
+            candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
+        }
+
         // Deduplicate
         // Simple deduplication based on string representation or enum equality
         // Since we implement PartialEq, dedup works if consecutive. We need unique.
@@ -370,7 +368,7 @@ impl BaselineRegistry {
         subject: &str,
     ) -> Vec<BaselineResolution> {
         let mut tree_counts: HashMap<(String, Option<String>), usize> = HashMap::new();
-        let mut matched_subsystem_name = None;
+        let mut tree_subsystems: HashMap<(String, Option<String>), String> = HashMap::new();
 
         for file in files {
             for entry in &self.entries {
@@ -388,13 +386,15 @@ impl BaselineRegistry {
                 }
 
                 if matched {
-                    // Capture the subsystem name of the first match (simplified heuristic)
-                    if matched_subsystem_name.is_none() {
-                        matched_subsystem_name = Some(entry.subsystem.clone());
-                    }
-
                     for tree in &entry.trees {
                         *tree_counts.entry(tree.clone()).or_insert(0) += 1;
+                        // Associate this tree with the subsystem that maps to
+                        // it directly, so special-case checks below key off
+                        // the winning tree's own subsystem rather than
+                        // whichever entry happened to match first overall.
+                        tree_subsystems
+                            .entry(tree.clone())
+                            .or_insert_with(|| entry.subsystem.clone());
                     }
                 }
             }
@@ -404,16 +404,23 @@ impl BaselineRegistry {
             return Vec::new();
         }
 
+        // Intel Wired LAN series are queued on dev-queue of Tony's trees,
+        // never on the trees' default branches.
+        if let Some(url) = Self::iwl_queue_tree(subject, &tree_counts) {
+            return vec![self.resolve_url(&url, Some("dev-queue".to_string()))];
+        }
+
         let mut candidates: Vec<(&(String, Option<String>), &usize)> = tree_counts.iter().collect();
         candidates.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.0.cmp(&b.0.0)));
 
         // Check for Linux-MM special handling
         // If the top candidate is akpm/mm or linux-mm, OR the subsystem is MEMORY MANAGEMENT
-        let (top_url, _top_branch) = candidates[0].0;
+        let top_tree = candidates[0].0;
+        let (top_url, _top_branch) = top_tree;
+        let top_subsystem = tree_subsystems.get(top_tree);
         let is_mm = top_url.contains("akpm/mm")
             || top_url.contains("linux-mm")
-            || matched_subsystem_name
-                .as_deref()
+            || top_subsystem
                 .map(|s| s.eq_ignore_ascii_case("MEMORY MANAGEMENT"))
                 .unwrap_or(false);
 
@@ -425,6 +432,24 @@ impl BaselineRegistry {
                 self.resolve_url(mm_url, Some("mm-new".to_string())),
                 self.resolve_url(mm_url, Some("mm-unstable".to_string())),
                 self.resolve_url(mm_url, Some("mm-stable".to_string())),
+            ];
+        }
+
+        // Check for Staging special handling
+        // gregkh/staging.git's HEAD points at "main", which tracks what has
+        // already been merged upstream rather than the branch new patches
+        // are expected to apply to. Prioritize the actual active branches,
+        // same reasoning as the linux-mm case above.
+        let is_staging = top_url.contains("gregkh/staging")
+            || top_subsystem
+                .map(|s| s.eq_ignore_ascii_case("STAGING SUBSYSTEM"))
+                .unwrap_or(false);
+
+        if is_staging {
+            let staging_url = top_url;
+            return vec![
+                self.resolve_url(staging_url, Some("staging-testing".to_string())),
+                self.resolve_url(staging_url, Some("staging-next".to_string())),
             ];
         }
 
@@ -447,7 +472,8 @@ impl BaselineRegistry {
 
         let mut scored_candidates: Vec<(i32, BaselineResolution)> = Vec::new();
 
-        for ((url, branch), count) in candidates {
+        for (candidate_tree, count) in candidates {
+            let (url, branch) = candidate_tree;
             let mut score = (*count as i32) * 10;
             let url_lower = url.to_lowercase();
             let branch_lower = branch
@@ -503,12 +529,12 @@ impl BaselineRegistry {
             let keywords = [
                 "net", "bpf", "drm", "mm", "sched", "x86", "arm", "arm64", "scsi", "usb", "perf",
             ];
+            let cand_subsys = tree_subsystems.get(candidate_tree);
             for kw in keywords {
                 let url_matches = url_lower.contains(kw);
                 let branch_matches = branch_lower.contains(kw);
                 let subject_or_subsys_matches = subject_lower.contains(kw)
-                    || matched_subsystem_name
-                        .as_deref()
+                    || cand_subsys
                         .map(|s| s.to_lowercase().contains(kw))
                         .unwrap_or(false);
 
@@ -531,6 +557,30 @@ impl BaselineRegistry {
         }
 
         unique_filtered
+    }
+
+    /// URL of the Tony Nguyen queue tree matching an iwl-net/iwl-next tag in
+    /// the subject, picked from the MAINTAINERS trees the touched files voted
+    /// for. Returns None when the subject carries no iwl tag or none of those
+    /// trees is the matching queue.
+    fn iwl_queue_tree(
+        subject: &str,
+        tree_counts: &HashMap<(String, Option<String>), usize>,
+    ) -> Option<String> {
+        let subject_lower = subject.to_lowercase();
+        let queue = if subject_lower.contains("iwl-next") {
+            "next-queue"
+        } else if subject_lower.contains("iwl-net") {
+            "net-queue"
+        } else {
+            return None;
+        };
+
+        tree_counts
+            .keys()
+            .map(|(url, _)| url)
+            .find(|url| url.contains(queue))
+            .cloned()
     }
 
     fn resolve_url(&self, url: &str, branch: Option<String>) -> BaselineResolution {
@@ -657,8 +707,8 @@ mod tests {
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;
 
-        // The last candidate before custom remotes should be a RemoteTarget
-        // for origin/master, not a LocalRef("HEAD").
+        // The mainline candidate should be a RemoteTarget for origin/master,
+        // not a LocalRef("HEAD").
         let mainline = candidates.iter().find(|c| match c {
             BaselineResolution::RemoteTarget { name, branch, .. } => {
                 name == "origin" && branch.as_deref() == Some("master")
@@ -766,6 +816,176 @@ F: patterns/
             assert!(url.contains("linux-next"));
         } else {
             panic!("Expected linux-next");
+        }
+    }
+
+    fn iwl_registry() -> BaselineRegistry {
+        let entries = vec![MaintainersEntry {
+            subsystem: "INTEL ETHERNET DRIVERS".to_string(),
+            trees: vec![
+                (
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/net-queue.git"
+                        .to_string(),
+                    None,
+                ),
+                (
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/tnguy/next-queue.git"
+                        .to_string(),
+                    None,
+                ),
+            ],
+            patterns: vec!["drivers/net/ethernet/intel/".to_string()],
+        }];
+
+        BaselineRegistry {
+            entries,
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_iwl_tags_pick_dev_queue() {
+        let registry = iwl_registry();
+        let files = vec!["drivers/net/ethernet/intel/ice/ice_main.c".to_string()];
+
+        for (subject, expected_repo) in [
+            ("[PATCH iwl-net v2 1/3] ice: fix something", "net-queue"),
+            ("[PATCH IWL-NEXT] ice: add something", "next-queue"),
+        ] {
+            let candidates = registry.resolve_candidates(&files, subject, None).await;
+
+            match &candidates[0] {
+                BaselineResolution::RemoteTarget { url, branch, .. } => {
+                    assert!(url.contains(expected_repo), "{} -> {}", subject, url);
+                    assert_eq!(branch.as_deref(), Some("dev-queue"));
+                }
+                other => panic!("Expected dev-queue RemoteTarget, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_intel_without_iwl_tag_keeps_heuristic() {
+        let registry = iwl_registry();
+        let files = vec!["drivers/net/ethernet/intel/ice/ice_main.c".to_string()];
+
+        let candidates = registry
+            .resolve_candidates(&files, "[PATCH net] ice: fix something", None)
+            .await;
+
+        let has_dev_queue = candidates.iter().any(|c| {
+            matches!(c, BaselineResolution::RemoteTarget { branch, .. }
+                if branch.as_deref() == Some("dev-queue"))
+        });
+        assert!(!has_dev_queue, "dev-queue requires an iwl tag");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_staging() {
+        // gregkh/staging.git's HEAD points at "main", which tracks what has
+        // already landed upstream, not the branch new patches apply to
+        // (staging-testing). The MAINTAINERS T: line carries no branch, so
+        // without the special case this would resolve to HEAD and fail to
+        // apply cleanly against the active tree (issue #268).
+        let entries = vec![MaintainersEntry {
+            subsystem: "STAGING SUBSYSTEM".to_string(),
+            trees: vec![(
+                "git://git.kernel.org/pub/scm/linux/kernel/git/gregkh/staging.git".to_string(),
+                None,
+            )],
+            patterns: vec!["drivers/staging/".to_string()],
+        }];
+        let mut remote_map = HashMap::new();
+        remote_map.insert(
+            "git://git.kernel.org/pub/scm/linux/kernel/git/gregkh/staging.git".to_string(),
+            "gregkh-staging".to_string(),
+        );
+
+        let registry = BaselineRegistry {
+            entries,
+            remote_map,
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
+        };
+
+        let files = vec!["drivers/staging/foo/bar.c".to_string()];
+        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+
+        assert!(candidates.len() >= 2);
+
+        let check_branch = |c: &BaselineResolution, expected_branch: &str| {
+            if let BaselineResolution::RemoteTarget { branch, .. } = c {
+                assert_eq!(branch.as_deref(), Some(expected_branch));
+            } else {
+                panic!("Expected RemoteTarget with branch {}", expected_branch);
+            }
+        };
+
+        check_branch(&candidates[0], "staging-testing");
+        check_branch(&candidates[1], "staging-next");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_staging_does_not_hijack_other_subsystem() {
+        // A series can touch a Staging file alongside files from an
+        // unrelated subsystem. The Staging special case must only fire
+        // when the winning tree (by file count) actually belongs to
+        // Staging -- not merely because a Staging file happened to be the
+        // first one matched while iterating `files`.
+        let staging_url =
+            "git://git.kernel.org/pub/scm/linux/kernel/git/gregkh/staging.git".to_string();
+        let net_url = "git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net.git".to_string();
+
+        let entries = vec![
+            MaintainersEntry {
+                subsystem: "STAGING SUBSYSTEM".to_string(),
+                trees: vec![(staging_url.clone(), None)],
+                patterns: vec!["drivers/staging/".to_string()],
+            },
+            MaintainersEntry {
+                subsystem: "NETWORKING [GENERAL]".to_string(),
+                trees: vec![(net_url.clone(), None)],
+                patterns: vec!["net/".to_string()],
+            },
+        ];
+
+        let registry = BaselineRegistry {
+            entries,
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: None,
+        };
+
+        // The Staging file is listed first, but three Networking files
+        // outnumber it, so net_url must be the tree that wins.
+        let files = vec![
+            "drivers/staging/foo/bar.c".to_string(),
+            "net/core/a.c".to_string(),
+            "net/core/b.c".to_string(),
+            "net/core/c.c".to_string(),
+        ];
+        let candidates = registry.resolve_candidates(&files, "Subject", None).await;
+
+        for candidate in &candidates {
+            if let BaselineResolution::RemoteTarget { url, branch, .. } = candidate
+                && url == &net_url
+            {
+                assert_ne!(
+                    branch.as_deref(),
+                    Some("staging-testing"),
+                    "net_url must not be resolved with a staging branch"
+                );
+                assert_ne!(
+                    branch.as_deref(),
+                    Some("staging-next"),
+                    "net_url must not be resolved with a staging branch"
+                );
+            }
         }
     }
 
@@ -894,8 +1114,7 @@ F: patterns/
         let repo_path = temp_dir.path();
 
         // Init git repo to avoid ensure_remote failing too hard
-        std::process::Command::new("git")
-            .current_dir(repo_path)
+        crate::git_cmd::in_dir(repo_path)
             .arg("init")
             .output()
             .unwrap();
@@ -928,5 +1147,50 @@ F: patterns/
             .collect();
 
         assert!(candidate_names.contains(&"dummy-repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_custom_remotes_precede_linux_next() {
+        use crate::settings::CustomRemoteSettings;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+
+        crate::git_cmd::in_dir(repo_path)
+            .arg("init")
+            .output()
+            .unwrap();
+
+        let dummy_url = repo_path.join("dummy_remote").to_str().unwrap().to_string();
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: Some(vec![CustomRemoteSettings {
+                name: "topic-tree".to_string(),
+                url: dummy_url,
+                check_all_branches: false,
+                only_branches: Some(vec!["topic-next".to_string()]),
+            }]),
+            repo_path: repo_path.to_path_buf(),
+            mainline_remote: None,
+        };
+
+        let candidates = registry.resolve_candidates(&[], "Subject", None).await;
+        let names: Vec<String> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                BaselineResolution::RemoteTarget { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let pos_custom = names.iter().position(|n| n == "topic-tree").unwrap();
+        let pos_next = names.iter().position(|n| n == "linux-next").unwrap();
+        assert!(
+            pos_custom < pos_next,
+            "custom remote at {} should precede linux-next at {}: {:?}",
+            pos_custom,
+            pos_next,
+            names
+        );
     }
 }

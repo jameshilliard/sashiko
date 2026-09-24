@@ -16,7 +16,10 @@ use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
-    worker::{PatchInput, ReviewInput, Worker, WorkerConfig, prompts::PromptRegistry},
+    worker::{
+        PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
+        prompts::PromptRegistry,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use futures::stream::StreamExt;
@@ -25,11 +28,14 @@ use std::{
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
+    pub project: crate::project::ProjectId,
     pub settings_path: Option<PathBuf>,
     pub baseline: Option<String>,
     pub repo: Option<PathBuf>,
@@ -41,7 +47,7 @@ pub struct WorkerOptions {
     pub reuse_worktree: Option<PathBuf>,
     pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
 }
@@ -49,6 +55,7 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
+            project: crate::project::ProjectId::Linux,
             settings_path: None,
             baseline: None,
             repo: None,
@@ -69,18 +76,20 @@ impl Default for WorkerOptions {
 
 #[derive(Clone, Debug)]
 pub struct ReviewOptions {
+    pub project: crate::project::ProjectId,
     pub baseline: Option<String>,
     pub settings_path: Option<PathBuf>,
     pub prompts: PathBuf,
     pub no_ai: bool,
     pub ai_provider: Option<String>,
     pub custom_prompt: Option<String>,
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
 }
 
 impl Default for ReviewOptions {
     fn default() -> Self {
         Self {
+            project: crate::project::ProjectId::Linux,
             baseline: None,
             settings_path: None,
             prompts: PathBuf::from("third_party/prompts/kernel"),
@@ -133,21 +142,21 @@ pub enum ProgressEvent {
     },
     AiReviewPlanReady {
         patch_index: i64,
-        planned_stages: Vec<u8>,
+        planned_stages: Vec<String>,
     },
     AiReviewStageStarted {
         patch_index: i64,
-        stage: u8,
+        stage: String,
     },
     AiReviewStageTurn {
         patch_index: i64,
-        stage: u8,
+        stage: String,
         turn: usize,
         max_turns: usize,
     },
     AiReviewStageFinished {
         patch_index: i64,
-        stage: u8,
+        stage: String,
     },
     AiReviewAttempt {
         patch_index: i64,
@@ -248,6 +257,7 @@ pub async fn run_git_review(
     run_worker(
         review_input,
         WorkerOptions {
+            project: options.project,
             settings_path: options
                 .settings_path
                 .or_else(|| Some(Settings::local_review_path())),
@@ -272,30 +282,36 @@ pub async fn run_worker(
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency) = if let Some(path) = &options.settings_path {
-        let local_settings = Settings::local_review_from_file(path)
-            .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else if repo_override.is_some() {
-        let local_settings =
-            Settings::local_review_settings().context("Failed to load local review settings")?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else {
-        let settings = Settings::new().context("Failed to load settings")?;
-        (
-            settings.ai,
-            Some(PathBuf::from(settings.git.repository_path)),
-            settings.review.concurrency,
-        )
-    };
+    let (mut ai, configured_repo_path, concurrency, timeout_seconds) =
+        if let Some(path) = &options.settings_path {
+            let local_settings = Settings::local_review_from_file(path)
+                .with_context(|| format!("Failed to load settings from {}", path.display()))?;
+            let review = local_settings.review;
+            (
+                local_settings.ai,
+                None,
+                review.concurrency,
+                review.timeout_seconds,
+            )
+        } else if repo_override.is_some() {
+            let local_settings = Settings::local_review_settings()
+                .context("Failed to load local review settings")?;
+            let review = local_settings.review;
+            (
+                local_settings.ai,
+                None,
+                review.concurrency,
+                review.timeout_seconds,
+            )
+        } else {
+            let settings = Settings::new().context("Failed to load settings")?;
+            (
+                settings.ai,
+                Some(PathBuf::from(settings.git.repository_path)),
+                settings.review.concurrency,
+                settings.review.timeout_seconds,
+            )
+        };
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();
@@ -387,6 +403,7 @@ pub async fn run_worker(
         &worktree,
         &ai,
         concurrency,
+        timeout_seconds,
         patchset_id,
         subject,
         patches,
@@ -408,18 +425,74 @@ pub async fn run_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Wrap the raw provider with the decorators a worker-run review needs.
+///
+/// Per-turn logging is implemented once, as a provider decorator, rather than
+/// in each front end: both local-CLI and daemon-spawned worker reviews run this
+/// same path, so wrapping here covers both.
+///
+/// The limiters are skipped for a daemon-spawned worker, which reaches the
+/// model through a stdio provider and is throttled by the daemon instead.
+fn decorate_provider(
+    inner: std::sync::Arc<dyn crate::ai::AiProvider>,
+    ai: &AiSettings,
+    llm_semaphore: &Arc<Semaphore>,
+    quota: &Arc<crate::ai::quota::QuotaManager>,
+    retry_budget: &Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
+) -> std::sync::Arc<dyn crate::ai::AiProvider> {
+    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = if ai.log_turns {
+        std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(inner))
+    } else {
+        inner
+    };
+
+    if ai.provider.starts_with("stdio-") {
+        return provider;
+    }
+
+    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
+        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+            provider,
+            llm_semaphore.clone(),
+        ),
+    );
+
+    // Backoff goes outermost, so a call that is waiting out a rate limit holds
+    // no concurrency permit while it sleeps.
+    // With a retry budget it stops at the review's deadline, as in the daemon;
+    // without one it falls back to an attempt ceiling.
+    std::sync::Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+        provider,
+        quota.clone(),
+        retry_budget.clone(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
     ai: &AiSettings,
     patchset_id: i64,
     subject: &str,
     p: &PatchInput,
+    all_patches: &[PatchInput],
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
     baseline_sha: &str,
+    llm_semaphore: &Arc<Semaphore>,
+    quota: &Arc<crate::ai::quota::QuotaManager>,
+    timeout_seconds: u64,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
+    let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> =
+        (timeout_seconds > 0).then(|| {
+            let deadline = Arc::new(std::sync::Mutex::new(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds),
+            ));
+            Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(deadline))
+                as Arc<dyn crate::ai::backoff_provider::RetryBudget>
+        });
     let mut last_error = None;
     for attempt in 1..=3 {
         emit(
@@ -438,14 +511,17 @@ async fn review_single_patch(
             );
         }
 
-        let provider =
-            crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
-        let prompts_tool_path = Some(options.prompts.join("tool.md"));
+        // No database, so the cache goes where the prompt bundle already lives.
+        let provider = crate::ai::create_provider_cached(ai, None)
+            .await
+            .context("Failed to create AI provider")?;
+        let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
+        // The directory itself: read_prompt resolves a name against it.
+        let prompts_tool_path = Some(options.prompts.clone());
 
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index) {
-            let output = tokio::process::Command::new("git")
-                .current_dir(&worktree.path)
+            let output = crate::git_cmd::in_dir_async(&worktree.path)
                 .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
                 .output()
                 .await;
@@ -475,20 +551,25 @@ async fn review_single_patch(
         }
 
         let prompts = PromptRegistry::new(options.prompts.clone());
-        let series_range = patch_shas
-            .get(&p.index)
-            .map(|sha| format!("{}..{}", baseline_sha, sha));
+        let series_range = calculate_series_range(
+            all_patches,
+            std::slice::from_ref(p),
+            patch_shas,
+            baseline_sha,
+        );
 
         let mut worker = Worker::new(
             provider,
             std::sync::Arc::new(tools),
             prompts,
             WorkerConfig {
+                project: options.project,
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
                 temperature: ai.temperature,
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
+                baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
             },
         );
@@ -543,7 +624,8 @@ async fn review_single_patch(
             "id": patchset_id,
             "subject": subject,
             "patches": rich_patches,
-            "patch_index": Some(p.index)
+            "patch_index": Some(p.index),
+            "baseline": baseline_sha
         });
 
         match worker
@@ -614,11 +696,35 @@ async fn review_single_patch(
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
 }
 
+/// Assembles the combined review payload for a review.
+///
+/// Pre-existing concerns are preserved in the payload so that daemon-spawned
+/// worker reviews can hand them to the standalone Linux bug pipeline for
+/// verification, deduplication, and database tracking.
+fn build_review_output(
+    summary: String,
+    findings: Vec<Value>,
+    concerns: Vec<Value>,
+    dismissed_concerns: Vec<Value>,
+    concerns_count: u64,
+    dismissed_concerns_count: u64,
+) -> Value {
+    json!({
+        "summary": summary,
+        "findings": findings,
+        "concerns": concerns,
+        "dismissed_concerns": dismissed_concerns,
+        "concerns_count": concerns_count,
+        "dismissed_concerns_count": dismissed_concerns_count
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_in_worktree(
     worktree: &GitWorktree,
     ai: &AiSettings,
     concurrency: usize,
+    timeout_seconds: u64,
     patchset_id: i64,
     subject: String,
     patches: Vec<PatchInput>,
@@ -656,6 +762,11 @@ async fn run_worker_in_worktree(
         true
     } else if let Some(commit_hash) = &options.review_commit {
         info!("Directly reviewing commit {}", commit_hash);
+        for p in &patches {
+            if let Some(sha) = &p.commit_id {
+                patch_shas.insert(p.index, sha.clone());
+            }
+        }
         if let Some(idx) = options.review_patch_index {
             patch_shas.insert(idx, commit_hash.clone());
             if let Ok(show) = worktree.get_commit_show(commit_hash).await {
@@ -773,7 +884,7 @@ async fn run_worker_in_worktree(
         },
     );
 
-    let rich_patches: Vec<Value> = patches_to_review
+    let rich_patches: Vec<Value> = patches
         .iter()
         .map(|p| {
             let date_str = if let Some(ts) = p.date {
@@ -791,19 +902,31 @@ async fn run_worker_in_worktree(
                 "author": p.author,
                 "date_string": date_str,
                 "diff": p.diff,
-                "commit_id": patch_shas.get(&p.index).cloned(),
+                "commit_id": patch_shas.get(&p.index).cloned().or_else(|| p.commit_id.clone()),
                 "git_show": patch_shows.get(&p.index).cloned(),
                 "commit_message_full": patch_messages.get(&p.index).cloned()
             })
         })
         .collect();
 
+    // Cap in-flight model calls across the whole run. The patch fan-out below
+    // is bounded by `concurrency`; each patch then fans its stages out
+    // concurrently on top of that, so without a shared ceiling the number of
+    // simultaneous requests is unbounded.
+    let llm_semaphore = Arc::new(Semaphore::new(
+        crate::ai::concurrency_limited_provider::llm_permits(concurrency),
+    ));
+    // Shared so a rate-limit response from one request backs the whole run off.
+    let quota = Arc::new(crate::ai::quota::QuotaManager::new());
     // Execute patch reviews concurrently with a limit
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
         let options = &options;
         let subject_clone = subject.clone();
+        let all_patches = &patches;
+        let llm_semaphore = &llm_semaphore;
+        let quota = &quota;
         async move {
             review_single_patch(
                 worktree,
@@ -811,10 +934,14 @@ async fn run_worker_in_worktree(
                 patchset_id,
                 &subject_clone,
                 p,
+                all_patches,
                 &rich_patches,
                 patch_shas,
                 options,
                 baseline_sha,
+                llm_semaphore,
+                quota,
+                timeout_seconds,
                 progress,
             )
             .await
@@ -828,7 +955,9 @@ async fn run_worker_in_worktree(
     }
 
     // Aggregate findings, inline reviews, history, input context, and concern counts
+    let mut combined_summary = String::new();
     let mut combined_findings = Vec::new();
+    let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
     let mut combined_inline = String::new();
     let mut combined_history = Vec::new();
@@ -849,6 +978,18 @@ async fn run_worker_in_worktree(
             .unwrap_or_default();
 
         if let Some(review) = res.get("review") {
+            if let Some(summary) = review.get("summary").and_then(|v| v.as_str())
+                && !summary.trim().is_empty()
+            {
+                if !combined_summary.is_empty() {
+                    combined_summary.push_str("\n\n");
+                }
+                if patches_to_review.len() > 1 {
+                    combined_summary.push_str(&format!("Patch [{}]: {}", p_idx, summary.trim()));
+                } else {
+                    combined_summary.push_str(summary.trim());
+                }
+            }
             if let Some(findings) = review.get("findings").and_then(|v| v.as_array()) {
                 for f in findings {
                     let mut finding_val = f.clone();
@@ -857,9 +998,18 @@ async fn run_worker_in_worktree(
                     combined_findings.push(finding_val);
                 }
             }
+            if let Some(concerns) = review.get("concerns").and_then(|v| v.as_array()) {
+                for c in concerns {
+                    let mut concern_val = c.clone();
+                    concern_val["patch_index"] = json!(p_idx);
+                    concern_val["patch_subject"] = json!(patch_subject);
+                    combined_concerns.push(concern_val);
+                }
+            }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
             }
+
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
                 total_concerns_count += cc;
             }
@@ -878,7 +1028,10 @@ async fn run_worker_in_worktree(
             if !combined_inline.is_empty() {
                 combined_inline.push_str("\n\n");
             }
-            combined_inline.push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+            if patches_to_review.len() > 1 {
+                combined_inline
+                    .push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+            }
             combined_inline.push_str(inline.trim());
         }
 
@@ -900,12 +1053,14 @@ async fn run_worker_in_worktree(
         total_tokens_cached += res["tokens_cached"].as_u64().unwrap_or(0);
     }
 
-    let review_output = json!({
-        "findings": combined_findings,
-        "dismissed_concerns": combined_dismissed_concerns,
-        "concerns_count": total_concerns_count,
-        "dismissed_concerns_count": total_dismissed_concerns_count
-    });
+    let review_output = build_review_output(
+        combined_summary,
+        combined_findings,
+        combined_concerns,
+        combined_dismissed_concerns,
+        total_concerns_count,
+        total_dismissed_concerns_count,
+    );
 
     let combined_result = json!({
         "patchset_id": patchset_id,
@@ -930,7 +1085,63 @@ pub async fn run_worker_from_stdin(options: WorkerOptions) -> Result<Value> {
     }
     let input: ReviewInput = serde_json::from_str(&buffer)?;
     let repo_override = options.repo.clone();
-    run_worker(input, options, repo_override, None).await
+    run_worker(input, options, repo_override, Some(&progress_to_stderr)).await
+}
+
+/// The line prefix `progress_to_stderr` writes and `sashiko-cli local` keys
+/// on when it streams the worker's stderr.
+pub const PROGRESS_LINE_PREFIX: &str = "progress: ";
+
+/// Renders the AI-phase events as plain lines on stderr, one per event, for
+/// the worker subprocess. Its parent owns the terminal and decides what to
+/// show; without these lines the whole AI phase is silent from outside, and a
+/// slow review is indistinguishable from a hung one.
+pub fn progress_to_stderr(event: ProgressEvent) {
+    if let Some(line) = progress_line(event) {
+        eprintln!("{PROGRESS_LINE_PREFIX}{line}");
+    }
+}
+
+/// The text after the prefix for an AI-phase event; `None` for the events
+/// the worker's log lines already cover.
+pub fn progress_line(event: ProgressEvent) -> Option<String> {
+    let line = match event {
+        ProgressEvent::AiReviewStarted { patches } => format!(
+            "reviewing {} patch{}",
+            patches,
+            if patches == 1 { "" } else { "es" }
+        ),
+        ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
+            format!("patch {patch_index}: pre-screen")
+        }
+        ProgressEvent::AiReviewPlanningStarted { patch_index } => {
+            format!("patch {patch_index}: planning")
+        }
+        ProgressEvent::AiReviewPlanReady {
+            patch_index,
+            planned_stages,
+        } => format!("patch {patch_index}: stages {}", planned_stages.join(", ")),
+        ProgressEvent::AiReviewStageStarted { patch_index, stage } => {
+            format!("patch {patch_index}: {stage} started")
+        }
+        ProgressEvent::AiReviewStageTurn {
+            patch_index,
+            stage,
+            turn,
+            max_turns,
+        } => format!("patch {patch_index}: {stage} turn {turn}/{max_turns}"),
+        ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
+            format!("patch {patch_index}: {stage} finished")
+        }
+        ProgressEvent::AiReviewAttempt {
+            patch_index,
+            attempt,
+            max_attempts,
+        } if attempt > 1 => format!("patch {patch_index}: retry {attempt}/{max_attempts}"),
+        ProgressEvent::AiReviewFinished { patch_index } => format!("patch {patch_index}: done"),
+        _ => return None,
+    };
+    Some(line)
 }
 
 pub fn result_has_error(result: &Value) -> bool {
@@ -1132,13 +1343,205 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use std::process::Command;
+    use std::sync::Arc;
+
+    /// A provider that does nothing; the decoration tests only care about
+    /// whether it was wrapped, which `Arc::ptr_eq` answers directly.
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for StubProvider {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            unreachable!("decoration tests never issue a request")
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "stub".into(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn stub() -> Arc<dyn crate::ai::AiProvider> {
+        Arc::new(StubProvider)
+    }
+
+    /// Fails the first call with a rate limit, then succeeds, so a test can
+    /// tell whether the retry limiter was actually installed.
+    struct RateLimitOnce {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for RateLimitOnce {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            use std::sync::atomic::Ordering;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(crate::ai::gemini::GeminiError::QuotaExceeded(
+                    std::time::Duration::from_millis(5),
+                )
+                .into());
+            }
+            Ok(crate::ai::AiResponse {
+                content: Some("ok".into()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "rate-limit-once".into(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn dummy_request() -> crate::ai::AiRequest {
+        crate::ai::AiRequest {
+            system: None,
+            messages: vec![crate::ai::AiMessage {
+                role: crate::ai::AiRole::User,
+                content: Some("hi".into()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decorate_provider_retries_rate_limits_for_in_process_reviews() -> Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let mut settings = Settings::new()?;
+        settings.ai.log_turns = false;
+        let sem = Arc::new(Semaphore::new(4));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+
+        // In-process: the limiter waits out the window and retries, so the
+        // caller sees a success rather than the rate-limit error.
+        settings.ai.provider = "claude-cli".to_string();
+        let inner = Arc::new(RateLimitOnce {
+            calls: AtomicU32::new(0),
+        });
+        let decorated = decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None);
+        let response = decorated.generate_content(dummy_request()).await?;
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+
+        // Daemon-spawned worker: the daemon owns the retry, so the error is
+        // passed straight back instead of being retried here as well.
+        settings.ai.provider = "stdio-claude".to_string();
+        let inner = Arc::new(RateLimitOnce {
+            calls: AtomicU32::new(0),
+        });
+        let decorated = decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None);
+        assert!(decorated.generate_content(dummy_request()).await.is_err());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_decorate_provider_honours_the_retry_budget() -> Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// Stands in for a review whose deadline has already passed.
+        struct Expired;
+        impl crate::ai::backoff_provider::RetryBudget for Expired {
+            fn credit_wait(&self, _slept: std::time::Duration) {}
+            fn check(&self) -> Result<()> {
+                Err(anyhow!("deadline exceeded"))
+            }
+        }
+
+        let mut settings = Settings::new()?;
+        settings.ai.log_turns = false;
+        settings.ai.provider = "claude-cli".to_string();
+        let sem = Arc::new(Semaphore::new(4));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+        let budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> =
+            Some(Arc::new(Expired));
+
+        let inner = Arc::new(RateLimitOnce {
+            calls: AtomicU32::new(0),
+        });
+        let decorated = decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &budget);
+        assert!(decorated.generate_content(dummy_request()).await.is_err());
+        // The budget is consulted before the request goes out, so a review that
+        // is already past its deadline stops rather than retrying through it.
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decorate_provider_log_turns_gate() -> Result<()> {
+        let mut settings = Settings::new()?;
+        // A stdio provider skips the limiters, isolating the logging decision.
+        settings.ai.provider = "stdio-gemini".to_string();
+        let sem = Arc::new(Semaphore::new(1));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+
+        // Off: the provider is handed back untouched, so a review that does not
+        // ask for turn logging pays nothing for it.
+        settings.ai.log_turns = false;
+        let inner = stub();
+        assert!(Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None)
+        ));
+
+        // On: wrapped, so the turns are logged.
+        settings.ai.log_turns = true;
+        let inner = stub();
+        assert!(!Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_decorate_provider_skips_limiters_for_stdio_workers() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.ai.log_turns = false;
+        let sem = Arc::new(Semaphore::new(1));
+        let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+
+        // A daemon-spawned worker is throttled by the daemon, so it must be
+        // left unwrapped rather than limited twice.
+        settings.ai.provider = "stdio-claude".to_string();
+        let inner = stub();
+        assert!(Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None)
+        ));
+
+        // A review running in-process has nothing in front of it, so it gets
+        // the limiter.
+        settings.ai.provider = "claude-cli".to_string();
+        let inner = stub();
+        assert!(!Arc::ptr_eq(
+            &inner,
+            &decorate_provider(inner.clone(), &settings.ai, &sem, &quota, &None)
+        ));
+        Ok(())
+    }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
-        let output = Command::new("git")
-            .current_dir(repo_path)
-            .args(args)
-            .output()?;
+        let output = crate::git_cmd::in_dir(repo_path).args(args).output()?;
         if !output.status.success() {
             return Err(anyhow!(
                 "git {:?} failed: {}",
@@ -1301,5 +1704,293 @@ mod tests {
         assert!(std::fs::read_to_string(worktree.path.join("file.txt"))?.contains("Change"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_series_range_in_local_review() {
+        let p1 = PatchInput {
+            index: 1,
+            diff: "diff1".to_string(),
+            subject: Some("Patch 1".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha1".to_string()),
+        };
+        let p2 = PatchInput {
+            index: 2,
+            diff: "diff2".to_string(),
+            subject: Some("Patch 2".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha2".to_string()),
+        };
+        let all_patches = vec![p1.clone(), p2.clone()];
+        let mut patch_shas = HashMap::new();
+        patch_shas.insert(1, "sha1".to_string());
+        patch_shas.insert(2, "sha2".to_string());
+
+        let range_p1 = calculate_series_range(
+            &all_patches,
+            std::slice::from_ref(&p1),
+            &patch_shas,
+            "baseline_sha",
+        );
+        assert_eq!(range_p1, Some("baseline_sha..sha2".to_string()));
+
+        let range_p2 = calculate_series_range(
+            &all_patches,
+            std::slice::from_ref(&p2),
+            &patch_shas,
+            "baseline_sha",
+        );
+        assert_eq!(range_p2, None);
+    }
+
+    #[test]
+    fn test_rich_patches_and_follow_up_context_with_patch_index_filter() {
+        use crate::worker::build_follow_up_series_context;
+
+        let p1 = PatchInput {
+            index: 1,
+            diff: "diff1".to_string(),
+            subject: Some("Patch 1".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha1".to_string()),
+        };
+        let p2 = PatchInput {
+            index: 2,
+            diff: "diff2".to_string(),
+            subject: Some("Patch 2".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("sha2".to_string()),
+        };
+        let all_patches = vec![p1.clone(), p2.clone()];
+        let mut patch_shas = HashMap::new();
+        patch_shas.insert(1, "sha1".to_string());
+        patch_shas.insert(2, "sha2".to_string());
+
+        // When reviewing only patch 1 with index filter:
+        let rich_patches: Vec<Value> = all_patches
+            .iter()
+            .map(|p| {
+                json!({
+                    "index": p.index,
+                    "subject": p.subject,
+                    "author": p.author,
+                    "commit_id": patch_shas.get(&p.index).cloned(),
+                })
+            })
+            .collect();
+
+        let patchset_val = json!({
+            "id": 100,
+            "subject": "Series Subject",
+            "patches": rich_patches,
+            "patch_index": Some(1),
+            "baseline": "baseline_sha"
+        });
+
+        let range = calculate_series_range(
+            &all_patches,
+            std::slice::from_ref(&p1),
+            &patch_shas,
+            "baseline_sha",
+        );
+        assert_eq!(range, Some("baseline_sha..sha2".to_string()));
+
+        let context = build_follow_up_series_context(range.as_deref(), &patchset_val, "sha1");
+        assert!(context.is_some());
+        let ctx_str = context.unwrap();
+        assert!(ctx_str.contains("Current Patch Under Review: [Patch 1 of 2] - Patch 1"));
+        assert!(ctx_str.contains("Series End Commit (Final State): sha2"));
+        assert!(ctx_str.contains("- [Patch 2 of 2] (commit sha2): Patch 2"));
+    }
+
+    #[test]
+    fn test_inline_review_aggregation_single_and_multi_patch() {
+        let single_patch = [PatchInput {
+            index: 1,
+            diff: "diff1".to_string(),
+            subject: Some("[PATCH 1/1] test single".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: None,
+        }];
+        let single_res = [json!({
+            "patch_index": 1,
+            "inline_review": "> +int x;\n+Use unsigned int instead.",
+        })];
+
+        let mut combined_single = String::new();
+        for res in &single_res {
+            let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+            let patch_subject = single_patch
+                .iter()
+                .find(|p| p.index == p_idx)
+                .and_then(|p| p.subject.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(inline) = res["inline_review"].as_str()
+                && !inline.trim().is_empty()
+                && inline.trim() != "No issues found."
+            {
+                if !combined_single.is_empty() {
+                    combined_single.push_str("\n\n");
+                }
+                if single_patch.len() > 1 {
+                    combined_single
+                        .push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+                }
+                combined_single.push_str(inline.trim());
+            }
+        }
+        assert_eq!(combined_single, "> +int x;\n+Use unsigned int instead.");
+        assert!(!combined_single.contains("--- Patch [1]:"));
+
+        let multi_patches = [
+            PatchInput {
+                index: 1,
+                diff: "diff1".to_string(),
+                subject: Some("[PATCH 1/2] test first".to_string()),
+                author: None,
+                date: None,
+                message_id: None,
+                commit_id: None,
+            },
+            PatchInput {
+                index: 2,
+                diff: "diff2".to_string(),
+                subject: Some("[PATCH 2/2] test second".to_string()),
+                author: None,
+                date: None,
+                message_id: None,
+                commit_id: None,
+            },
+        ];
+        let multi_res = [
+            json!({
+                "patch_index": 1,
+                "inline_review": "Comment on patch 1",
+            }),
+            json!({
+                "patch_index": 2,
+                "inline_review": "Comment on patch 2",
+            }),
+        ];
+
+        let mut combined_multi = String::new();
+        for res in &multi_res {
+            let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+            let patch_subject = multi_patches
+                .iter()
+                .find(|p| p.index == p_idx)
+                .and_then(|p| p.subject.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(inline) = res["inline_review"].as_str()
+                && !inline.trim().is_empty()
+                && inline.trim() != "No issues found."
+            {
+                if !combined_multi.is_empty() {
+                    combined_multi.push_str("\n\n");
+                }
+                if multi_patches.len() > 1 {
+                    combined_multi
+                        .push_str(&format!("--- Patch [{}]: {} ---\n", p_idx, patch_subject));
+                }
+                combined_multi.push_str(inline.trim());
+            }
+        }
+        assert!(
+            combined_multi
+                .contains("--- Patch [1]: [PATCH 1/2] test first ---\nComment on patch 1")
+        );
+        assert!(
+            combined_multi
+                .contains("--- Patch [2]: [PATCH 2/2] test second ---\nComment on patch 2")
+        );
+    }
+
+    #[test]
+    fn test_local_review_output_preserves_preexisting_concerns() {
+        let output = build_review_output(
+            "Adds dev-queue routing heuristic.".to_string(),
+            vec![json!({"problem": "new regression"})],
+            vec![json!({"problem": "preexisting bug"})],
+            vec![],
+            3,
+            0,
+        );
+
+        // Pre-existing candidates and summary must be preserved so daemon-spawned worker reviews
+        // store the summary and hand concerns to the standalone Linux bug pipeline.
+        assert_eq!(output["summary"], "Adds dev-queue routing heuristic.");
+        assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
+        assert_eq!(output["concerns_count"], 3);
+        assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_worker_progress_lines_are_what_the_cli_keys_on() {
+        // sashiko-cli local strips PROGRESS_LINE_PREFIX and treats a line
+        // containing " turn " as a tick to overwrite rather than print.
+        let turn = progress_line(ProgressEvent::AiReviewStageTurn {
+            patch_index: 2,
+            stage: "security".to_string(),
+            turn: 3,
+            max_turns: 20,
+        })
+        .unwrap();
+        assert_eq!(turn, "patch 2: security turn 3/20");
+        assert!(turn.contains(" turn "));
+
+        for (event, expected) in [
+            (
+                ProgressEvent::AiReviewStageStarted {
+                    patch_index: 1,
+                    stage: "locking".to_string(),
+                },
+                "patch 1: locking started",
+            ),
+            (
+                ProgressEvent::AiReviewStageFinished {
+                    patch_index: 1,
+                    stage: "locking".to_string(),
+                },
+                "patch 1: locking finished",
+            ),
+            (
+                ProgressEvent::AiReviewAttempt {
+                    patch_index: 1,
+                    attempt: 2,
+                    max_attempts: 3,
+                },
+                "patch 1: retry 2/3",
+            ),
+        ] {
+            let line = progress_line(event).unwrap();
+            assert_eq!(line, expected);
+            assert!(!line.contains(" turn "), "a non-tick line reads as a tick");
+        }
+
+        // A first attempt and the pre-AI events are covered by the worker's
+        // log lines and print nothing here.
+        assert!(
+            progress_line(ProgressEvent::AiReviewAttempt {
+                patch_index: 1,
+                attempt: 1,
+                max_attempts: 3,
+            })
+            .is_none()
+        );
+        assert!(progress_line(ProgressEvent::PatchApplied { index: 1 }).is_none());
+        assert!(PROGRESS_LINE_PREFIX.ends_with(' '));
     }
 }

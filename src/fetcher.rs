@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::events::Event;
+use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::process::Command;
+use std::process::{Output, Stdio};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
@@ -110,8 +109,14 @@ impl FetchAgent {
                 if commit_or_range.contains("..") {
                     let parts: Vec<&str> = commit_or_range.split("..").collect();
                     if parts.len() == 2 {
-                        commits_to_check.push(parts[0].to_string());
-                        commits_to_check.push(parts[1].to_string());
+                        let base = parts[0];
+                        let head = parts[1].trim_start_matches('.');
+                        if !base.is_empty() {
+                            commits_to_check.push(base.to_string());
+                        }
+                        if !head.is_empty() {
+                            commits_to_check.push(head.to_string());
+                        }
                     }
                 } else {
                     commits_to_check.push(commit_or_range.clone());
@@ -162,6 +167,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: commit.clone(),
                                     error: format!("Failed to set up remote {}: {}", url, e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                         }
@@ -183,6 +189,7 @@ impl FetchAgent {
                                     .send(Event::IngestionFailed {
                                         article_id: commit.clone(),
                                         error: format!("Failed to fetch from {}: {}", url, e),
+                                        source: MessageSource::GitFetch,
                                     })
                                     .await;
                             }
@@ -213,6 +220,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: range.clone(),
                                     error: format!("Failed to resolve git range: {}", e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                             continue;
@@ -276,6 +284,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: commit_or_range.clone(),
                                     error: format!("Failed to resolve SHA: {}", e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                             continue;
@@ -289,7 +298,7 @@ impl FetchAgent {
                         .unwrap_or((None, None, None));
 
                     let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, &commit_or_range)
+                        format!("mr-{}-{}", number, commit_or_range)
                     } else {
                         commit_or_range.clone()
                     };
@@ -326,6 +335,7 @@ impl FetchAgent {
                                 .send(Event::IngestionFailed {
                                     article_id: commit_or_range,
                                     error: format!("Failed to extract patch: {}", e),
+                                    source: MessageSource::GitFetch,
                                 })
                                 .await;
                         }
@@ -346,10 +356,17 @@ impl FetchAgent {
     }
 
     async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
-        // Inject GitLab token if available
+        // Inject GitLab token via parsed url::Url to prevent parser differentials.
         let authenticated_url = if let Some(token) = &self.gitlab_token {
-            if url.contains("gitlab.com") && url.starts_with("https://") {
-                url.replace("https://", &format!("https://oauth2:{}@", token))
+            if let Ok(mut parsed) = url::Url::parse(url)
+                && parsed.scheme() == "https"
+                && parsed
+                    .host_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case("gitlab.com"))
+            {
+                let _ = parsed.set_username("oauth2");
+                let _ = parsed.set_password(Some(token));
+                parsed.to_string()
             } else {
                 url.to_string()
             }
@@ -358,8 +375,7 @@ impl FetchAgent {
         };
 
         // Check if remote exists
-        let status = Command::new("git")
-            .current_dir(&self.repo_path)
+        let status = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["remote", "get-url", name])
             .stdout(Stdio::null())
@@ -368,8 +384,7 @@ impl FetchAgent {
             .await?;
 
         if status.success() {
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let output = crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .args(["remote", "get-url", name])
                 .output()
@@ -383,8 +398,7 @@ impl FetchAgent {
                     redact_secret(&current_url),
                     redact_secret(&authenticated_url)
                 );
-                Command::new("git")
-                    .current_dir(&self.repo_path)
+                crate::git_cmd::in_dir_async(&self.repo_path)
                     .args(["-c", "safe.bareRepository=all"])
                     .args(["remote", "set-url", name, &authenticated_url])
                     .output()
@@ -396,8 +410,7 @@ impl FetchAgent {
                 name,
                 redact_secret(&authenticated_url)
             );
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let output = crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .args(["remote", "add", name, &authenticated_url])
                 .output()
@@ -406,46 +419,86 @@ impl FetchAgent {
             if !output.status.success() {
                 return Err(anyhow!(
                     "Failed to add remote: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
                 ));
             }
         }
         Ok(())
     }
 
-    async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&self.repo_path)
-            .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-            .arg("fetch")
-            .arg(remote);
+    /// Runs one `git fetch`, dropping a stale commit-graph and trying
+    /// again when that is what turned the fetch away.  Fetch-pack
+    /// rejects the graph before it opens a connection, so that retry
+    /// repeats no transfer; the wording the commit parse emits can
+    /// come after one, and then the retry pays for it again.  Returns
+    /// git's own output either way; the caller words the failure.
+    async fn fetch_with_graph_retry(&self, args: &[&str]) -> Result<Output> {
+        let mut dropped_graph = false;
 
+        loop {
+            let output = crate::git_cmd::in_dir_async(&self.repo_path)
+                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+                .arg("fetch")
+                .args(args)
+                .output()
+                .await?;
+
+            if output.status.success() || dropped_graph {
+                if dropped_graph {
+                    crate::git_ops::schedule_commit_graph_rebuild(&self.repo_path);
+                }
+                return Ok(output);
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if !crate::git_ops::is_stale_commit_graph(&stderr) {
+                return Ok(output);
+            }
+
+            warn!("Fetch found a stale commit-graph; dropping it");
+            if let Err(e) = crate::git_ops::drop_commit_graph(&self.repo_path).await {
+                warn!("Failed to drop the commit-graph: {}", e);
+                return Ok(output);
+            }
+            dropped_graph = true;
+        }
+    }
+
+    async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
+        let mut args = vec![remote];
         for commit in commits {
-            cmd.arg(commit);
+            if commit.is_empty()
+                || commit.chars().any(char::is_whitespace)
+                || commit.starts_with('-')
+                || commit.starts_with('+')
+                || commit.contains(':')
+            {
+                warn!("Skipping invalid commit ref in fetch batch: {}", commit);
+                continue;
+            }
+            args.push(commit.as_str());
+        }
+        if args.len() == 1 {
+            return Err(anyhow!("No valid commit refs to fetch"));
         }
 
-        let output = cmd.output().await?;
+        let output = self.fetch_with_graph_retry(&args).await?;
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                redact_secret(String::from_utf8_lossy(&output.stderr).trim())
             ));
         }
         Ok(())
     }
 
     async fn fetch_all(&self, remote: &str) -> Result<()> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-            .args(["fetch", remote])
-            .output()
-            .await?;
+        let output = self.fetch_with_graph_retry(&[remote]).await?;
 
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch all failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                redact_secret(String::from_utf8_lossy(&output.stderr).trim())
             ));
         }
         Ok(())
@@ -463,8 +516,7 @@ impl FetchAgent {
             args.extend(["rev-parse", "--verify", &arg_str]);
         };
 
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+        let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(&args)
             .output()
             .await;
@@ -491,8 +543,7 @@ impl FetchAgent {
     }
 
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+        let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["rev-parse", "--verify", commit])
             .output()
@@ -559,18 +610,15 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Setup dummy repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .arg("init")
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
@@ -579,13 +627,11 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "content")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Subject Line\n\nBody Line"])
             .output()
             .await?;
@@ -593,8 +639,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()
             .await?;
@@ -631,18 +676,15 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Setup dummy repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .arg("init")
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
@@ -651,13 +693,11 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "content")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Subject Line"])
             .output()
             .await?;
@@ -665,8 +705,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD^{tree}"])
             .output()
             .await?;
@@ -677,8 +716,7 @@ mod tests {
             "Tree SHA should not be considered a present commit"
         );
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()
             .await?;

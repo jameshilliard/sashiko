@@ -63,6 +63,7 @@
             --sev-high: #FF5722;
             --sev-medium: #FF9800;
             --sev-low: #FBC02D;
+            --sev-unknown: #6e7681;
         }
 
         @media (prefers-color-scheme: dark) {
@@ -114,6 +115,7 @@
                 --sev-high: #ff9d7e;
                 --sev-medium: #ffc260;
                 --sev-low: #ffea7f;
+                --sev-unknown: #8b949e;
             }
         }
 
@@ -130,6 +132,7 @@
             --sev-high: #8A5F00;         /* Dark Orange */
             --sev-medium: #787221;       /* Dark Yellow/Olive */
             --sev-low: #336C8B;          /* Dark Sky Blue */
+            --sev-unknown: #6e7681;
         }
 
         /* Dark Theme (System Preference): Uses standard Okabe-Ito colors */
@@ -145,6 +148,7 @@
                 --sev-high: #E69F00;         /* Orange */
                 --sev-medium: #F0E442;       /* Yellow */
                 --sev-low: #56B4E9;          /* Sky Blue */
+                --sev-unknown: #8b949e;
             }
         }
 
@@ -160,6 +164,7 @@
             --sev-high: #8A5F00;
             --sev-medium: #787221;
             --sev-low: #336C8B;
+            --sev-unknown: #6e7681;
         }
 
         /* Explicit Dark Theme: Overrides system light preference */
@@ -174,6 +179,7 @@
             --sev-high: #E69F00;
             --sev-medium: #F0E442;
             --sev-low: #56B4E9;
+            --sev-unknown: #8b949e;
         }
 
         /* Explicit Theme Overrides */
@@ -223,6 +229,7 @@
             --sev-high: #FF5722;
             --sev-medium: #FF9800;
             --sev-low: #FBC02D;
+            --sev-unknown: #6e7681;
         }
 
         body.theme-dark {
@@ -271,6 +278,7 @@
             --sev-high: #ff9d7e;
             --sev-medium: #ffc260;
             --sev-low: #ffea7f;
+            --sev-unknown: #8b949e;
         }
 
 
@@ -279,6 +287,7 @@
         }
 
         body {
+            position: relative;
             color-scheme: light dark;
             font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
             font-size: 13px;
@@ -323,7 +332,10 @@
 
         /* Navigation */
         .nav {
-            margin-bottom: 10px;
+            margin-bottom: 20px;
+            min-height: 28px;
+            display: flex;
+            align-items: center;
         }
 
         .nav a {
@@ -342,13 +354,17 @@
         .controls input[type="text"] {
             background: var(--input-bg);
             color: var(--text);
-            flex: 1;
-            min-width: 200px;
             padding: 4px 8px;
             font-family: inherit;
             font-size: inherit;
             border: 1px solid var(--border);
             border-radius: 3px;
+        }
+
+        #searchInput {
+            flex: 1;
+            min-width: 140px;
+            max-width: 360px;
         }
 
         .controls button,
@@ -374,12 +390,137 @@
         button:disabled,
         select:disabled {
             opacity: 0.5;
-            cursor: default;
+            cursor: not-allowed;
         }
 
         .controls button.active {
             background: var(--selected);
             font-weight: bold;
+        }
+
+        /* Subsystem Multi-select Dropdown */
+        .subsystem-dropdown {
+            position: relative;
+            display: inline-block;
+        }
+
+        .subsystem-dropdown-btn {
+            padding: 4px 10px;
+            font-family: inherit;
+            font-size: inherit;
+            border: 1px solid var(--border);
+            background: var(--btn-bg);
+            color: var(--text);
+            border-radius: 3px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+
+        .subsystem-dropdown-btn:hover {
+            background: var(--hover);
+        }
+
+        .subsystem-dropdown-menu {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            z-index: 1000;
+            min-width: 280px;
+            max-width: 380px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+        }
+
+        .subsystem-dropdown-header {
+            padding: 8px;
+            border-bottom: 1px solid var(--border-light);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            background: var(--th-bg);
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }
+
+        .subsystem-dropdown-header input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--input-bg);
+            color: var(--text);
+            padding: 4px 8px;
+            font-family: inherit;
+            font-size: 0.9em;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+        }
+
+        .subsystem-dropdown-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            font-size: 0.85em;
+        }
+
+        .subsystem-dropdown-actions a {
+            color: var(--link);
+            cursor: pointer;
+            text-decoration: none;
+        }
+
+        .subsystem-dropdown-actions a:hover {
+            text-decoration: underline;
+        }
+
+        .subsystem-items-container {
+            max-height: 280px;
+            overflow-y: auto;
+            padding: 4px 0;
+        }
+
+        .subsystem-item {
+            display: flex;
+            align-items: center;
+            padding: 5px 10px;
+            cursor: pointer;
+            gap: 8px;
+            font-size: 0.9em;
+            user-select: none;
+            transition: background 0.1s ease;
+        }
+
+        .subsystem-item:hover {
+            background: var(--hover);
+        }
+
+        .subsystem-item input[type="checkbox"] {
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .subsystem-item-name {
+            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .subsystem-item-count {
+            color: var(--text-muted);
+            font-size: 0.85em;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .subsystem-empty-msg {
+            padding: 12px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.9em;
         }
 
         /* Table Styles */
@@ -463,6 +604,33 @@
 
         .status-Incomplete {
             color: var(--thought-color);
+        }
+
+        /* Bug triage states (lifecycle_status) */
+        .status-Dismissed,
+        .status-Duplicate,
+        .status-Closed {
+            color: var(--text-dim);
+            border-color: var(--border);
+        }
+
+        .status-New,
+        .status-Open {
+            color: var(--status-pending);
+        }
+
+        .status-Fixed {
+            color: var(--status-reviewed);
+        }
+
+        /* Bug analysis states (pipeline_state) */
+        .status-Queued,
+        .status-Analyzing {
+            color: var(--status-inreview);
+        }
+
+        .status-Abandoned {
+            color: var(--status-failed);
         }
 
         /* Subsystem Tags - UNCHANGED */
@@ -1096,11 +1264,113 @@
             white-space: pre-wrap;
             font-size: 0.9em;
         }
-    </style>
+    
+        /* Auth UI */
+        #auth-header {
+            position: absolute;
+            top: 32px;
+            right: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            z-index: 10;
+        }
+        #auth-user {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+        #auth-user svg {
+            opacity: 0.6;
+            vertical-align: middle;
+        }
+        #auth-email {
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-style: italic;
+        }
+        #auth-header button {
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 2px 8px;
+            font-size: 11px;
+            line-height: 1.4;
+            cursor: pointer;
+            color: var(--text-muted);
+            transition: all 0.15s ease;
+        }
+        #auth-header button:hover {
+            background: var(--hover);
+            color: var(--text);
+            border-color: var(--text-muted);
+        }
+        #authModal .modal-content { max-width: 450px; }
+        #authModal .note {
+            font-size: 13px;
+            color: var(--text);
+            line-height: 1.5;
+            margin-bottom: 20px;
+        }
+        #bugActionModal .modal-content { max-width: 480px; }
+        button.primary,
+        .btn.primary {
+            background: var(--link);
+            color: #fff;
+            border-color: var(--link);
+        }
+        button.primary:hover,
+        .btn.primary:hover {
+            opacity: 0.9;
+        }
+        .subsystem-dropdown summary::-webkit-details-marker {
+            display: none;
+        }
+        .subsystem-dropdown summary {
+            list-style: none;
+        }
+        [data-bug-panel][hidden] {
+            display: none !important;
+        }
+</style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 </head>
 
 <body>
+    <div id="auth-header">
+        <div id="auth-user">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+            </svg>
+            <span id="auth-email">Guest</span>
+        </div>
+        <button id="auth-btn" class="btn" onclick="toggleAuth()">Login</button>
+    </div>
+
+    <div id="authModal" class="modal-overlay" onclick="if(event.target===this) closeAuthModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeAuthModal()">&times;</span>
+            <div class="about-logo" style="margin-bottom: 16px;">Sign In</div>
+            <div class="note">
+                Enter your email address below to receive a secure sign-in link.
+                <br><br>
+                If your account is authorized, we will email you a link to log in directly without a password.
+            </div>
+            <input type="email" id="authEmailInput" class="search-input" placeholder="Email address (e.g., maintainer@kernel.org)" onkeydown="if(event.key==='Enter') submitAuthRequest()" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box; margin-bottom: 12px; font-size: 14px;">
+            <div id="authMessage" style="font-size: 13px; width: 100%; margin-bottom: 12px; display: none; line-height: 1.4;"></div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                <button type="button" class="btn" onclick="closeAuthModal()">Cancel</button>
+                <button type="button" class="btn primary" id="authSubmitBtn" onclick="submitAuthRequest()">Send Link</button>
+            </div>
+        </div>
+    </div>
+
     <div id="app"></div>
 
     <div class="kbd-hint">
@@ -1215,6 +1485,39 @@
         </div>
     </div>
 
+    <div id="bugActionModal" class="modal-overlay" onclick="if(event.target===this) closeBugActionModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeBugActionModal()">&times;</span>
+            <div class="about-logo" id="bugActionTitle" style="margin-bottom: 24px;">Action</div>
+            
+            <form id="bugActionForm" onsubmit="submitBugAction(event)">
+                <input type="hidden" id="bugActionType" value="">
+                <input type="hidden" id="bugActionTargetId" value="">
+                
+                <div id="bugActionDuplicateSection" style="display: none; margin-bottom: 16px;">
+                    <div style="margin-bottom: 8px;"><strong>Canonical Bug ID:</strong></div>
+                    <input type="text" id="bugActionDuplicateId" class="search-input" placeholder="linux-…" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box;" step="1">
+                    <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Paste the bug ID shown at the top of the existing bug.</div>
+                </div>
+
+                <div id="bugActionAssignSection" style="display: none; margin-bottom: 16px;">
+                    <div style="margin-bottom: 8px;"><strong>Assignee email:</strong></div>
+                    <input type="email" id="bugActionAssignee" class="search-input" placeholder="developer@example.org" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box;">
+                    <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Leave empty to unassign.</div>
+                </div>
+
+                <div style="margin-bottom: 8px;"><strong id="bugActionReasonLabel">Reason / Comment:</strong></div>
+                <textarea id="bugActionReason" class="search-input" style="width: 100%; height: 120px; border: 1px solid var(--border); box-sizing: border-box; resize: vertical;" placeholder="Add reasoning or context..."></textarea>
+                
+                <div style="margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
+                    <button type="button" class="btn" onclick="closeBugActionModal()">Cancel</button>
+                    <button type="submit" class="btn primary" id="bugActionSubmitBtn">Submit</button>
+                </div>
+                <div id="bugActionError" style="color: var(--status-failed); margin-top: 12px; display: none;"></div>
+            </form>
+        </div>
+    </div>
+
     <script>
         // =====================================================================
         // STATE
@@ -1230,6 +1533,14 @@
             stats: null,
             mailingLists: [],
             selectedList: '',
+            bugSubsystem: '',
+            bugSubsystemsList: [],
+            selectedSubsystems: null,
+            bugMinSeverity: '',
+            bugLifecycleStatus: 'open',
+            bugAssignee: '',
+            bugSortBy: 'severity',
+            bugSortOrder: 'desc',
             patchsetId: null,
             patchsetPage: 1,
             patchsetTotalPages: 1,
@@ -1260,8 +1571,320 @@
                 } catch (e) {
                     console.warn("localStorage is not available:", e);
                 }
+            },
+            removeItem(key) {
+                try {
+                    localStorage.removeItem(key);
+                } catch (e) {
+                    console.warn("localStorage is not available:", e);
+                }
             }
         };
+
+        // =====================================================================
+        // AUTHENTICATION & PERMISSIONS
+        // =====================================================================
+        const API_TOKEN_KEY = 'sashiko_session_token';
+        const API_USER_KEY = 'sashiko_session_email';
+
+        function parseJwtPayload(token) {
+            if (!token || typeof token !== 'string') return null;
+            try {
+                const parts = token.split('.');
+                if (parts.length !== 3) return null;
+                const base64Url = parts[1];
+                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+                const jsonPayload = decodeURIComponent(
+                    atob(base64)
+                        .split('')
+                        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+                        .join('')
+                );
+                return JSON.parse(jsonPayload);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function isTokenExpired(token) {
+            const payload = parseJwtPayload(token);
+            if (!payload || typeof payload.exp !== 'number') return true;
+            // Mark expired if within 5 seconds of expiration timestamp to avoid race conditions
+            return (Date.now() / 1000) >= (payload.exp - 5);
+        }
+
+        function clearAuthSession() {
+            safeStorage.removeItem(API_TOKEN_KEY);
+            safeStorage.removeItem(API_USER_KEY);
+            updateAuthUI();
+        }
+
+        function getAuthToken() {
+            const token = safeStorage.getItem(API_TOKEN_KEY);
+            if (!token) return null;
+            if (isTokenExpired(token)) {
+                clearAuthSession();
+                return null;
+            }
+            return token;
+        }
+
+        function getAuthEmail() {
+            if (!getAuthToken()) return null;
+            return safeStorage.getItem(API_USER_KEY);
+        }
+
+        function canPerformBugActions() {
+            if (config && config.read_only) return false;
+            return !!getAuthToken();
+        }
+
+        function getCommentDisabledTitle() {
+            if (config && config.read_only) {
+                return "Server is running in read-only mode.";
+            }
+            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
+            if (!isAuthed) {
+                return "Please sign in to add comments.";
+            }
+            return "You don't have permissions to comment on this bug.";
+        }
+
+        function getManageDisabledTitle() {
+            if (config && config.read_only) {
+                return "Server is running in read-only mode.";
+            }
+            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
+            if (!isAuthed) {
+                return "Please sign in with maintainer credentials to manage this bug.";
+            }
+            return "You don't have maintainer permissions to manage this bug.";
+        }
+
+        function getActionDisabledTitle() {
+            if (config && config.read_only) {
+                return "Server is running in read-only mode.";
+            }
+            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
+            if (!isAuthed) {
+                return "You don't have permissions to perform bug actions in guest mode. Please sign in.";
+            }
+            return "You don't have permissions to perform bug actions.";
+        }
+
+        let isLoggingOut = false;
+        function logoutAuth() {
+            if (isLoggingOut) return;
+            isLoggingOut = true;
+            try {
+                const hadToken = !!safeStorage.getItem(API_TOKEN_KEY);
+                clearAuthSession();
+                if (hadToken) {
+                    fetchConfig().then(refreshPageData);
+                }
+            } finally {
+                setTimeout(() => { isLoggingOut = false; }, 100);
+            }
+        }
+
+        function refreshPageData() {
+            if (typeof router === 'function') {
+                router();
+            } else {
+                window.location.reload();
+            }
+        }
+
+        // Enhance fetch globally to attach Authorization if token exists and handle expiration/rejection
+        const originalFetch = window.fetch;
+        window.fetch = async function() {
+            let [resource, config] = arguments;
+            const token = getAuthToken();
+            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
+                config = config || {};
+                config.headers = config.headers || {};
+                if (!config.headers['Authorization']) {
+                    config.headers['Authorization'] = `Bearer ${token}`;
+                }
+            }
+            const res = await originalFetch(resource, config);
+
+            // Handle token rejection or expiration by the server
+            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
+                if (res.status === 401) {
+                    // Token expired or invalid signature/revoked
+                    console.warn("Session token expired or rejected by server (401 Unauthorized), logging out.");
+                    logoutAuth();
+                } else if (res.status === 403 && resource === '/api/auth/refresh') {
+                    // Token refresh rejected (e.g. blocklisted or revoked permissions)
+                    console.warn("Session refresh forbidden (403 Forbidden), logging out.");
+                    logoutAuth();
+                }
+            }
+            return res;
+        };
+
+        async function fetchNewSessionToken(signInToken) {
+            try {
+                const res = await originalFetch(`/api/auth/verify?token=${encodeURIComponent(signInToken)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.token) {
+                        const payload = parseJwtPayload(data.token);
+                        safeStorage.setItem(API_TOKEN_KEY, data.token);
+                        safeStorage.setItem(API_USER_KEY, (payload && payload.sub) ? payload.sub : 'Authorized User');
+                        updateAuthUI();
+                        await fetchConfig();
+                        refreshPageData();
+                    }
+                } else {
+                    let msg = "Sign-in link is invalid or has expired.";
+                    if (res.status === 403) {
+                        msg = "Sign-in rejected: this account is not authorized or is blocked.";
+                    }
+                    alert(msg);
+                    clearAuthSession();
+                }
+            } catch(e) {
+                console.error(e);
+            }
+        }
+
+        async function runTokenRefresher() {
+            const token = getAuthToken();
+            if (!token) return;
+            try {
+                const res = await originalFetch(`/api/auth/refresh`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.token) {
+                        const payload = parseJwtPayload(data.token);
+                        safeStorage.setItem(API_TOKEN_KEY, data.token);
+                        if (payload && payload.sub) {
+                            safeStorage.setItem(API_USER_KEY, payload.sub);
+                        }
+                        await fetchConfig();
+                    }
+                } else if (res.status === 401 || res.status === 403) {
+                    logoutAuth();
+                }
+            } catch(e) {}
+        }
+
+        function updateAuthUI() {
+            const email = getAuthEmail();
+            const emailSpan = document.getElementById('auth-email');
+            const btn = document.getElementById('auth-btn');
+            if (!emailSpan || !btn) return;
+            if (email) {
+                emailSpan.textContent = email;
+                emailSpan.title = email;
+                btn.textContent = 'Logout';
+                emailSpan.style.color = 'var(--status-reviewed)';
+                emailSpan.style.fontWeight = 'bold';
+                emailSpan.style.fontStyle = 'normal';
+            } else {
+                emailSpan.textContent = 'Guest';
+                emailSpan.title = '';
+                btn.textContent = 'Login';
+                emailSpan.style.color = 'var(--text-muted)';
+                emailSpan.style.fontWeight = 'normal';
+                emailSpan.style.fontStyle = 'italic';
+            }
+        }
+
+        function toggleAuth() {
+            if (getAuthToken()) {
+                logoutAuth();
+            } else {
+                openAuthModal();
+            }
+        }
+
+        function openAuthModal(noticeMessage) {
+            document.getElementById('authEmailInput').value = '';
+            const msg = document.getElementById('authMessage');
+            if (noticeMessage) {
+                msg.style.color = 'var(--status-failed)';
+                msg.textContent = noticeMessage;
+                msg.style.display = 'block';
+            } else {
+                msg.style.display = 'none';
+            }
+            document.getElementById('authModal').style.display = 'flex';
+        }
+
+        function closeAuthModal() {
+            document.getElementById('authModal').style.display = 'none';
+        }
+
+        async function submitAuthRequest() {
+            const email = document.getElementById('authEmailInput').value.trim();
+            if (!email) return;
+
+            const btn = document.getElementById('authSubmitBtn');
+            const msg = document.getElementById('authMessage');
+            btn.disabled = true;
+            msg.style.display = 'none';
+
+            try {
+                const res = await originalFetch('/api/auth/request-link', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+
+                if (res.ok) {
+                    msg.style.color = 'var(--status-reviewed)';
+                    msg.innerHTML = "<b>Sign-in request received.</b><br>If your address is authorized, a sign-in link has been sent to your inbox.";
+                } else {
+                    msg.style.color = 'var(--status-failed)';
+                    msg.textContent = "Error requesting sign-in link: " + res.statusText;
+                }
+            } catch (e) {
+                msg.style.color = 'var(--status-failed)';
+                msg.textContent = "Error: " + e.message;
+            }
+            msg.style.display = 'block';
+            btn.disabled = false;
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const signInToken = urlParams.get('token');
+            if (signInToken) {
+                const cleanPath = window.location.pathname.startsWith('/auth/verify') ? '/' : window.location.pathname;
+                window.history.replaceState({}, document.title, cleanPath + window.location.hash);
+                fetchNewSessionToken(signInToken);
+            } else {
+                // Ensure expired token is purged on load
+                getAuthToken();
+                updateAuthUI();
+            }
+
+            // Check for local expiration periodically so idle tabs log out promptly
+            setInterval(() => {
+                const token = safeStorage.getItem(API_TOKEN_KEY);
+                if (token && isTokenExpired(token)) {
+                    logoutAuth();
+                }
+            }, 30 * 1000);
+
+            // Periodically refresh the session token before it expires
+            setInterval(() => {
+                if (getAuthToken()) {
+                    runTokenRefresher();
+                }
+            }, 3600 * 1000);
+            setTimeout(() => {
+                if (getAuthToken()) {
+                    runTokenRefresher();
+                }
+            }, 2000);
+        });
 
         // =====================================================================
         // SETTINGS & LOCAL STORAGE
@@ -1345,6 +1968,18 @@
             const patchMatch = hash.match(/^#\/patchset\/(.+)$/);
             if (patchMatch) {
                 return { view: 'patchset', id: decodeURIComponent(patchMatch[1]), query };
+            }
+            const bugLogMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)\/log$/) || hash.match(/^#\/log\/bug\/(.+)$/);
+            if (bugLogMatch) {
+                return { view: 'bug_log', id: decodeURIComponent(bugLogMatch[1]), query };
+            }
+            const bugInputMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)\/input$/);
+            if (bugInputMatch) {
+                return { view: 'bug_input', id: decodeURIComponent(bugInputMatch[1]), query };
+            }
+            const bugMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)$/);
+            if (bugMatch) {
+                return { view: 'bug', id: decodeURIComponent(bugMatch[1]), query };
             }
             const msgMatch = hash.match(/^#\/message\/(.+)$/);
             if (msgMatch) {
@@ -1433,6 +2068,15 @@
                     case 'patchset':
                         await renderPatchsetView(route.id, route.query || {});
                         break;
+                    case 'bug':
+                        await renderBugView(route.id, route.query ? route.query.tab : null);
+                        break;
+                    case 'bug_log':
+                        await renderBugLogView(route.id);
+                        break;
+                    case 'bug_input':
+                        await renderBugInputView(route.id);
+                        break;
                     case 'message':
                         await renderMessageView(route.id);
                         break;
@@ -1457,6 +2101,30 @@
             hasNavigatedInternally = true;
             fetchConfig().then(router);
         });
+
+        // Values that come from mail headers, model output or MAINTAINERS are
+        // carried in data attributes and read back here, rather than being
+        // pasted into an inline handler. HTML-escaping is not enough in that
+        // position: the parser decodes &#039; back to a quote before the
+        // attribute is compiled as JS, so an apostrophe in a Message-ID would
+        // close the string literal and run whatever follows it.
+        document.addEventListener('click', (e) => {
+            const btn = e.target.closest('.copy-btn[data-copy]');
+            if (!btn) return;
+            // Rows behind these buttons navigate on click. Capturing at the
+            // document is the only point guaranteed to run before a handler
+            // bound on the row itself, so the stop has to happen here.
+            e.stopPropagation();
+            e.preventDefault();
+            copyToClipboard(btn.dataset.copy);
+        }, true);
+
+        document.addEventListener('change', (e) => {
+            const box = e.target.closest('input[type="checkbox"][data-subsystem]');
+            if (!box) return;
+            toggleSubsystemSelection(box.dataset.subsystem, box.checked);
+        });
+
 
         // =====================================================================
         // DATA FETCHING
@@ -1549,6 +2217,97 @@
             if (e.key === 'Escape') closeAbout();
         });
 
+        function getSeverityColor(sev) {
+            const s = String(sev || '').toLowerCase();
+            switch (s) {
+                case 'critical':
+                    return 'var(--sev-critical)';
+                case 'high':
+                    return 'var(--sev-high)';
+                case 'medium':
+                    return 'var(--sev-medium)';
+                case 'low':
+                    return 'var(--sev-low)';
+                case 'unknown':
+                default:
+                    return 'var(--sev-unknown)';
+            }
+        }
+
+        // Triage states, keyed by lifecycle_status.
+        const BUG_LIFECYCLE_BADGES = {
+            'new': { label: 'New', cls: 'status-New', color: 'var(--status-pending)' },
+            'open': { label: 'Open', cls: 'status-Open', color: 'var(--status-pending)' },
+            'fixed': { label: 'Fixed', cls: 'status-Fixed', color: 'var(--status-reviewed)' },
+            'dismissed': { label: 'Dismissed', cls: 'status-Dismissed', color: 'var(--text-dim)' },
+            'duplicate': { label: 'Duplicate', cls: 'status-Duplicate', color: 'var(--thought-color)' },
+            'closed': { label: 'Closed', cls: 'status-Closed', color: 'var(--text-dim)' },
+        };
+
+        // Analysis states, keyed by pipeline_state. Only the states that say
+        // something the triage badge cannot are listed; 'succeeded' is silent
+        // because a finished analysis is the normal case.
+        const BUG_PIPELINE_BADGES = {
+            'pending': { label: 'Queued', cls: 'status-Queued', color: 'var(--status-inreview)' },
+            'running': { label: 'Analyzing', cls: 'status-Analyzing', color: 'var(--status-inreview)' },
+            'failed': { label: 'Failed', cls: 'status-Failed', color: 'var(--status-failed)' },
+            'abandoned': { label: 'Abandoned', cls: 'status-Abandoned', color: 'var(--status-failed)' },
+        };
+
+        // Picks the single badge that best describes a bug.
+        //
+        // While analysis is queued, running or broken, the pipeline state is
+        // what the reader needs to know, so it takes precedence. Once analysis
+        // has succeeded the pipeline state is uninteresting and the triage
+        // status is shown instead.
+        function getBugStatus(bug) {
+            const pipeline = BUG_PIPELINE_BADGES[(bug.pipeline_state || '').toLowerCase()];
+            if (pipeline) {
+                return pipeline;
+            }
+            if (bug.is_fixed) {
+                return BUG_LIFECYCLE_BADGES['fixed'];
+            }
+            return BUG_LIFECYCLE_BADGES[(bug.lifecycle_status || '').toLowerCase()]
+                || BUG_LIFECYCLE_BADGES['open'];
+        }
+
+        function formatCommitRef(ref, includeTag = false) {
+            if (!ref) return '';
+            let s = String(ref).trim();
+            if (!includeTag) {
+                s = s.replace(/\s*\[.*?\]\s*$/, '');
+            }
+            const m = s.match(/^([0-9a-fA-F]{7,40})(?:\s+\((.*?)\))?(?:\s+(\[.*?\]))?$/);
+            if (m) {
+                const shortSha = m[1].substring(0, 12);
+                const subject = m[2];
+                const tag = (includeTag && m[3]) ? ' ' + m[3] : '';
+                if (subject) {
+                    const cleanSub = subject.startsWith('"') && subject.endsWith('"') ? subject : `"${subject}"`;
+                    return `${shortSha} (${cleanSub})${tag}`;
+                }
+                return `${shortSha}${tag}`;
+            }
+            return s.replace(/\b([0-9a-fA-F]{12})[0-9a-fA-F]{28}\b/g, '$1');
+        }
+
+        function formatLocations(locs) {
+            if (!locs) return '';
+            let arr = locs;
+            if (typeof locs === 'string') {
+                try { arr = JSON.parse(locs); } catch (e) { return `<code>${escapeHtml(locs)}</code>`; }
+            }
+            if (!Array.isArray(arr) || arr.length === 0) return '';
+            return arr.map(loc => {
+                if (typeof loc === 'string') return `<code>${escapeHtml(loc)}</code>`;
+                let text = loc.file || '';
+                if (loc.line) text += `:${loc.line}`;
+                if (loc.function_or_symbol) text += ` (${loc.function_or_symbol})`;
+                return `<code>${escapeHtml(text || JSON.stringify(loc))}</code>`;
+            }).join(' ');
+        }
+
         function escapeHtml(text, highlightDiff = false, renderAiComments = false) {
             if (!text) return '';
             const escaped = String(text)
@@ -1631,11 +2390,16 @@
                     // Parse severity if this is a potential comment candidate
                     let severity = null;
                     let displayLine = line;
+                    let isBulletSeverity = false;
                     if (type === 'TEXT' && renderAiComments) {
                         const severityMatch = line.match(/\[Severity:\s*(Critical|High|Medium|Low)\]/i);
+                        const bulletMatch = line.match(/^\s*-\s*\[(Critical|High|Medium|Low)\]/i);
                         if (severityMatch) {
                             severity = severityMatch[1].toLowerCase();
                             displayLine = line.replace(/\[Severity:\s*(Critical|High|Medium|Low)\]/i, '').trim();
+                        } else if (bulletMatch) {
+                            severity = bulletMatch[1].toLowerCase();
+                            isBulletSeverity = true;
                         }
                     }
 
@@ -1647,7 +2411,7 @@
                          else if (content.startsWith('-') && !content.startsWith('---') && content.trim() !== '--') cls += ' diff-removed';
                     }
 
-                    return { line: displayLine, type, cls, severity };
+                    return { line: displayLine, type, cls, severity, isBulletSeverity };
                 });
 
                 // Pass 2: Group into logical blocks and propagate severity
@@ -1670,6 +2434,9 @@
                     if (item.type === 'TEXT') {
                         if (item.severity) {
                             flushCurrentBlock();
+                            if (item.isBulletSeverity && blocks.length > 0 && blocks[blocks.length - 1].type === 'COMMENT') {
+                                blocks.push({ type: 'EMPTY', item: { line: '', type: 'EMPTY', cls: 'diff-line', severity: null } });
+                            }
                         }
                         if (!currentBlock) {
                             currentBlock = { type: 'COMMENT', items: [], severity: null };
@@ -1723,9 +2490,40 @@
             return escaped;
         }
 
+        function formatDateParts(unix) {
+            if (unix === null || unix === undefined || unix === '') {
+                return { dateStr: '-', timeStr: '' };
+            }
+            const num = typeof unix === 'number' ? unix : Number(unix);
+            if (isNaN(num) || !isFinite(num) || num <= 0) {
+                return { dateStr: '-', timeStr: '' };
+            }
+            const millis = num > 1e11 ? num : num * 1000;
+            const d = new Date(millis);
+            if (isNaN(d.getTime())) {
+                return { dateStr: '-', timeStr: '' };
+            }
+            try {
+                const dateStr = d.toISOString().split('T')[0];
+                const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                return { dateStr, timeStr };
+            } catch (e) {
+                return { dateStr: '-', timeStr: '' };
+            }
+        }
+
         function formatDate(unix, full = false) {
-            const d = new Date(unix * 1000);
-            return full ? d.toLocaleString() : d.toISOString().split('T')[0];
+            if (unix === null || unix === undefined || unix === '') return '-';
+            const num = typeof unix === 'number' ? unix : Number(unix);
+            if (isNaN(num) || !isFinite(num) || num <= 0) return '-';
+            const millis = num > 1e11 ? num : num * 1000;
+            const d = new Date(millis);
+            if (isNaN(d.getTime())) return '-';
+            try {
+                return full ? d.toLocaleString() : d.toISOString().split('T')[0];
+            } catch (e) {
+                return '-';
+            }
         }
 
         function copyToClipboard(input) {
@@ -1862,6 +2660,10 @@
         async function renderListView() {
             const app = document.getElementById('app');
 
+            if (state.listMode === 'bugs') {
+                await loadBugSubsystems();
+            }
+
             const listOptions = state.mailingLists.map(l => 
                 `<option value="${escapeHtml(l.group)}" ${state.selectedList === l.group ? 'selected' : ''}>${escapeHtml(l.name)}</option>`
             ).join('');
@@ -1874,18 +2676,56 @@
                     </span>
                 </h1>
                 <div class="controls">
-                    <select id="listSelector" onchange="setMailingList(this.value)">
+                    <select id="listSelector" onchange="setMailingList(this.value)" style="${state.listMode === 'bugs' ? 'display:none;' : ''}">
                         <option value="">All Lists</option>
                         ${listOptions}
                     </select>
-                    
-                    <input type="text" id="searchInput" placeholder="Search (subject, author:, date:)" value="${escapeHtml(state.searchQuery)}">
+
+                    <div id="bugFilters" style="display: ${state.listMode === 'bugs' ? 'flex' : 'none'}; gap: 8px; align-items: center; position: relative;">
+                        <div id="subsystemDropdown" class="subsystem-dropdown">
+                            <button type="button" id="subsystemDropdownBtn" class="subsystem-dropdown-btn" onclick="toggleSubsystemDropdown(event)">
+                                ${getSubsystemButtonLabel()}
+                            </button>
+                            <div id="subsystemDropdownMenu" class="subsystem-dropdown-menu" style="display: none;" onclick="event.stopPropagation()">
+                                <div class="subsystem-dropdown-header">
+                                    <input type="text" id="subsystemSearchInput" placeholder="Filter subsystems..." oninput="filterSubsystemsList(this.value)">
+                                    <div class="subsystem-dropdown-actions">
+                                        <a href="javascript:void(0)" onclick="selectAllSubsystems(true)">Select All</a>
+                                        <span>|</span>
+                                        <a href="javascript:void(0)" onclick="selectAllSubsystems(false)">Clear</a>
+                                    </div>
+                                </div>
+                                <div id="subsystemItemsContainer" class="subsystem-items-container"></div>
+                            </div>
+                        </div>
+                        <select id="bugSeveritySelector" onchange="setBugFilter('min_severity', this.value)">
+                            <option value="" ${!state.bugMinSeverity ? 'selected' : ''}>All Severities</option>
+                            <option value="Critical" ${state.bugMinSeverity === 'Critical' ? 'selected' : ''}>Critical</option>
+                            <option value="High" ${state.bugMinSeverity === 'High' ? 'selected' : ''}>High+</option>
+                            <option value="Medium" ${state.bugMinSeverity === 'Medium' ? 'selected' : ''}>Medium+</option>
+                            <option value="Low" ${state.bugMinSeverity === 'Low' ? 'selected' : ''}>Low+</option>
+                        </select>
+                        <select id="bugStatusSelector" onchange="setBugFilter('lifecycle_status', this.value)">
+                            <option value="" ${!state.bugLifecycleStatus ? 'selected' : ''}>All Statuses</option>
+                            <option value="new" ${state.bugLifecycleStatus === 'new' ? 'selected' : ''}>New</option>
+                            <option value="open" ${state.bugLifecycleStatus === 'open' ? 'selected' : ''}>Open</option>
+                            <option value="duplicate" ${state.bugLifecycleStatus === 'duplicate' ? 'selected' : ''}>Duplicate</option>
+                            <option value="dismissed" ${state.bugLifecycleStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
+                            <option value="fixed" ${state.bugLifecycleStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
+                            <option value="closed" ${state.bugLifecycleStatus === 'closed' ? 'selected' : ''}>Closed</option>
+                        </select>
+                        <input type="text" id="bugAssigneeFilter" placeholder="Assignee (or none)" value="${escapeHtml(state.bugAssignee)}" style="width: 160px;" onchange="setBugFilter('assignee', this.value)">
+                    </div>
+
+                    <input type="text" id="searchInput" placeholder="${state.listMode === 'bugs' ? 'Search bugs (problem, file, commit)' : 'Search (subject, author:, date:)'}" value="${escapeHtml(state.searchQuery)}">
 
                     <button onclick="triggerSearch()">Search</button>
                     <button onclick="clearSearch()">Clear</button>
-                    <div style="flex:1"></div>
-                    <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
-                    <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
+                    <div style="display: flex; gap: 8px; margin-left: auto;">
+                        <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
+                        <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
+                        <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}">Bugs</button>
+                    </div>
                 </div>
                 <table id="dataTable">
                     <thead id="tableHead"></thead>
@@ -1896,6 +2736,9 @@
             `;
 
             updateTableHeader();
+            if (state.listMode === 'bugs') {
+                renderSubsystemDropdown();
+            }
             await fetchListData();
             fetchStats();
 
@@ -1910,13 +2753,49 @@
 
             if (state.listMode === 'patchsets') {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:50px">Parts</th><th style="width:80px">Status</th><th style="width:120px">Findings</th></tr>`;
+            } else if (state.listMode === 'bugs') {
+                const sortIndicator = (field) => {
+                    if (state.bugSortBy !== field) return '';
+                    return state.bugSortOrder === 'asc' ? ' ▲' : ' ▼';
+                };
+                thead.innerHTML = `<tr>
+                    <th style="cursor:pointer; user-select:none;" onclick="toggleBugSort('problem')" title="Sort by Problem">Problem${sortIndicator('problem')}</th>
+                    <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('severity')" title="Sort by Severity">Severity${sortIndicator('severity')}</th>
+                    <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('discoveries')" title="Sort by Discoveries">Discoveries${sortIndicator('discoveries')}</th>
+                    <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('created_at')" title="Sort by Date">Date${sortIndicator('created_at')}</th>
+                    <th style="width:150px; cursor:pointer; user-select:none;" onclick="toggleBugSort('assignee')" title="Sort by Assignee">Assignee${sortIndicator('assignee')}</th>
+                    <th style="width:80px; cursor:pointer; user-select:none;" onclick="toggleBugSort('status')" title="Sort by Status">Status${sortIndicator('status')}</th>
+                </tr>`;
             } else {
                 thead.innerHTML = `<tr><th>Subject</th><th style="width:180px">Author</th><th style="width:100px">Date</th><th style="width:30px"></th></tr>`;
             }
         }
 
+        window.toggleBugSort = function(field) {
+            if (state.bugSortBy === field) {
+                state.bugSortOrder = state.bugSortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                state.bugSortBy = field;
+                state.bugSortOrder = (field === 'problem' || field === 'bugid') ? 'asc' : 'desc';
+            }
+            state.currentPage = 1;
+            updateTableHeader();
+            fetchListData();
+        };
+
+        let listFetchAbortController = null;
+        let listFetchRequestId = 0;
+
         async function fetchListData() {
-            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : '/api/messages';
+            if (listFetchAbortController) {
+                listFetchAbortController.abort();
+            }
+            listFetchAbortController = new AbortController();
+            const signal = listFetchAbortController.signal;
+            const currentReqId = ++listFetchRequestId;
+            const requestedMode = state.listMode;
+
+            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : (state.listMode === 'bugs' ? '/api/bugs' : '/api/messages');
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
             if (state.searchQuery) {
                 url += `&q=${encodeURIComponent(state.searchQuery)}`;
@@ -1924,105 +2803,235 @@
             if (state.selectedList) {
                 url += `&mailing_list=${encodeURIComponent(state.selectedList)}`;
             }
-
-            const res = await fetch(url);
-            const data = await res.json();
-
-            const items = data.items || [];
-            const total = data.total || 0;
-
-            state.totalPages = Math.ceil(total / state.perPage) || 1;
+            if (state.listMode === 'bugs') {
+                if (state.selectedSubsystems !== null) {
+                    if (state.selectedSubsystems.size === 0) {
+                        state.totalPages = 1;
+                        const tbody = document.getElementById('tableBody');
+                        if (tbody) {
+                            tbody.innerHTML = '<tr><td colspan="100%" style="text-align: center; color: var(--text-muted); padding: 32px 16px;">No subsystems selected. Check one or more subsystems to view bugs.</td></tr>';
+                        }
+                        updatePagination(0);
+                        return;
+                    }
+                    if (state.selectedSubsystems.size < state.bugSubsystemsList.length) {
+                        url += `&subsystems=${encodeURIComponent(Array.from(state.selectedSubsystems).join(','))}`;
+                    }
+                } else if (state.bugSubsystem) {
+                    url += `&subsystem=${encodeURIComponent(state.bugSubsystem)}`;
+                }
+                if (state.bugMinSeverity) {
+                    url += `&min_severity=${encodeURIComponent(state.bugMinSeverity)}`;
+                }
+                if (state.bugLifecycleStatus) {
+                    url += `&lifecycle_status=${encodeURIComponent(state.bugLifecycleStatus)}`;
+                }
+                if (state.bugAssignee) {
+                    url += `&assignee=${encodeURIComponent(state.bugAssignee)}`;
+                }
+                if (state.bugSortBy) {
+                    url += `&sort_by=${encodeURIComponent(state.bugSortBy)}`;
+                }
+                if (state.bugSortOrder) {
+                    url += `&sort_order=${encodeURIComponent(state.bugSortOrder)}`;
+                }
+            }
 
             const tbody = document.getElementById('tableBody');
-            tbody.innerHTML = '';
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="100%" style="text-align: center; color: var(--text-muted); padding: 48px 16px;">Loading...</td></tr>';
+            }
 
-            items.forEach((p, idx) => {
-                const row = document.createElement('tr');
-                const d = new Date(p.date * 1000);
-                const dateStr = d.toISOString().split('T')[0];
-                const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-
-                const dateHtml = `
-                    <div>${dateStr}</div>
-                    <div class="text-muted-sm">${timeStr}</div>
-                `;
-
-                // Parse author
-                const author = parseAuthor(p.author);
-                const nameToDisplay = author.name || author.email;
-                const emailToDisplay = author.name ? author.email : '';
-
-                const authorHtml = `
-                    <div>${escapeHtml(nameToDisplay)}</div>
-                    ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
-                `;
-
-                if (state.listMode === 'patchsets') {
-                    const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
-                        ? `${p.total_parts}`
-                        : `${p.received_parts || 0}/${p.total_parts || 0}`;
-
-                    const clickHandler = (e) => {
-                        if (e.target.closest('.copy-btn')) return;
-                        const target = `#/patchset/${encodeURIComponent(p.slug || p.message_id || p.id)}`;
-                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
-                            window.open(target, '_blank');
-                        } else if (e.button === 0) {
-                            navigate(target);
-                        }
-                    };
-                    row.onclick = clickHandler;
-                    row.onauxclick = clickHandler;
-
-                    let tagsHtml = '';
-                    if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
-                        tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+            try {
+                const res = await fetch(url, { signal });
+                if (res.status === 401 && state.listMode === 'bugs') {
+                    logoutAuth();
+                    clearAuthSession();
+                    if (tbody) {
+                        tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; padding: 48px 16px;">
+                            <div style="font-weight: 500; font-size: 1.1em; margin-bottom: 8px;">Authentication Required</div>
+                            <div class="text-muted-sm" style="margin-bottom: 16px;">Please sign in to view Linux kernel bugs.</div>
+                            <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                        </td></tr>`;
                     }
-
-                    let statusLabel = p.status || 'Pending';
-                    let findingsHtml = '-';
-                    if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
-                        const counts = {
-                            low: p.findings_low || 0,
-                            medium: p.findings_medium || 0,
-                            high: p.findings_high || 0,
-                            critical: p.findings_critical || 0
-                        };
-                        findingsHtml = renderFindingsBadges(counts, statusLabel);
-                    }
-
-                    row.innerHTML = `
-                        <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
-                        <td style="line-height:1.2;">${authorHtml}</td>
-                        <td style="line-height:1.2;">${dateHtml}</td>
-                        <td>${parts}</td>
-                        <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
-                        <td>${findingsHtml}</td>
-                    `;
-                } else {
-                    const clickHandler = (e) => {
-                        if (e.target.closest('.copy-btn')) return;
-                        const target = `#/message/${encodeURIComponent(p.message_id)}`;
-                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
-                            window.open(target, '_blank');
-                        } else if (e.button === 0) {
-                            navigate(target);
-                        }
-                    };
-                    row.onclick = clickHandler;
-                    row.onauxclick = clickHandler;
-
-                    row.innerHTML = `
-                        <td>${escapeHtml(p.subject) || '(no subject)'}</td>
-                        <td style="line-height:1.2;">${authorHtml}</td>
-                        <td style="line-height:1.2;">${dateHtml}</td>
-                        <td><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard('${escapeHtml(p.message_id)}')">📋</button></td>
-                    `;
+                    updatePagination(0);
+                    openAuthModal("Please sign in to access bugs.");
+                    return;
                 }
-                tbody.appendChild(row);
-            });
+                if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                const data = await res.json();
 
-            updatePagination(total);
+                if (currentReqId !== listFetchRequestId || state.listMode !== requestedMode) {
+                    return;
+                }
+
+                const items = data.items || [];
+                const total = data.total || 0;
+
+                state.totalPages = Math.ceil(total / state.perPage) || 1;
+
+                if (tbody) {
+                    tbody.innerHTML = '';
+                }
+
+                if (items.length === 0) {
+                    if (tbody) {
+                        tbody.innerHTML = '<tr><td colspan="100%" style="text-align: center; color: var(--text-muted); padding: 32px 16px;">No items found.</td></tr>';
+                    }
+                    updatePagination(0);
+                    return;
+                }
+
+                items.forEach((p, idx) => {
+                    const row = document.createElement('tr');
+
+                    if (state.listMode === 'patchsets') {
+                        const { dateStr, timeStr } = formatDateParts(p.date);
+                        const dateHtml = `
+                            <div>${dateStr}</div>
+                            ${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}
+                        `;
+                        const author = parseAuthor(p.author);
+                        const nameToDisplay = author.name || author.email;
+                        const emailToDisplay = author.name ? author.email : '';
+                        const authorHtml = `
+                            <div>${escapeHtml(nameToDisplay)}</div>
+                            ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                        `;
+
+                        const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
+                            ? `${p.total_parts}`
+                            : `${p.received_parts || 0}/${p.total_parts || 0}`;
+
+                        const clickHandler = (e) => {
+                            if (e.target.closest('.copy-btn')) return;
+                            const target = `#/patchset/${encodeURIComponent(p.slug || p.message_id || p.id)}`;
+                            if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                                window.open(target, '_blank');
+                            } else if (e.button === 0) {
+                                navigate(target);
+                            }
+                        };
+                        row.onclick = clickHandler;
+                        row.onauxclick = clickHandler;
+
+                        let tagsHtml = '';
+                        const lists = p.mailing_lists || p.subsystems;
+                        if (lists && Array.isArray(lists) && lists.length > 0) {
+                            tagsHtml = '<div style="margin-top:2px">' + lists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                        }
+
+                        let statusLabel = p.status || 'Pending';
+                        let findingsHtml = '-';
+                        if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
+                            const counts = {
+                                low: p.findings_low || 0,
+                                medium: p.findings_medium || 0,
+                                high: p.findings_high || 0,
+                                critical: p.findings_critical || 0
+                            };
+                            findingsHtml = renderFindingsBadges(counts, statusLabel);
+                        }
+
+                        row.innerHTML = `
+                            <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
+                            <td style="line-height:1.2;">${authorHtml}</td>
+                            <td style="line-height:1.2;">${dateHtml}</td>
+                            <td>${parts}</td>
+                            <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
+                            <td>${findingsHtml}</td>
+                        `;
+                    } else if (state.listMode === 'bugs') {
+                        const clickHandler = (e) => {
+                            if (e.target.closest('.copy-btn')) return;
+                            const target = `#/bug/${encodeURIComponent(p.bugid || p.slug || p.id)}`;
+                            if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                                window.open(target, '_blank');
+                            } else if (e.button === 0) {
+                                navigate(target);
+                            }
+                        };
+                        row.onclick = clickHandler;
+                        row.onauxclick = clickHandler;
+
+                        let tagsHtml = '';
+                        if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
+                            tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                        }
+                        
+                        const sevStr = p.severity || 'Unknown';
+                        const sevColor = getSeverityColor(sevStr);
+                        const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(sevStr)}</span>`;
+                        
+                        const statusInfo = getBugStatus(p);
+
+                        const { dateStr, timeStr } = formatDateParts(p.created_at || p.date);
+                        const discoveriesCount = (p.evidence && typeof p.evidence.count === 'number') ? p.evidence.count : 1;
+                        const toolsCount = p.evidence?.tools?.length ?? 0;
+                        const modelsCount = p.evidence?.models?.length ?? 0;
+                        const toolsText = `${toolsCount} ${toolsCount === 1 ? 'tool' : 'tools'}`;
+                        const modelsText = `${modelsCount} ${modelsCount === 1 ? 'model' : 'models'}`;
+                        const discoveriesTitle = `${discoveriesCount} ${discoveriesCount === 1 ? 'discovery' : 'discoveries'} (${toolsText}, ${modelsText})`;
+
+                        row.innerHTML = `
+                            <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
+                            <td style="line-height:1.2;">${sevHtml}</td>
+                            <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
+                            <td style="line-height:1.2;"><div>${dateStr}</div>${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}</td>
+                            <td title="${escapeHtml(p.assignee || 'Unassigned')}">${p.assignee ? escapeHtml(p.assignee.split('@')[0]) : '<span class="text-muted-sm">Unassigned</span>'}</td>
+                            <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
+                        `;
+                    } else {
+                        const { dateStr, timeStr } = formatDateParts(p.date);
+                        const dateHtml = `
+                            <div>${dateStr}</div>
+                            ${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}
+                        `;
+                        const author = parseAuthor(p.author);
+                        const nameToDisplay = author.name || author.email;
+                        const emailToDisplay = author.name ? author.email : '';
+                        const authorHtml = `
+                            <div>${escapeHtml(nameToDisplay)}</div>
+                            ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                        `;
+                        
+                        const clickHandler = (e) => {
+                            if (e.target.closest('.copy-btn')) return;
+                            const target = `#/message/${encodeURIComponent(p.message_id)}`;
+                            if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                                window.open(target, '_blank');
+                            } else if (e.button === 0) {
+                                navigate(target);
+                            }
+                        };
+                        row.onclick = clickHandler;
+                        row.onauxclick = clickHandler;
+
+                        row.innerHTML = `
+                            <td>${escapeHtml(p.subject) || '(no subject)'}</td>
+                            <td style="line-height:1.2;">${authorHtml}</td>
+                            <td style="line-height:1.2;">${dateHtml}</td>
+                            <td><button class="copy-btn" data-copy="${escapeHtml(p.message_id)}">📋</button></td>
+                        `;
+                    }
+                    if (tbody) {
+                        tbody.appendChild(row);
+                    }
+                });
+
+                updatePagination(total);
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    // Intentionally aborted due to superseded request
+                    return;
+                }
+                console.error("fetchListData failed:", err);
+                if (currentReqId === listFetchRequestId && state.listMode === requestedMode) {
+                    if (tbody) {
+                        tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; color: var(--text-danger, #d73a49); padding: 32px 16px;">Failed to load data: ${escapeHtml(err.message)}</td></tr>`;
+                    }
+                }
+            }
         }
 
         function updatePagination(total) {
@@ -2080,19 +3089,206 @@
             fetchListData();
         }
 
-        function clearSearch() {
-            document.getElementById('searchInput').value = '';
-            state.searchQuery = '';
+        async function loadBugSubsystems(force = false) {
+            if (!force && state.bugSubsystemsList && state.bugSubsystemsList.length > 0) {
+                return;
+            }
+            try {
+                const status = state.bugLifecycleStatus || 'open';
+                const res = await fetch(`/api/bugs/subsystems?lifecycle_status=${encodeURIComponent(status)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    // Skip entries with (0)
+                    state.bugSubsystemsList = (data || []).filter(s => (s.open_bugs || s.count || 0) > 0);
+                    if (state.selectedSubsystems === null || force) {
+                        // Select all other by default
+                        state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to load bug subsystems:", e);
+            }
+        }
+
+        function getSubsystemButtonLabel() {
+            if (!state.selectedSubsystems || state.bugSubsystemsList.length === 0) {
+                return 'Subsystems (All) &#9662;';
+            }
+            const total = state.bugSubsystemsList.length;
+            const count = state.selectedSubsystems.size;
+            if (count === 0) {
+                return 'Subsystems (None) &#9662;';
+            }
+            if (count === total) {
+                return 'Subsystems (All) &#9662;';
+            }
+            if (count === 1) {
+                const singleName = Array.from(state.selectedSubsystems)[0];
+                const display = singleName.length > 18 ? singleName.substring(0, 16) + '...' : singleName;
+                return `Subsystem: ${escapeHtml(display)} &#9662;`;
+            }
+            return `Subsystems (${count}/${total}) &#9662;`;
+        }
+
+        function renderSubsystemDropdown() {
+            const btn = document.getElementById('subsystemDropdownBtn');
+            if (btn) {
+                btn.innerHTML = getSubsystemButtonLabel();
+            }
+            const container = document.getElementById('subsystemItemsContainer');
+            if (!container) return;
+
+            const filterText = (document.getElementById('subsystemSearchInput')?.value || '').toLowerCase().trim();
+
+            const items = state.bugSubsystemsList
+                .filter(s => !filterText || s.name.toLowerCase().includes(filterText))
+                .map(s => {
+                    const isChecked = state.selectedSubsystems ? state.selectedSubsystems.has(s.name) : true;
+                    const bugCount = s.open_bugs || s.count || 0;
+                    return `
+                        <label class="subsystem-item" onclick="event.stopPropagation()">
+                            <input type="checkbox" ${isChecked ? 'checked' : ''} data-subsystem="${escapeHtml(s.name)}">
+                            <span class="subsystem-item-name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
+                            <span class="subsystem-item-count">(${bugCount})</span>
+                        </label>
+                    `;
+                })
+                .join('');
+
+            container.innerHTML = items || '<div class="subsystem-empty-msg">No subsystems found</div>';
+        }
+
+        function toggleSubsystemDropdown(event) {
+            if (event) event.stopPropagation();
+            const menu = document.getElementById('subsystemDropdownMenu');
+            if (!menu) return;
+            const isVisible = menu.style.display !== 'none';
+            if (isVisible) {
+                menu.style.display = 'none';
+            } else {
+                menu.style.display = 'block';
+                renderSubsystemDropdown();
+                const searchInput = document.getElementById('subsystemSearchInput');
+                if (searchInput) searchInput.focus();
+            }
+        }
+
+        function filterSubsystemsList(query) {
+            renderSubsystemDropdown();
+        }
+
+        function toggleSubsystemSelection(name, checked) {
+            if (!state.selectedSubsystems) {
+                state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+            }
+            if (checked) {
+                state.selectedSubsystems.add(name);
+            } else {
+                state.selectedSubsystems.delete(name);
+            }
+            const btn = document.getElementById('subsystemDropdownBtn');
+            if (btn) btn.innerHTML = getSubsystemButtonLabel();
             state.currentPage = 1;
             fetchListData();
         }
 
-        function setListMode(mode) {
+        function selectAllSubsystems(select) {
+            if (select) {
+                state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+            } else {
+                state.selectedSubsystems = new Set();
+            }
+            renderSubsystemDropdown();
+            state.currentPage = 1;
+            fetchListData();
+        }
+
+        function setBugFilter(key, value) {
+            if (key === 'subsystem') state.bugSubsystem = value.trim();
+            if (key === 'min_severity') state.bugMinSeverity = value;
+            if (key === 'lifecycle_status') {
+                state.bugLifecycleStatus = value;
+                loadBugSubsystems(true).then(() => {
+                    renderSubsystemDropdown();
+                });
+            }
+            if (key === 'assignee') {
+                state.bugAssignee = value.trim();
+            }
+            state.currentPage = 1;
+            fetchListData();
+        }
+
+        function clearSearch() {
+            document.getElementById('searchInput').value = '';
+            state.searchQuery = '';
+            if (state.listMode === 'bugs') {
+                state.bugSubsystem = '';
+                state.bugMinSeverity = '';
+                state.bugLifecycleStatus = 'open';
+                state.bugAssignee = '';
+                state.bugSortBy = 'severity';
+                state.bugSortOrder = 'desc';
+                if (state.bugSubsystemsList.length > 0) {
+                    state.selectedSubsystems = new Set(state.bugSubsystemsList.map(s => s.name));
+                } else {
+                    state.selectedSubsystems = null;
+                }
+                renderSubsystemDropdown();
+                const sevSel = document.getElementById('bugSeveritySelector');
+                if (sevSel) sevSel.value = '';
+                const statSel = document.getElementById('bugStatusSelector');
+                if (statSel) statSel.value = 'open';
+                const assigneeInput = document.getElementById('bugAssigneeFilter');
+                if (assigneeInput) assigneeInput.value = '';
+            }
+            state.currentPage = 1;
+            fetchListData();
+        }
+
+        async function setListMode(mode) {
             if (state.listMode === mode) return;
             state.listMode = mode;
             state.currentPage = 1;
-            document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
-            document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
+
+            if (mode === 'bugs') {
+                if (!state.bugLifecycleStatus) {
+                    state.bugLifecycleStatus = 'open';
+                    const statSel = document.getElementById('bugStatusSelector');
+                    if (statSel) statSel.value = 'open';
+                }
+                if (!state.bugSortBy) {
+                    state.bugSortBy = 'severity';
+                    state.bugSortOrder = 'desc';
+                }
+            }
+
+            document.getElementById('btn-patchsets')?.classList.toggle('active', mode === 'patchsets');
+            document.getElementById('btn-messages')?.classList.toggle('active', mode === 'messages');
+            document.getElementById('btn-bugs')?.classList.toggle('active', mode === 'bugs');
+
+            const listSel = document.getElementById('listSelector');
+            const bugFilters = document.getElementById('bugFilters');
+            const searchInput = document.getElementById('searchInput');
+            if (listSel) listSel.style.display = mode === 'bugs' ? 'none' : '';
+            if (bugFilters) bugFilters.style.display = mode === 'bugs' ? 'flex' : 'none';
+            if (searchInput) {
+                searchInput.placeholder = mode === 'bugs'
+                    ? 'Search bugs (problem, file, commit)'
+                    : 'Search (subject, author:, date:)';
+            }
+
+            if (mode === 'bugs') {
+                renderSubsystemDropdown();
+                if (!state.bugSubsystemsList || state.bugSubsystemsList.length === 0) {
+                    loadBugSubsystems().then(() => {
+                        if (state.listMode === 'bugs') {
+                            renderSubsystemDropdown();
+                        }
+                    });
+                }
+            }
+
             updateTableHeader();
             fetchListData();
         }
@@ -2180,9 +3376,6 @@
                 header += `<a href="${patchLink}" class="permalink-icon" onclick="copyToClipboard('${patchLink}'); return false;" title="Copy permalink to this patch">
                     <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
                 </a>`;
-
-                let totalTokens = 0;
-                reviews.forEach(r => totalTokens += (r.tokens_in || 0) + (r.tokens_out || 0) + (r.tokens_cached || 0));
 
                 const borderStyle = '';
 
@@ -2323,7 +3516,7 @@
             let paginationHtml = '';
             if (data.total_patches_in_db > data.limit) {
                 const totalPages = Math.ceil(data.total_patches_in_db / data.limit);
-                const basePath = `#/patchset/${encodeURIComponent(data.slug || data.id || data.message_id)}`;
+                const basePath = `#/patchset/${encodeURIComponent((data.slug || data.id) || data.id || data.message_id)}`;
 
                 paginationHtml = `
                     <div class="pagination">
@@ -2340,8 +3533,9 @@
             const isGitSubmission = (data.message_id && (/^[0-9a-f]{40}$/.test(data.message_id) || data.message_id.includes('@sashiko.local'))) || (data.subject && data.subject.startsWith('Git Import:'));
 
             const threadHtml = isGitSubmission ? '' : renderThreadTree(data.thread);
-            const subsystemsHtml = data.subsystems?.length > 0
-                ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
+            const mailingLists = data.mailing_lists || data.subsystems;
+            const mailingListsHtml = mailingLists?.length > 0
+                ? mailingLists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
                 : '-';
 
             let failureHtml = '';
@@ -2356,7 +3550,9 @@
 
             const modelName = data.model_name || '-';
             const providerModel = data.provider ? `${data.provider}/${modelName}` : modelName;
-            const promptsHash = data.prompts_git_hash ? data.prompts_git_hash.substring(0, 8) : '-';
+            const promptsHash = (data.prompts_git_hash || config.git_hash || config.version)
+                ? (data.prompts_git_hash || config.git_hash || config.version).substring(0, 8)
+                : '-';
             
             let baselineStr = '-';
             if (data.baseline) {
@@ -2440,6 +3636,52 @@
                  `;
             }
 
+            let preexistingBugsHtml = '';
+            if (data.bugs && Array.isArray(data.bugs) && data.bugs.length > 0) {
+                preexistingBugsHtml = `
+                    <div class="section" id="preexisting-bugs">
+                        <h2>Discovered Linux Kernel Bugs (${data.bugs.length})</h2>
+                        <div style="margin-bottom: 12px; color: var(--text-muted); font-size: 0.9em;">
+                            The following Linux Kernel defects in the codebase were identified during review (separated from patch regressions):
+                        </div>
+                        ${data.bugs.map(b => {
+                            const sevStr = b.severity || 'Unknown';
+                            const sevColor = getSeverityColor(sevStr);
+                            const statusInfo = getBugStatus(b);
+                            const bugLink = `#/bug/${encodeURIComponent((b.bugid || b.slug || b.id))}`;
+                            const cardId = 'pb-card-' + Math.random().toString(36).substr(2, 9);
+                            return `
+                                <div class="review-card" style="border-left: 3px solid ${sevColor};">
+                                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+                                        <div>
+                                            <a href="${bugLink}" style="font-weight:bold; font-size:1.05em; color:var(--text);">${escapeHtml(b.problem)}</a>
+                                            <div style="margin-top:4px;">
+                                                <span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(sevStr)}</span>
+                                                ${(b.subsystems && Array.isArray(b.subsystems) && b.subsystems.length > 0) ? b.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') : (b.subsystem ? `<span class="tag">${escapeHtml(b.subsystem)}</span>` : '')}
+                                                <span class="tag">${escapeHtml((b.bugid || b.slug || b.id))}</span>
+                                                <span class="tag" style="border:1px solid ${statusInfo.color}; color:${statusInfo.color}; font-weight:bold; background:transparent;">${statusInfo.label}</span>
+                                                ${b.introduced_in_commit ? `<span class="tag" title="${escapeHtml(b.introduced_in_commit)}">Intro: ${escapeHtml(b.introduced_in_commit.length > 20 ? b.introduced_in_commit.substring(0, 20) + '...' : b.introduced_in_commit)}</span>` : ''}
+                                                ${b.is_newly_discovered ? `<span class="tag" style="background:var(--diff-add-bg); color:var(--status-reviewed);">Newly Discovered</span>` : ''}
+                                            </div>
+                                        </div>
+                                        <a href="${bugLink}" style="font-weight:600; font-size:0.9em; white-space:nowrap;">View Details &rarr;</a>
+                                    </div>
+                                    ${(b.description || b.inline_review) ? `
+                                        <div style="margin-top:10px;">
+                                            <button class="toggle-btn" onclick="toggleCollapsible('${cardId}', this)">▶ Inline Review</button>
+                                            <div id="${cardId}" class="collapsible" style="position:relative; margin-top:6px;">
+                                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                                <div class="log-inline-block">${escapeHtml(b.description || b.inline_review, true, true)}</div>
+                                            </div>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                `;
+            }
+
             let currentStatus = data.status || 'Pending';
 
             document.getElementById('app').innerHTML = `
@@ -2457,7 +3699,7 @@
                         return escapeHtml(a.name ? `${a.name} <${a.email}>` : a.email);
                     })()}</div></div>
                     <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
-                    <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
+                    <div class="kv"><div class="label">Mailing Lists:</div><div>${mailingListsHtml}</div></div>
                     <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
                     <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
                     <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
@@ -2479,6 +3721,8 @@
 
                 ${baselineLogsHtml}
                 
+                ${preexistingBugsHtml}
+
                 <div class="section">
                     <h2 id="ai-reviews">AI Reviews</h2>
                     ${summaryHtml}
@@ -2490,11 +3734,11 @@
             if (query.patch || query.part) {
                 setTimeout(() => {
                     let el = null;
-                    if (query.patch) {
-                        el = document.getElementById(`patch-${query.patch}`);
-                    }
-                    if (!el && query.part) {
+                    if (query.part) {
                         el = document.querySelector(`[data-part="${query.part}"]`);
+                    }
+                    if (!el && query.patch) {
+                        el = document.querySelector(`[data-part="${query.patch}"]`) || document.getElementById(`patch-${query.patch}`);
                     }
                     if (el) {
                         el.scrollIntoView({behavior: 'smooth', block: 'center'});
@@ -2554,9 +3798,9 @@
             
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
+            let outputJson = null;
             try {
                 if (r.output) {
-                    let outputJson = null;
                     if (typeof r.output === 'string') {
                         outputJson = JSON.parse(r.output);
                     } else if (typeof r.output === 'object') {
@@ -2658,8 +3902,23 @@
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
+            const summaryText = (r.summary || (outputJson && outputJson.summary) || '').trim();
+            let summaryHtml = '';
+            if (summaryText) {
+                summaryHtml = `
+                    <div style="margin-top:8px;">
+                        <button class="toggle-btn" onclick="toggleCollapsible('summary-${uniqueId}', this)">▼ Summary</button>
+                        <div id="summary-${uniqueId}" class="collapsible open" style="position: relative;">
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                            <div class="log-inline-block">${escapeHtml(summaryText, true, false)}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
             let inlineHtml = '';
-            if (r.inline_review) {
+            const inlineReview = r.inline_review || r.description;
+            if (inlineReview) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
                 const hasIssues = parsedFindings && !displayResult.includes('No regressions');
                 const isOpen = hasIssues ? 'open' : '';
@@ -2669,7 +3928,7 @@
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                            <div class="log-inline-block">${escapeHtml(r.inline_review, true, true)}</div>
+                            <div class="log-inline-block">${escapeHtml(inlineReview, true, true)}</div>
                         </div>
                     </div>
                 `;
@@ -2694,6 +3953,7 @@
                         `}
                     </div>
                     ${showDetails ? `
+                    ${summaryHtml}
                     ${inlineHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}
@@ -2777,7 +4037,7 @@
                     <div><span class="label">To:</span> ${escapeHtml(formatAuthorList(data.to))}</div>
                     <div><span class="label">Cc:</span> ${escapeHtml(formatAuthorList(data.cc))}</div>
                     <div><span class="label">Date:</span> ${date}</div>
-                    <div><span class="label">ID:</span> ${escapeHtml(data.message_id)} <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(data.message_id)}')">Copy</button></div>
+                    <div><span class="label">ID:</span> ${escapeHtml(data.message_id)} <button class="copy-btn" data-copy="${escapeHtml(data.message_id)}">Copy</button></div>
                 </div>
                 
                 ${threadHtml ? `<div class="section"><h2>Thread</h2>${threadHtml}</div>` : ''}
@@ -2830,6 +4090,777 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         // =====================================================================
+        // Linux Kernel Bug VIEW
+        // =====================================================================
+        function bugLogLink(bugid, eventId) {
+            return `#/bug/${encodeURIComponent(bugid)}/log${eventId ? `?event=${encodeURIComponent(eventId)}` : ''}`;
+        }
+
+        function bugInputLink(bugid) {
+            return `#/bug/${encodeURIComponent(bugid)}/input`;
+        }
+
+        // Matches the "View Raw Log" affordance used by patch reviews so raw
+        // records are reached the same way everywhere in the UI.
+        function rawRecordLinkHtml(href, label) {
+            return `<a href="${href}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
+        }
+
+        function bugLogLinkHtml(bugid, eventId, label = 'View Raw Log') {
+            return rawRecordLinkHtml(bugLogLink(bugid, eventId), label);
+        }
+
+        function bugInputLinkHtml(bugid, label = 'View Raw Input') {
+            return rawRecordLinkHtml(bugInputLink(bugid), label);
+        }
+
+        function bugAttribution(record) {
+            let author = record.author;
+            const configuredAttr = config.attribution || config.project_domain;
+            if (!author) {
+                author = configuredAttr || 'sashiko';
+            } else if (author === 'sashiko' && configuredAttr) {
+                author = configuredAttr;
+            }
+            let tool = record.tool;
+            if (tool === 'sashiko:reviewer') {
+                tool = 'sashiko:linux_patch_review';
+            } else if (tool === 'sashiko:bug-worker') {
+                tool = 'sashiko:linux_bug';
+            }
+            const authorHtml = escapeHtml(author || 'Not recorded');
+            const toolHtml = escapeHtml(tool || 'Not recorded');
+            const modelHtml = escapeHtml(record.model || (['web', 'api', 'human'].includes(tool) ? 'Not used' : 'Not recorded'));
+            return `<strong>${authorHtml}</strong> <span class="text-muted-sm">&middot; Tool: <code>${toolHtml}</code> &middot; Model: <code>${modelHtml}</code></span>`;
+        }
+
+        function setBugTab(tab) {
+            document.querySelectorAll('[data-bug-tab]').forEach(button => {
+                const selected = button.dataset.bugTab === tab;
+                button.classList.toggle('active', selected);
+                button.setAttribute('aria-selected', String(selected));
+                button.tabIndex = selected ? 0 : -1;
+            });
+            document.querySelectorAll('[data-bug-panel]').forEach(panel => { panel.hidden = panel.dataset.bugPanel !== tab; });
+        }
+
+        function bugTabKeydown(event) {
+            const tabs = [...document.querySelectorAll('[data-bug-tab]')];
+            const index = tabs.indexOf(event.target);
+            if (index < 0) return;
+            let next;
+            if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+            if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+            if (event.key === 'Home') next = 0;
+            if (event.key === 'End') next = tabs.length - 1;
+            if (next === undefined) return;
+            event.preventDefault();
+            setBugTab(tabs[next].dataset.bugTab);
+            tabs[next].focus();
+        }
+
+        async function renderBugView(slugOrId, initialTab) {
+            const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+            const res = await fetch(`/api/bug?${queryParam}`);
+            if (res.status === 401) {
+                logoutAuth();
+                clearAuthSession();
+                document.getElementById('app').innerHTML = `
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Authentication Required</h2>
+                        <p class="text-muted-sm" style="margin-bottom: 24px;">Please sign in to access Linux kernel bugs.</p>
+                        <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                    </div>
+                `;
+                openAuthModal("Please sign in to access bugs.");
+                return;
+            }
+            if (res.status === 404) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/">← Back to bugs</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Bug Not Found</h2>
+                        <p class="text-muted-sm">The requested bug does not exist or you do not have access to view it.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (!res.ok) throw new Error(`Bug could not be loaded (${res.status} ${res.statusText})`);
+            const data = await res.json();
+            const bugid = data.bugid || data.slug || data.internal_id;
+            const id = Number(data.internal_id || data.id);
+            const evidence = data.evidence || { count: 0, models: [], tools: [], discoveries: [], activity: [] };
+            const status = getBugStatus(data);
+            const severity = data.severity || 'Unknown';
+            const sevColor = getSeverityColor(severity);
+            const report = data.description || data.inline_review;
+            const activity = evidence.activity || [];
+            // Any record with an interaction log makes the raw log page useful,
+            // so the link is offered whenever at least one exists.
+            const hasInteractionLogs = activity.some(e => e.has_logs);
+            document.title = `${config.project_name || 'Sashiko'} - ${data.problem || bugid}`;
+            const commit = (value, includeTag = false) => value ? `<code>${escapeHtml(formatCommitRef(value, includeTag))}</code>` : '';
+
+            const discoveryRows = (evidence.discoveries || []).map(d => {
+                let sourceHtml = 'Direct report';
+                if (d.patchset_id && (d.patch_part || d.patch_id)) {
+                    const patchLabel = d.patch_part ? `Patch ${d.patch_part}` : `Patch ID ${d.patch_id}`;
+                    const patchParam = d.patch_part ? `part=${encodeURIComponent(d.patch_part)}` : `patch=${encodeURIComponent(d.patch_id)}`;
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a> (<a href="#/patchset/${encodeURIComponent(d.patchset_id)}?${patchParam}">${escapeHtml(patchLabel)}</a>)`;
+                } else if (d.patchset_id) {
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>`;
+                } else if (d.commit) {
+                    sourceHtml = `Commit <code>${escapeHtml(formatCommitRef(d.commit))}</code>`;
+                }
+
+                return `
+                <div class="review-card" style="margin-bottom: 10px;">
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap: 8px;">
+                        <a href="#/bug/${encodeURIComponent(d.bugid)}" style="font-weight:bold; font-size:1.05em;">${escapeHtml(d.bugid)}</a>
+                        <span class="text-muted-sm">${formatDate(d.created_at, true)}</span>
+                    </div>
+                    <div class="review-meta" style="margin-top: 6px;">
+                        <div class="review-meta-label">Attribution:</div>
+                        <div>${bugAttribution(d)}</div>
+                        <div class="review-meta-label">Source:</div>
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                            <span>${sourceHtml}${d.legacy ? ' <span class="text-muted-sm">· Historical report; discovery metadata incomplete</span>' : ''}</span>
+                            <span style="font-size:0.9em;">${d.has_input ? bugInputLinkHtml(d.bugid) : ''}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+            }).join('');
+
+            const comments = [];
+            const fixes = [];
+            const reproducers = [];
+            const analysis = [];
+            const auditEvents = [];
+
+            for (const e of activity) {
+                if (e.kind === 'audit' || e.kind === 'deduplication') {
+                    auditEvents.push(e);
+                } else if (e.kind === 'comment') {
+                    comments.push(e);
+                } else if (e.kind === 'fix' || e.kind === 'fix_candidate' || (e.kind && e.kind.startsWith('fix_')) || e.kind === 'proposed_fix' || e.kind === 'suggested_fix') {
+                    fixes.push(e);
+                } else if (e.kind === 'reproducer' || e.kind === 'testcase' || e.kind === 'poc') {
+                    reproducers.push(e);
+                } else if (e.kind === 'report' || e.kind === 'candidate' || e.kind === 'discovery' || e.kind === 'raw_candidate') {
+                    // Exclude primary report and raw discovery candidates from enrichment tabs
+                    continue;
+                } else if (e.kind && e.kind.endsWith('_run')) {
+                    // Workflow stage records only carry interaction logs, which
+                    // the workflow log page presents.
+                    continue;
+                } else {
+                    analysis.push(e);
+                }
+            }
+
+            // The description comes from the report generation run. Older bugs
+            // stored that interaction on the report record itself, while newer
+            // ones keep it on the stage record, so both are accepted.
+            const reportEvent = activity.find(e => e.kind === 'report' && e.has_logs)
+                || activity.find(e => e.kind === 'report_generation_run' && e.has_logs);
+
+            const sortedComments = [...comments].sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+
+            const availableTabs = [
+                { id: 'description', label: 'Description' },
+                { id: 'discoveries', label: `Discoveries (${evidence.count})` }
+            ];
+            if (sortedComments.length > 0) {
+                availableTabs.push({ id: 'comments', label: `Comments (${sortedComments.length})` });
+            }
+            if (fixes.length > 0) {
+                availableTabs.push({ id: 'fixes', label: `Fixes (${fixes.length})` });
+            }
+            if (reproducers.length > 0) {
+                availableTabs.push({ id: 'reproducers', label: `Reproducers (${reproducers.length})` });
+            }
+            if (analysis.length > 0) {
+                availableTabs.push({ id: 'analysis', label: `Analysis (${analysis.length})` });
+            }
+            availableTabs.push({ id: 'audit', label: `Audit (${auditEvents.length})` });
+
+            const prevActiveTab = document.querySelector('[data-bug-tab].active')?.dataset?.bugTab;
+            const targetTab = initialTab || prevActiveTab;
+            const activeTab = (targetTab && availableTabs.some(t => t.id === targetTab)) ? targetTab : 'description';
+
+            const tabButtonsHtml = availableTabs.map(t => {
+                const isSelected = t.id === activeTab;
+                return `<button class="${isSelected ? 'active' : ''}" id="bug-tab-${t.id}" role="tab" data-bug-tab="${t.id}" aria-controls="bug-panel-${t.id}" aria-selected="${isSelected}" tabindex="${isSelected ? 0 : -1}" onclick="setBugTab('${t.id}')">${t.label}</button>`;
+            }).join('\n                    ');
+
+            const subsystemsHtml = (data.subsystems && data.subsystems.length > 0)
+                ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
+                : '<span class="status-placeholder">None</span>';
+
+            const canManage = Boolean(data.can_manage);
+            const canComment = Boolean(data.can_comment);
+            state.currentBugCanManage = canManage;
+            state.currentBugCanComment = canComment;
+            const commentDisabledTitle = getCommentDisabledTitle();
+            const manageDisabledTitle = getManageDisabledTitle();
+
+            // Remembered so the assign modal opens prefilled for reassignment
+            // rather than making the user retype the current owner.
+            state.currentBugAssignee = data.assignee || '';
+
+            const commentBtnHtml = canComment ? `
+                <button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>
+            ` : `
+                <button class="primary" disabled title="${escapeHtml(commentDisabledTitle)}">Add Comment</button>
+            `;
+
+            const assignBtnHtml = canManage ? `
+                <button class="btn" onclick="openBugActionModal('assign', '${id}')">${data.assignee ? 'Reassign' : 'Assign'}</button>
+            ` : `
+                <button class="btn" disabled title="${escapeHtml(manageDisabledTitle)}">${data.assignee ? 'Reassign' : 'Assign'}</button>
+            `;
+
+            const statusBtnHtml = canManage ? `
+                <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
+                    <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
+                    <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
+                        ${!['closed', 'fixed'].includes(data.lifecycle_status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
+                        ${data.lifecycle_status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
+                        ${data.lifecycle_status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
+                    </div>
+                </details>
+            ` : `
+                <button class="btn" disabled title="${escapeHtml(manageDisabledTitle)}">Change Status ▾</button>
+            `;
+
+            const actionButtonsHtml = `
+                ${commentBtnHtml}
+                ${assignBtnHtml}
+                ${statusBtnHtml}
+            `;
+
+            const commentsPanelHtml = sortedComments.length > 0 ? `
+                <div class="section" id="bug-panel-comments" data-bug-panel="comments" role="tabpanel" aria-labelledby="bug-tab-comments" ${activeTab === 'comments' ? '' : 'hidden'}>
+                    <div class="controls" style="justify-content:space-between; margin-bottom: 12px;">
+                        <h2 style="border:none; margin:0; padding:0;">Comments (${sortedComments.length})</h2>
+                        ${canComment ? `<button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>` : ''}
+                    </div>
+                    ${sortedComments.map(c => `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border);">Comment</span>
+                                    ${c.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(c.bugid)}">${escapeHtml(c.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(c.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Author:</div>
+                                <div>${bugAttribution(c)}</div>
+                            </div>
+                            ${c.content ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(c.content, true, false)}</div>` : ''}
+                            ${c.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(c.bugid, c.id)}
+                            </div>` : ''}
+                        </div>
+                    `).join('')}
+                    ${canComment ? `
+                        <div style="margin-top: 16px;">
+                            <button class="btn" onclick="openBugActionModal('comment', '${id}')">Add another comment...</button>
+                        </div>
+                    ` : ''}
+                </div>
+            ` : '';
+
+            const fixesPanelHtml = fixes.length > 0 ? `
+                <div class="section" id="bug-panel-fixes" data-bug-panel="fixes" role="tabpanel" aria-labelledby="bug-tab-fixes" ${activeTab === 'fixes' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Fixes &amp; Patches (${fixes.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Proposed patches, fix commits, and resolution candidates.</p>
+                    ${fixes.map(f => {
+                        const fixLabel = (f.kind || 'fix').replace(/_/g, ' ');
+                        return `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(fixLabel)}</span>
+                                    ${f.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(f.bugid)}">${escapeHtml(f.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(f.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Actor:</div>
+                                <div>${bugAttribution(f)}</div>
+                            </div>
+                            ${f.content ? `
+                                <div style="position: relative; margin-top: 8px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block">${escapeHtml(f.content, true, false)}</div>
+                                </div>
+                            ` : ''}
+                            ${f.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(f.bugid, f.id)}
+                            </div>` : ''}
+                        </div>
+                        `;
+                    }).join('')}
+                </div>
+            ` : '';
+
+            const reproducersPanelHtml = reproducers.length > 0 ? `
+                <div class="section" id="bug-panel-reproducers" data-bug-panel="reproducers" role="tabpanel" aria-labelledby="bug-tab-reproducers" ${activeTab === 'reproducers' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Reproducers (${reproducers.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Programs, scripts, and testcases to reproduce the defect.</p>
+                    ${reproducers.map(r => {
+                        const reproLabel = (r.kind || 'reproducer').replace(/_/g, ' ');
+                        return `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(reproLabel)}</span>
+                                    ${r.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(r.bugid)}">${escapeHtml(r.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(r.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Actor:</div>
+                                <div>${bugAttribution(r)}</div>
+                            </div>
+                            ${r.content ? `
+                                <div style="position: relative; margin-top: 8px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block" style="font-family: monospace;">${escapeHtml(r.content, true, false)}</div>
+                                </div>
+                            ` : ''}
+                            ${r.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(r.bugid, r.id)}
+                            </div>` : ''}
+                        </div>
+                        `;
+                    }).join('')}
+                </div>
+            ` : '';
+
+            const analysisPanelHtml = analysis.length > 0 ? `
+                <div class="section" id="bug-panel-analysis" data-bug-panel="analysis" role="tabpanel" aria-labelledby="bug-tab-analysis" ${activeTab === 'analysis' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Analysis &amp; Verification (${analysis.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Automated bug verification, origin discovery, and severity calibration stages.</p>
+                    ${analysis.map(a => {
+                        const label = (a.kind || 'analysis').replace(/_run$/, '').replace(/_/g, ' ');
+                        return `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(label)}</span>
+                                    ${a.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(a.bugid)}">${escapeHtml(a.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(a.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Actor:</div>
+                                <div>${bugAttribution(a)}</div>
+                            </div>
+                            ${a.content ? `
+                                <div style="position: relative; margin-top: 8px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block">${escapeHtml(a.content, true, false)}</div>
+                                </div>
+                            ` : ''}
+                            ${a.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(a.bugid, a.id)}
+                            </div>` : ''}
+                        </div>
+                        `;
+                    }).join('')}
+                </div>
+            ` : '';
+
+            const auditPanelHtml = `
+                <div class="section" id="bug-panel-audit" data-bug-panel="audit" role="tabpanel" aria-labelledby="bug-tab-audit" ${activeTab === 'audit' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Audit Log (${auditEvents.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">History of changes, status transitions, field updates, and deduplication events. Newest first.</p>
+                    ${auditEvents.length ? auditEvents.map(e => {
+                        let tag = 'Audit';
+                        let summary = e.content || 'Change recorded';
+                        if (e.kind === 'deduplication') {
+                            tag = 'Duplicate';
+                        } else if (summary.toLowerCase().includes('status')) {
+                            tag = 'Status';
+                        } else if (summary.toLowerCase().includes('title')) {
+                            tag = 'Title';
+                        } else if (summary.toLowerCase().includes('created')) {
+                            tag = 'Created';
+                        } else if (summary.toLowerCase().includes('subsystem')) {
+                            tag = 'Subsystem';
+                        } else if (summary.toLowerCase().includes('duplicate')) {
+                            tag = 'Duplicate';
+                        }
+                        return `
+                        <div class="review-card" style="margin-bottom: 8px; padding: 12px 16px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; flex-wrap:wrap;">
+                                <div style="display:flex; align-items:center; gap: 8px; flex-wrap:wrap;">
+                                    <span class="tag" style="font-weight:600; font-size:0.8em; text-transform:uppercase; background:var(--code-bg); border:1px solid var(--border);">${escapeHtml(tag)}</span>
+                                    <strong style="font-size:0.95em;">${escapeHtml(summary)}</strong>
+                                    ${e.bugid !== bugid ? `<span class="text-muted-sm">· From <a href="#/bug/${encodeURIComponent(e.bugid)}">${escapeHtml(e.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm" style="font-size:0.85em;">${formatDate(e.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 6px; font-size:0.85em; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                                <div>Actor: ${bugAttribution(e)}</div>
+                                ${e.has_logs ? bugLogLinkHtml(e.bugid, e.id) : ''}
+                            </div>
+                        </div>
+                        `;
+                    }).join('') : '<p class="status-placeholder">No audit history recorded.</p>'}
+                </div>
+            `;
+
+            document.getElementById('app').innerHTML = `
+                <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
+                <h1>
+                    <span>${escapeHtml(data.problem || data.title || 'Untitled bug')}</span>
+                    <span class="status-badge ${status.cls}">${status.label}</span>
+                </h1>
+
+                ${data.duplicate_of ? `
+                <div class="section" style="margin-bottom: 16px;">
+                    <div class="review-card" style="border-left: 3px solid var(--status-inreview);">
+                        This discovery belongs to <a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid)}"><strong>${escapeHtml(data.duplicate_of.problem || data.duplicate_of.bugid)}</strong></a>. Evidence below includes the linked discoveries.
+                    </div>
+                </div>` : ''}
+
+                <div class="section">
+                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" data-copy="${escapeHtml(bugid)}">Copy</button></div></div>
+                    <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
+                    <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
+                    <div class="kv"><div class="label">Assignee:</div><div>${data.assignee ? `${escapeHtml(data.assignee)}${data.assigned_at ? ` <span class="text-muted-sm">since ${formatDate(data.assigned_at, true)}</span>` : ''}` : '<span class="text-muted-sm">Unassigned</span>'}</div></div>
+                    <div class="kv"><div class="label">Discoveries:</div><div>${evidence.count} (${evidence.tools.length} ${evidence.tools.length === 1 ? 'tool' : 'tools'}, ${evidence.models.length} ${evidence.models.length === 1 ? 'model' : 'models'})</div></div>
+                    <div class="kv"><div class="label">Reported:</div><div>${formatDate(data.reported_at || data.created_at, true)}</div></div>
+                    <div class="kv"><div class="label">Updated:</div><div>${formatDate(data.updated_at, true)}</div></div>
+                    <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
+                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div>${commit(data.introduced_in_commit)} <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling)">Copy</button></div></div>` : ''}
+                    ${data.fixed_in_commit ? `<div class="kv"><div class="label">Fixed in:</div><div>${commit(data.fixed_in_commit)}</div></div>` : ''}
+                    ${data.verified_on_sha ? `<div class="kv"><div class="label">Verified on:</div><div>${commit(data.verified_on_sha)}</div></div>` : ''}
+                    ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
+                    ${hasInteractionLogs ? `<div class="kv"><div class="label">Interaction log:</div><div>${bugLogLinkHtml(bugid)}</div></div>` : ''}
+                </div>
+
+                <div class="controls" style="margin-top: 20px; margin-bottom: 16px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px;" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
+                    ${tabButtonsHtml}
+                </div>
+
+                <div class="section" id="bug-panel-description" data-bug-panel="description" role="tabpanel" aria-labelledby="bug-tab-description" ${activeTab === 'description' ? '' : 'hidden'}>
+                    ${report ? `
+                        <div style="position: relative; margin-top: 10px;">
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                            <div class="log-inline-block" style="padding-right: 55px;">${escapeHtml(report, true, false)}</div>
+                        </div>
+                        ${reportEvent ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">${bugLogLinkHtml(reportEvent.bugid, reportEvent.id)}</div>` : ''}
+                    ` : `
+                        <p class="status-placeholder">${data.pipeline_state === 'pending' || data.pipeline_state === 'running' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the audit history or discoveries for available findings.'}</p>
+                    `}
+                </div>
+
+                <div class="section" id="bug-panel-discoveries" data-bug-panel="discoveries" role="tabpanel" aria-labelledby="bug-tab-discoveries" ${activeTab === 'discoveries' ? '' : 'hidden'}>
+                    <h2>Discovery Evidence</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Each initial finding is counted once, including reports later matched to this bug. Verification and enrichment stages do not add discoveries.</p>
+                    <div class="section" style="margin: 12px 0;">
+                        <div class="kv"><div class="label">Models:</div><div>${evidence.models.length ? evidence.models.map(m => `<span class="tag">${escapeHtml(m)}</span>`).join('') : '<span class="status-placeholder">Not recorded</span>'}</div></div>
+                        <div class="kv"><div class="label">Tools:</div><div>${evidence.tools.length ? evidence.tools.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('') : '<span class="status-placeholder">Not recorded</span>'}</div></div>
+                    </div>
+                    ${evidence.unknown_models ? `<p class="text-muted-sm" style="margin-bottom: 12px;">Model not recorded for ${evidence.unknown_models} ${evidence.unknown_models === 1 ? 'discovery' : 'discoveries'}. Unknown values are excluded from model diversity.</p>` : ''}
+                    ${discoveryRows || '<p class="status-placeholder">No discoveries recorded.</p>'}
+                </div>
+
+                ${commentsPanelHtml}
+                ${fixesPanelHtml}
+                ${reproducersPanelHtml}
+                ${analysisPanelHtml}
+                ${auditPanelHtml}
+
+                <div class="controls" style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border-light);">
+                    ${actionButtonsHtml}
+                </div>
+            `;
+        }
+
+        // The workflow records the name each stage ran under. Older records
+        // predate that, so the raw kind is humanized instead. Records written
+        // before stages stopped being numbered also carry a stage_number,
+        // which is ignored: a position goes stale as soon as the pipeline
+        // gains a stage, so the name is the only durable label.
+        function bugStageLabel(record) {
+            const data = record.data_json || {};
+            if (data.stage_title) {
+                return data.stage_title;
+            }
+            return String(record.kind || 'stage').replace(/_run$/, '').replace(/_/g, ' ');
+        }
+
+        function formatTokenCount(value) {
+            return Number(value || 0).toLocaleString();
+        }
+
+        // Shows the agent stages that ran for a bug and its duplicates, in the
+        // order they executed, with the tokens each one consumed.
+        async function renderBugLogView(slugOrId) {
+            const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+            const res = await fetch(`/api/bug/raw?${queryParam}`);
+            if (res.status === 401) {
+                logoutAuth();
+                clearAuthSession();
+                document.getElementById('app').innerHTML = `
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Authentication Required</h2>
+                        <p class="text-muted-sm" style="margin-bottom: 24px;">Please sign in to access interaction logs.</p>
+                        <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                    </div>
+                `;
+                openAuthModal("Please sign in to access bugs.");
+                return;
+            }
+            if (res.status === 404) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/">← Back to bugs</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Bug Not Found</h2>
+                        <p class="text-muted-sm">The requested bug does not exist or you do not have access to view it.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (res.status === 403) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/bug/${encodeURIComponent(slugOrId)}">← Back to bug</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Access Restricted</h2>
+                        <p class="text-muted-sm">Raw interaction logs and analysis transcripts are restricted to security team and operators.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (!res.ok) throw new Error(`Interaction log could not be loaded (${res.status}). Please try again.`);
+            const payload = await res.json();
+            const records = payload.records || [];
+            const bugid = payload.bugid;
+            document.title = `${config.project_name || 'Sashiko'} - Interaction log for ${bugid}`;
+            const selected = new URLSearchParams(location.hash.split('?')[1] || '').get('event');
+
+            const stages = [];
+            for (const bug of records) {
+                for (const e of (bug.enrichments || [])) {
+                    let entries = [];
+                    if (e.logs) { try { const parsed = JSON.parse(e.logs); entries = Array.isArray(parsed) ? parsed : [parsed]; } catch (_) { } }
+                    entries = entries.filter(entry => entry && typeof entry === 'object');
+                    if (!entries.length) continue;
+                    stages.push({ record: e, bugid: bug.bugid, entries });
+                }
+            }
+            stages.sort((a, b) => (a.record.created_at || 0) - (b.record.created_at || 0));
+
+            // tokens_in counts the cached prefix, so subtract it here to keep
+            // the input and cached figures from reporting the same tokens
+            // twice, the same way the review cards report them.
+            const uncachedTokensIn = (record) => Math.max(0, (record.tokens_in || 0) - (record.tokens_cached || 0));
+
+            const totals = stages.reduce((acc, s) => ({
+                in: acc.in + uncachedTokensIn(s.record),
+                out: acc.out + (s.record.tokens_out || 0),
+                cached: acc.cached + (s.record.tokens_cached || 0),
+            }), { in: 0, out: 0, cached: 0 });
+
+            const stagesHtml = stages.map(({ record: e, bugid: stageBugid, entries }) => {
+                const tokensHtml = (e.tokens_in || e.tokens_out || e.tokens_cached) ? `
+                            <div class="review-meta-label">Tokens:</div>
+                            <div>In ${formatTokenCount(uncachedTokensIn(e))} &middot; Out ${formatTokenCount(e.tokens_out)} &middot; Cached ${formatTokenCount(e.tokens_cached)}</div>
+                ` : '';
+                return `
+                <div class="review-card" id="bug-event-${Number(e.id)}" style="margin-bottom: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                        <div style="display:flex; align-items:center; gap: 8px;">
+                            <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(bugStageLabel(e))}</span>
+                            ${stageBugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(stageBugid)}">${escapeHtml(stageBugid)}</a></span>` : ''}
+                            <span class="text-muted-sm">${entries.length} ${entries.length === 1 ? 'interaction' : 'interactions'}</span>
+                        </div>
+                        <span class="text-muted-sm">${formatDate(e.created_at, true)}</span>
+                    </div>
+                    <div class="review-meta" style="margin-top: 4px;">
+                        <div class="review-meta-label">Actor:</div>
+                        <div>${bugAttribution(e)}</div>
+                        ${tokensHtml}
+                    </div>
+                    <div style="margin-top: 12px;">${renderInteractionLogEntries(entries, `bug-${Number(e.id)}-`)}</div>
+                </div>`;
+            }).join('');
+
+            // The canonical bug carries the status shown in the header, the same
+            // way the patch review log page badges its review status.
+            const canonical = records.find(b => b.bugid === bugid) || records[0] || {};
+            const bugStatus = getBugStatus(canonical);
+
+            document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
+                <h1>
+                    <span>Interaction Log</span>
+                    <span class="header-subtitle">
+                        ${(() => {
+                            const ver = config.git_hash || config.version;
+                            return ver ? 'Sashiko ver.: ' + ver.substring(0, 8) + ' · ' : '';
+                        })()}
+                        <span class="status-badge ${bugStatus.cls}">${bugStatus.label}</span>
+                    </span>
+                </h1>
+                <p class="text-muted-sm" style="margin-bottom: 12px;">Every agent stage that ran for <a href="#/bug/${encodeURIComponent(bugid)}"><code>${escapeHtml(bugid)}</code></a> and its duplicates, in execution order.</p>
+                ${stages.length ? `
+                <div class="section" style="margin-bottom: 16px;">
+                    <div class="kv"><div class="label">Stages:</div><div>${stages.length}</div></div>
+                    <div class="kv"><div class="label">Tokens in:</div><div>${formatTokenCount(totals.in)}</div></div>
+                    <div class="kv"><div class="label">Tokens out:</div><div>${formatTokenCount(totals.out)}</div></div>
+                    <div class="kv"><div class="label">Tokens cached:</div><div>${formatTokenCount(totals.cached)}</div></div>
+                </div>` : ''}
+                ${stagesHtml || '<p class="status-placeholder">No interactions were recorded for this bug.</p>'}`;
+
+            if (selected && /^\d+$/.test(selected)) {
+                setTimeout(() => {
+                    document.getElementById(`bug-event-${selected}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                }, 100);
+            }
+        }
+
+        // Shows the payload the workflow was started with. Duplicates keep
+        // their own candidate records, so each one shows its original input.
+        async function renderBugInputView(slugOrId) {
+            const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+            const res = await fetch(`/api/bug/input?${queryParam}`);
+            if (res.status === 401) {
+                logoutAuth();
+                clearAuthSession();
+                document.getElementById('app').innerHTML = `
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Authentication Required</h2>
+                        <p class="text-muted-sm" style="margin-bottom: 24px;">Please sign in to access raw workflow inputs.</p>
+                        <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                    </div>
+                `;
+                openAuthModal("Please sign in to access bugs.");
+                return;
+            }
+            if (res.status === 404) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/">← Back to bugs</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Bug Not Found</h2>
+                        <p class="text-muted-sm">The requested bug does not exist or you do not have access to view it.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (res.status === 403) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/bug/${encodeURIComponent(slugOrId)}">← Back to bug</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Access Restricted</h2>
+                        <p class="text-muted-sm">Raw workflow inputs are restricted to security team and operators.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (!res.ok) throw new Error(`Raw input could not be loaded (${res.status}). Please try again.`);
+            const payload = await res.json();
+            const bugid = payload.bugid;
+            const inputs = payload.inputs || [];
+            document.title = `${config.project_name || 'Sashiko'} - Raw input for ${bugid}`;
+
+            const inputsHtml = inputs.map(record => {
+                const body = record.input !== null && record.input !== undefined
+                    ? JSON.stringify(record.input, null, 2)
+                    : (record.content || '');
+                return `
+                <div class="review-card" style="margin-bottom: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                        <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border);">Candidate</span>
+                        <span class="text-muted-sm">${formatDate(record.created_at, true)}</span>
+                    </div>
+                    <div class="review-meta" style="margin-top: 4px;">
+                        <div class="review-meta-label">Reported by:</div>
+                        <div>${bugAttribution(record)}</div>
+                    </div>
+                    <div style="position: relative; margin-top: 10px;">
+                        <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                        <div class="log-block">${escapeHtml(body)}</div>
+                    </div>
+                </div>`;
+            }).join('');
+
+            document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
+                <h1><span>Raw Input</span></h1>
+                <p class="text-muted-sm" style="margin-bottom: 12px;">The payload the bug workflow was started with for <a href="#/bug/${encodeURIComponent(bugid)}"><code>${escapeHtml(bugid)}</code></a>.</p>
+                ${inputsHtml || '<p class="status-placeholder">No workflow input was recorded for this discovery.</p>'}`;
+        }
+
+        function renderInteractionLogEntries(logs, prefix = '') {
+            if (!logs || !logs.length) {
+                return '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
+            }
+            let jsonCounter = 0;
+            return logs.map((entry, idx) => {
+                const role = String(entry.role || 'unknown').toLowerCase();
+                const parts = Array.isArray(entry.parts) ? entry.parts : [];
+                let rowClass = 'log-entry';
+                if (role === 'user') rowClass += ' role-user';
+                else if (role === 'model' || role === 'assistant') rowClass += ' role-model';
+                else if (role === 'tool' || role === 'function') rowClass += ' role-tool';
+                else rowClass += ' role-system';
+
+                let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
+
+                let content = '';
+
+                // Unified format: direct content and tool_calls
+                if (entry.thought && typeof entry.thought === 'string') {
+                    content += `<div class="thought-block">${escapeHtml(entry.thought)}</div>`;
+                }
+                
+                if (entry.content && typeof entry.content === 'string') {
+                    if (role === 'tool') {
+                        content += formatJsonExpandable(entry.content, `${prefix}${jsonCounter++}`);
+                    } else {
+                        content += `<div>${escapeHtml(entry.content)}</div>`;
+                    }
+                }
+                if (entry.tool_calls && Array.isArray(entry.tool_calls)) {
+                    entry.tool_calls.forEach(call => {
+                        if (!call || typeof call !== 'object') return;
+                        const callId = `${prefix}${jsonCounter++}`;
+                        content += formatFuncCallExpandable(call.function_name, call.arguments, callId);
+                    });
+                }
+
+                // Gemini format: parts array
+                parts.forEach(part => {
+                    if (!part || typeof part !== 'object') return;
+                    if (part.text) {
+                        if (part.thought) {
+                            content += `<div class="thought-block">${escapeHtml(part.text)}</div>`;
+                        } else {
+                            content += `<div>${escapeHtml(part.text)}</div>`;
+                        }
+                    } else if (part.functionCall || part.function_call) {
+                        const fc = part.functionCall || part.function_call;
+                        const callId = `${prefix}${jsonCounter++}`;
+                        const callHtml = formatFuncCallExpandable(fc.name, fc.args, callId);
+                        content += callHtml;
+                    } else if (part.functionResponse || part.function_response) {
+                        const fr = part.functionResponse || part.function_response;
+                        const respHtml = formatJsonExpandable(fr.response, `${prefix}${jsonCounter++}`);
+                        content += `<div><span style="opacity:0.6">→ ${escapeHtml(fr.name)}:</span> ${respHtml}</div>`;
+                    }
+                });
+
+                return `<div class="${rowClass}"><div class="log-gutter">${label}</div><div class="log-content">${content}</div></div>`;
+            }).join('');
+        }
+
+        // =====================================================================
         // LOG VIEW
         // =====================================================================
         async function renderLogView(id) {
@@ -2837,7 +4868,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!res.ok) throw new Error('Review not found');
             const data = await res.json();
 
-            const totalTokens = (data.tokens_in || 0) + (data.tokens_out || 0) + (data.tokens_cached || 0);
             let logs = [];
             if (Array.isArray(data.logs)) {
                 logs = data.logs;
@@ -2845,73 +4875,17 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
             }
 
-            let logsHtml = '';
-            if (!logs.length) {
-                logsHtml = '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
-            } else {
-                let jsonCounter = 0;
-                logsHtml = logs.map((entry, idx) => {
-                    const role = (entry.role || 'unknown').toLowerCase();
-                    const parts = entry.parts || [];
-                    let rowClass = 'log-entry';
-                    if (role === 'user') rowClass += ' role-user';
-                    else if (role === 'model' || role === 'assistant') rowClass += ' role-model';
-                    else if (role === 'tool' || role === 'function') rowClass += ' role-tool';
-                    else rowClass += ' role-system';
-
-                    let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
-
-                    let content = '';
-
-                    // Unified format: direct content and tool_calls
-                    if (entry.thought && typeof entry.thought === 'string') {
-                        content += `<div class="thought-block">${escapeHtml(entry.thought)}</div>`;
-                    }
-                    
-                    if (entry.content && typeof entry.content === 'string') {
-                        if (role === 'tool') {
-                            content += formatJsonExpandable(entry.content, jsonCounter++);
-                        } else {
-                            content += `<div>${escapeHtml(entry.content)}</div>`;
-                        }
-                    }
-                    if (entry.tool_calls && Array.isArray(entry.tool_calls)) {
-                        entry.tool_calls.forEach(call => {
-                            const callId = jsonCounter++;
-                            content += formatFuncCallExpandable(call.function_name, call.arguments, callId);
-                        });
-                    }
-
-                    // Gemini format: parts array
-                    parts.forEach(part => {
-                        if (part.text) {
-                            if (part.thought) {
-                                content += `<div class="thought-block">${escapeHtml(part.text)}</div>`;
-                            } else {
-                                content += `<div>${escapeHtml(part.text)}</div>`;
-                            }
-                        } else if (part.functionCall || part.function_call) {
-                            const fc = part.functionCall || part.function_call;
-                            const callId = jsonCounter++;
-                            const callHtml = formatFuncCallExpandable(fc.name, fc.args, callId);
-                            content += callHtml;
-                        } else if (part.functionResponse || part.function_response) {
-                            const fr = part.functionResponse || part.function_response;
-                            const respHtml = formatJsonExpandable(fr.response, jsonCounter++);
-                            content += `<div><span style="opacity:0.6">→ ${escapeHtml(fr.name)}:</span> ${respHtml}</div>`;
-                        }
-                    });
-
-                    return `<div class="${rowClass}"><div class="log-gutter">${label}</div><div class="log-content">${content}</div></div>`;
-                }).join('');
-            }
+            const logsHtml = renderInteractionLogEntries(logs);
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
                     <span>Interaction Log</span>
                      <span class="header-subtitle">
-                        ${data.model || '?'} · ${data.prompts_hash ? 'Sashiko ver.: ' + data.prompts_hash.substring(0, 8) + ' · ' : ''}
+                        ${(() => {
+                            const ver = data.prompts_hash || config.git_hash || config.version;
+                            return ver ? 'Sashiko ver.: ' + ver.substring(0, 8) + ' · ' : '';
+                        })()}
                         <span class="status-badge status-${(data.status || '').replace(/ /g, '')}">${data.status}</span>
                     </span>
                 </h1>
@@ -3228,7 +5202,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     return !['pending', 'inreview'].includes(s) && !s.includes('failedtoapply');
                 });
 
-                const totalTokensIn = tokenReviews.reduce((acc, r) => acc + (r.tokens_in || 0), 0);
+                // tokens_in counts the cached prefix, so subtract it here to
+                // keep the two cards from reporting the same tokens twice.
+                const totalTokensIn = tokenReviews.reduce((acc, r) => acc + Math.max(0, (r.tokens_in || 0) - (r.tokens_cached || 0)), 0);
                 const totalTokensOut = tokenReviews.reduce((acc, r) => acc + (r.tokens_out || 0), 0);
                 const totalTokensCached = tokenReviews.reduce((acc, r) => acc + (r.tokens_cached || 0), 0);
                 
@@ -3421,8 +5397,188 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             }
         }
 
+        window.addEventListener('click', (e) => {
+            const dropdown = document.getElementById('subsystemDropdown');
+            const menu = document.getElementById('subsystemDropdownMenu');
+            if (menu && menu.style.display !== 'none') {
+                if (!dropdown || !dropdown.contains(e.target)) {
+                    menu.style.display = 'none';
+                }
+            }
+            const bugStatus = document.getElementById('bugStatusDropdown');
+            if (bugStatus && bugStatus.hasAttribute('open') && !bugStatus.contains(e.target)) {
+                bugStatus.removeAttribute('open');
+            }
+        });
+
         loadSettings();
         fetchConfig().then(router);
+        function openBugActionModal(action, id) {
+            if (action === 'comment') {
+                if (state.currentBugCanComment !== undefined && !state.currentBugCanComment) {
+                    alert(getCommentDisabledTitle());
+                    return;
+                }
+            } else {
+                if (state.currentBugCanManage !== undefined && !state.currentBugCanManage) {
+                    alert(getManageDisabledTitle());
+                    return;
+                }
+            }
+            if (!canPerformBugActions()) {
+                alert(getActionDisabledTitle());
+                return;
+            }
+            document.getElementById('bugActionType').value = action;
+            document.getElementById('bugActionTargetId').value = id;
+            document.getElementById('bugActionReason').value = '';
+            document.getElementById('bugActionDuplicateId').value = '';
+            document.getElementById('bugActionAssignee').value = '';
+            document.getElementById('bugActionError').style.display = 'none';
+            document.getElementById('bugActionSubmitBtn').disabled = false;
+            
+            const titleEl = document.getElementById('bugActionTitle');
+            const reasonLabelEl = document.getElementById('bugActionReasonLabel');
+            const dupSection = document.getElementById('bugActionDuplicateSection');
+            const assignSection = document.getElementById('bugActionAssignSection');
+            const reasonArea = document.getElementById('bugActionReason');
+
+            dupSection.style.display = 'none';
+            assignSection.style.display = 'none';
+            
+            if (action === 'comment') {
+                titleEl.textContent = 'Add Comment';
+                reasonLabelEl.textContent = 'Comment:';
+                reasonArea.placeholder = 'Type your comment...';
+            } else if (action === 'close') {
+                titleEl.textContent = 'Close Bug';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Why is this being closed?';
+            } else if (action === 'dismiss') {
+                titleEl.textContent = 'Dismiss Bug';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Why is this being dismissed?';
+            } else if (action === 'mark_duplicate') {
+                titleEl.textContent = 'Mark as Duplicate';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Explain why it is a duplicate...';
+                dupSection.style.display = 'block';
+            } else if (action === 'assign') {
+                titleEl.textContent = 'Assign Bug';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Why is this being assigned?';
+                assignSection.style.display = 'block';
+                // Prefill with the current assignee so the field doubles as a
+                // reassignment form rather than always starting blank.
+                document.getElementById('bugActionAssignee').value = state.currentBugAssignee || '';
+            }
+            
+            document.getElementById('bugActionModal').classList.add('open');
+        }
+
+        function closeBugActionModal() {
+            document.getElementById('bugActionModal').classList.remove('open');
+        }
+
+        async function submitBugAction(event) {
+            event.preventDefault();
+            const action = document.getElementById('bugActionType').value;
+            const id = document.getElementById('bugActionTargetId').value;
+            let reason = document.getElementById('bugActionReason').value.trim();
+            const errorEl = document.getElementById('bugActionError');
+            const submitBtn = document.getElementById('bugActionSubmitBtn');
+            
+            errorEl.style.display = 'none';
+            submitBtn.disabled = true;
+            
+            if (action === 'comment') {
+                if (state.currentBugCanComment !== undefined && !state.currentBugCanComment) {
+                    errorEl.textContent = getCommentDisabledTitle();
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+            } else {
+                if (state.currentBugCanManage !== undefined && !state.currentBugCanManage) {
+                    errorEl.textContent = getManageDisabledTitle();
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+            }
+            if (!canPerformBugActions()) {
+                errorEl.textContent = getActionDisabledTitle();
+                errorEl.style.display = 'block';
+                submitBtn.disabled = false;
+                return;
+            }
+
+            const payload = { action: action, tool: 'web' };
+            
+            if (action === 'comment') {
+                if (!reason) {
+                    errorEl.textContent = 'Comment content is required.';
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+                payload.content = reason;
+            } else if (action === 'close' || action === 'dismiss') {
+                if (reason) {
+                    payload.reason = reason;
+                }
+            } else if (action === 'mark_duplicate') {
+                const dupIdStr = document.getElementById('bugActionDuplicateId').value.trim();
+                if (!dupIdStr) {
+                    errorEl.textContent = 'Canonical Bug ID is required.';
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+                if (/^\d+$/.test(dupIdStr)) payload.duplicate_of_id = Number(dupIdStr);
+                else payload.duplicate_of_bugid = dupIdStr;
+                if (reason) {
+                    payload.reasoning = reason;
+                }
+            } else if (action === 'assign') {
+                // An empty field is meaningful here: it unassigns the bug.
+                payload.assignee = document.getElementById('bugActionAssignee').value.trim() || null;
+                if (reason) {
+                    payload.reason = reason;
+                }
+            }
+
+            try {
+                const res = await fetch(`/api/bug/action?id=${encodeURIComponent(id)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!res.ok) {
+                    let errStr = res.statusText;
+                    try { errStr = (await res.text()) || errStr; } catch(e) {}
+                    if (res.status === 401) {
+                        logoutAuth();
+                        clearAuthSession();
+                        openAuthModal("Please sign in to perform bug actions.");
+                    } else if (res.status === 403) {
+                        if (!errStr || errStr === "Forbidden" || errStr.toLowerCase().includes("remote mutations disallowed")) {
+                            errStr = (action === 'comment') ? getCommentDisabledTitle() : getManageDisabledTitle();
+                        }
+                    }
+                    throw new Error(errStr);
+                }
+                
+                closeBugActionModal();
+                await renderBugView(id, action === 'comment' ? 'comments' : undefined);
+                
+            } catch (e) {
+                errorEl.textContent = e.message;
+                errorEl.style.display = 'block';
+                submitBtn.disabled = false;
+            }
+        }
     </script>
 </body>
 

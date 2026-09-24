@@ -1,0 +1,250 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sashiko-self
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sashiko-self-ksa
+  namespace: sashiko-self
+  annotations:
+    iam.gke.io/gcp-service-account: sashiko-app@GCP_PROJECT_ID.iam.gserviceaccount.com
+---
+# The self-review instance only ever holds its own database and a clone of
+# the Sashiko repository, which is three orders of magnitude smaller than the
+# kernel tree the main instance carries.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sashiko-self-data-pvc
+  namespace: sashiko-self
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sashiko-self-deployment
+  namespace: sashiko-self
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sashiko-self
+  template:
+    metadata:
+      labels:
+        app: sashiko-self
+    spec:
+      # The main instance owns n2d-pool and sizes its requests to fill that
+      # node. Pinning the self-review instance to the other pool keeps a
+      # review storm on one instance from starving the other, and keeps a
+      # node drain from taking both down at once.
+      nodeSelector:
+        cloud.google.com/gke-nodepool: pool-256gb
+      securityContext:
+        fsGroup: 1000
+      serviceAccountName: sashiko-self-ksa
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: sashiko
+          image: us-docker.pkg.dev/GCP_PROJECT_ID/sashiko-repository/sashiko:next
+          # The image entrypoint provisions the Linux kernel tree, which this
+          # instance never reviews. This entrypoint provisions the Sashiko
+          # repository instead and then execs the same binary.
+          command: ["/bin/bash", "/usr/local/bin/sashiko-self-entrypoint.sh"]
+          args: ["--debug"]
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+            limits:
+              cpu: "16"
+              memory: "64Gi"
+          ports:
+            - containerPort: 8080
+          # /health is served by the API with no dependencies, so it answers
+          # whenever the async runtime can still accept a connection. A tool
+          # that monopolises a runtime worker stops that from happening while
+          # the process stays alive, which reads as Running to Kubernetes and
+          # as a 502 to every caller. These probes turn that state into a
+          # restart.
+          #
+          # Startup is allowed five minutes because the entrypoint clones the
+          # repository and the binary migrates the database before the
+          # listener opens.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          env:
+            - name: SASHIKO_LOG_PLAIN
+              value: "true"
+            - name: NO_COLOR
+              value: "true"
+            # The project selects the workflows, the prompt directory and the
+            # database stamp. Everything else here is a consequence of it.
+            - name: SASHIKO__PROJECT__KIND
+              value: "sashiko"
+            - name: SASHIKO__PROJECT__NAME
+              value: "Sashiko"
+            - name: SASHIKO__PROJECT__DESCRIPTION
+              value: "Sashiko reviewing Sashiko"
+            - name: SASHIKO__PROJECT__DOMAIN
+              value: "sashiko.sashiko.dev"
+            - name: SASHIKO__DATABASE__URL
+              value: "/data/db/sashiko-self.db"
+            # Read by the entrypoint, not by the binary: it names the tree to
+            # clone into SASHIKO__GIT__REPOSITORY_PATH.
+            - name: SASHIKO_SELF_REPOSITORY_URL
+              value: "https://github.com/sashiko-dev/sashiko.git"
+            - name: SASHIKO__GIT__REPOSITORY_PATH
+              value: "/app/third_party/sashiko"
+            - name: SASHIKO__REVIEW__WORKTREE_DIR
+              value: "/mnt/worktrees"
+            - name: SASHIKO__REVIEW__CONCURRENCY
+              value: "12"
+            - name: SASHIKO__SERVER__PORT
+              value: "8080"
+            # Sign-in links are mailed, so the service has to know the URL it
+            # is served at. Startup fails without this whenever SMTP is set.
+            - name: SASHIKO__SERVER__PUBLIC_BASE_URL
+              value: "https://sashiko.sashiko.dev"
+            - name: SASHIKO__SERVER__ACL__ADMINS
+              value: "roman.gushchin@linux.dev"
+            - name: SASHIKO__AI__MODEL
+              value: "gemini-3.1-pro-preview"
+            - name: SASHIKO__AI__MAX_INTERACTIONS
+              value: "100"
+            # Pull requests arrive over the forge webhook rather than NNTP,
+            # and enabling the forge is what turns the mailing list ingestor
+            # off.
+            - name: SASHIKO__FORGE__ENABLED
+              value: "true"
+            - name: SASHIKO__FORGE__PROVIDER
+              value: "github"
+            - name: SASHIKO__FORGE__POST_MODE
+              value: "live"
+            - name: SASHIKO__SMTP__SENDER_ADDRESS
+              value: "sashiko-bot@kernel.org"
+            - name: SASHIKO__SMTP__SERVER
+              value: "mail.kernel.org"
+            - name: SASHIKO__SMTP__PORT
+              value: "465"
+            - name: SASHIKO__SMTP__USERNAME
+              value: "sashiko-bot@kernel.org"
+            - name: SASHIKO__SMTP__REPLY_TO
+              value: "sashiko-reviews@lists.linux.dev"
+            - name: SASHIKO__SMTP__DRY_RUN
+              value: "false"
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: "grep.threads"
+            - name: GIT_CONFIG_VALUE_0
+              value: "1"
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: LLM_API_KEY
+            - name: SASHIKO__SMTP__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO_SMTP__PASSWORD
+            # Signs sign-in links and the sessions they establish. Without it
+            # nobody can sign in, and replacing it signs everyone out, so it
+            # lives in the Secret rather than being minted at startup.
+            - name: SASHIKO__SERVER__JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__SERVER__JWT_SECRET
+            # Authenticates GitHub webhook deliveries. Without it the service
+            # refuses every non-localhost submission, so it is required.
+            - name: SASHIKO__FORGE__WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__WEBHOOK_SECRET
+            # Raises the GitHub API rate limit for pull request fetches. The
+            # repository is public, so an absent token degrades throughput
+            # rather than breaking ingestion, and the container still starts.
+            - name: SASHIKO__FORGE__API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__API_TOKEN
+                  optional: true
+            - name: SASHIKO__FORGE__APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__APP_ID
+                  optional: true
+            - name: SASHIKO__FORGE__INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__INSTALLATION_ID
+                  optional: true
+            - name: SASHIKO__FORGE__APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__APP_PRIVATE_KEY
+                  optional: true
+          volumeMounts:
+            - name: sashiko-self-storage
+              mountPath: /data
+              subPath: data-dir
+            - name: sashiko-self-storage
+              mountPath: /app/third_party/sashiko
+              subPath: sashiko-repo
+            - name: entrypoint
+              mountPath: /usr/local/bin/sashiko-self-entrypoint.sh
+              subPath: sashiko-self-entrypoint.sh
+            - name: worktrees
+              mountPath: /mnt/worktrees
+            - name: tmp-volume
+              mountPath: /tmp
+      volumes:
+        - name: sashiko-self-storage
+          persistentVolumeClaim:
+            claimName: sashiko-self-data-pvc
+        # Worktrees are recreated from the clone on demand, so they live on
+        # the node rather than on the persistent disk.
+        - name: worktrees
+          emptyDir: {}
+        - name: tmp-volume
+          emptyDir: {}
+        - name: entrypoint
+          configMap:
+            name: sashiko-self-entrypoint
+            defaultMode: 0755

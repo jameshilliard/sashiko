@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
     ClassifyAiError, ProviderCapabilities, ToolCall, classify_status_code,
@@ -22,7 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -84,6 +83,7 @@ pub struct OpenAiFunction {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAiResponse {
     pub choices: Vec<OpenAiChoice>,
+    #[serde(default)]
     pub usage: OpenAiUsage,
 }
 
@@ -94,11 +94,43 @@ pub struct OpenAiChoice {
     pub finish_reason: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Every field defaults, and the object itself defaults on the response.
+/// A compatible endpoint reports whichever counts it keeps, and some
+/// report none at all.  The counts are accounting, and losing them costs
+/// less than losing a completion that arrived intact.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct OpenAiUsage {
+    #[serde(default)]
     pub prompt_tokens: u32,
+    #[serde(default)]
     pub completion_tokens: u32,
+    #[serde(default)]
     pub total_tokens: u32,
+    /// Absent on the many compatible endpoints that do not report cache
+    /// hits.  A value that does not fit the documented shape is dropped
+    /// rather than failing the response.
+    #[serde(
+        default,
+        deserialize_with = "lenient_prompt_tokens_details",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct OpenAiPromptTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+}
+
+fn lenient_prompt_tokens_details<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenAiPromptTokensDetails>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +234,16 @@ impl OpenAiCompatClient {
             },
             None => return Err(anyhow::anyhow!("Invalid url scheme in OpenAI url {}", url)),
         };
+
+        // If the caller supplied a full URL that already targets a chat
+        // completions endpoint, accept it verbatim. This allows any
+        // OpenAI-compatible provider to be configured via `base_url` alone,
+        // including endpoints whose path is not otherwise recognised such as
+        // z.ai's coding-plan gateway
+        // (https://api.z.ai/api/coding/paas/v4/chat/completions).
+        if path.ends_with("/chat/completions") {
+            return Ok(format!("{base}{path}"));
+        }
 
         let path = match path.as_str() {
             "" => "/chat/completions",
@@ -483,11 +525,28 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         );
     }
 
+    // prompt_tokens already counts the cached prefix, so cached_tokens is a
+    // breakdown of it rather than an addend the way Anthropic reports it.
+    // A larger count means the endpoint reports the prefix alongside the
+    // prompt instead.  Clamping to prompt_tokens leaves the two equal, so a
+    // consumer subtracting for uncached input still gets zero and the token
+    // budget still never trips.  Drop the count instead.
+    let cached = resp
+        .usage
+        .prompt_tokens_details
+        .and_then(|d| d.cached_tokens)
+        .filter(|&c| c <= resp.usage.prompt_tokens)
+        .unwrap_or(0);
+
     let usage = Some(AiUsage {
         prompt_tokens: resp.usage.prompt_tokens as usize,
         completion_tokens: resp.usage.completion_tokens as usize,
         total_tokens: resp.usage.total_tokens as usize,
-        cached_tokens: None,
+        cached_tokens: if cached > 0 {
+            Some(cached as usize)
+        } else {
+            None
+        },
     });
 
     Ok(AiResponse {
@@ -498,32 +557,6 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         usage,
         truncated,
     })
-}
-
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    let mut total = 0;
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-    total
 }
 
 #[async_trait]
@@ -539,15 +572,34 @@ impl AiProvider for OpenAiCompatClient {
         translate_ai_response(resp)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
             context_window_size: self.context_window_size,
         }
+    }
+
+    fn cache_identity(&self) -> String {
+        // The endpoint and the output cap shape the reply but travel outside
+        // the request, so the bare model name cannot distinguish them. A
+        // gpt-5.x call that hit the 4096 default comes back empty with
+        // finish_reason "length"; raising max_tokens has to miss that entry
+        // rather than replay it. base_url separates two endpoints serving
+        // the same model name, and provider_type decides whether the request
+        // carries max_tokens or max_completion_tokens.
+        let max_tokens = self.max_tokens.to_string();
+        let provider_type = match self.provider_type {
+            OpenAiProviderType::OpenAi => "openai",
+            OpenAiProviderType::OpenAiCompatible => "openai-compatible",
+        };
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("max_tokens", Some(max_tokens.as_str())),
+                ("base_url", Some(self.base_url.as_str())),
+                ("provider_type", Some(provider_type)),
+            ],
+        )
     }
 }
 
@@ -980,6 +1032,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                prompt_tokens_details: None,
             },
         };
 
@@ -993,6 +1046,156 @@ mod tests {
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.total_tokens, 30);
         assert_eq!(usage.cached_tokens, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_cached_tokens() -> Result<()> {
+        let openai_resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAiUsage {
+                prompt_tokens: 2048,
+                completion_tokens: 20,
+                total_tokens: 2068,
+                prompt_tokens_details: Some(OpenAiPromptTokensDetails {
+                    cached_tokens: Some(1920),
+                }),
+            },
+        };
+
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+
+        // prompt_tokens stays whole: the cached count is a breakdown of it,
+        // so uncached input is the difference.
+        assert_eq!(usage.prompt_tokens, 2048);
+        assert_eq!(usage.cached_tokens, Some(1920));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_zero_cached_tokens_is_none() -> Result<()> {
+        let openai_resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                prompt_tokens_details: Some(OpenAiPromptTokensDetails {
+                    cached_tokens: Some(0),
+                }),
+            },
+        };
+
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+        assert_eq!(usage.cached_tokens, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_usage_deserializes_without_prompt_tokens_details() -> Result<()> {
+        let usage: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}"#,
+        )?;
+        assert!(usage.prompt_tokens_details.is_none());
+
+        let usage: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens": 2048, "completion_tokens": 20, "total_tokens": 2068,
+                "prompt_tokens_details": {"cached_tokens": 1920, "audio_tokens": 0}}"#,
+        )?;
+        assert_eq!(
+            usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            Some(1920)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_usage_tolerates_malformed_prompt_tokens_details() -> Result<()> {
+        for details in [r#"{"cached_tokens": 1920.5}"#, r#""1920""#, "[]", "null"] {
+            let body = format!(
+                r#"{{"prompt_tokens": 2048, "completion_tokens": 20,
+                     "total_tokens": 2068, "prompt_tokens_details": {details}}}"#
+            );
+            let usage: OpenAiUsage = serde_json::from_str(&body)?;
+            let cached = usage.prompt_tokens_details.and_then(|d| d.cached_tokens);
+            assert_eq!(cached, None, "{details}");
+            assert_eq!(usage.prompt_tokens, 2048);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_response_deserializes_with_usage_missing_or_partial() -> Result<()> {
+        let resp: OpenAiResponse = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "finish_reason": "stop",
+                 "message": {"role": "assistant", "content": "Hello!"}}]}"#,
+        )?;
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+
+        let resp: OpenAiResponse = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "finish_reason": "stop",
+                 "message": {"role": "assistant", "content": "Hello!"}}],
+                 "usage": {"prompt_tokens": 10}}"#,
+        )?;
+        assert_eq!(resp.usage.prompt_tokens, 10);
+        assert_eq!(resp.usage.completion_tokens, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_drops_cached_over_prompt_tokens() -> Result<()> {
+        let openai_resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hello!".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAiUsage {
+                prompt_tokens: 2048,
+                completion_tokens: 20,
+                total_tokens: 2068,
+                prompt_tokens_details: Some(OpenAiPromptTokensDetails {
+                    cached_tokens: Some(3000),
+                }),
+            },
+        };
+
+        // An endpoint reporting the prefix alongside prompt_tokens offers no
+        // usable breakdown, so the whole prompt stays uncached input.
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+        assert_eq!(usage.cached_tokens, None);
+        assert_eq!(usage.prompt_tokens, 2048);
 
         Ok(())
     }
@@ -1021,6 +1224,7 @@ mod tests {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
+                prompt_tokens_details: None,
             },
         };
 
@@ -1046,53 +1250,12 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 0,
                 total_tokens: 10,
+                prompt_tokens_details: None,
             },
         };
 
         let result = translate_ai_response(openai_resp);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_estimate_tokens() {
-        let request = AiRequest {
-            system: Some("System prompt".to_string()),
-            messages: vec![
-                AiMessage {
-                    role: AiRole::User,
-                    content: Some("Short message".to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                AiMessage {
-                    role: AiRole::Assistant,
-                    content: None,
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "c1".to_string(),
-                        function_name: "my_function".to_string(),
-                        arguments: json!({"key": "value"}),
-                        thought_signature: None,
-                    }]),
-                    tool_call_id: None,
-                },
-            ],
-            tools: Some(vec![AiTool {
-                name: "my_function".to_string(),
-                description: "Does something".to_string(),
-                parameters: json!({"type": "object"}),
-            }]),
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let tokens = estimate_tokens_generic(&request);
-        assert!(tokens > 10);
-        assert!(tokens < 200);
     }
 
     #[test]
@@ -1242,6 +1405,32 @@ mod tests {
                 .unwrap(),
             "https://openrouter.ai/api/v1/chat/completions"
         );
+        // z.ai / Zhipu endpoints: full URLs ending in /chat/completions are
+        // accepted verbatim, so providers with otherwise-unrecognised paths
+        // (direct API and coding-plan gateway) can be used via base_url only.
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url("https://api.z.ai/api/paas/v4/chat/completions")
+                .unwrap(),
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url(
+                "https://api.z.ai/api/coding/paas/v4/chat/completions"
+            )
+            .unwrap(),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        // Trailing slash on a full endpoint URL is trimmed
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url(
+                "https://api.z.ai/api/coding/paas/v4/chat/completions/"
+            )
+            .unwrap(),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        // Paths that are not full chat/completions URLs and are not a known
+        // shorthand are still rejected.
+        assert!(OpenAiCompatClient::normalize_base_url("https://api.z.ai/api/paas/v4").is_err());
         // Test arbitrary deep nested paths that shouldn't be accepted
         assert!(
             OpenAiCompatClient::normalize_base_url(
@@ -1251,5 +1440,27 @@ mod tests {
         );
         // Test strings completely lacking a valid protocol scheme format
         assert!(OpenAiCompatClient::normalize_base_url("completely-broken-input-string").is_err());
+    }
+
+    fn test_client(base_url: &str, max_tokens: u32) -> OpenAiCompatClient {
+        OpenAiCompatClient::new(
+            base_url.to_string(),
+            OpenAiProviderType::OpenAi,
+            "gpt-5.1".to_string(),
+            400_000,
+            max_tokens,
+            60,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_identity_tracks_max_tokens_and_base_url() {
+        let capped = test_client("https://api.openai.com/v1", 4096);
+        let raised = test_client("https://api.openai.com/v1", 65536);
+        assert_ne!(capped.cache_identity(), raised.cache_identity());
+
+        let elsewhere = test_client("http://localhost:1234/v1", 4096);
+        assert_ne!(capped.cache_identity(), elsewhere.cache_identity());
     }
 }

@@ -14,11 +14,11 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitShowTool;
 
@@ -102,8 +102,8 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
             if let Some(Value::String(raw_str)) = cached_raw {
                 raw_str
             } else {
-                let mut cmd = Command::new("git");
-                cmd.current_dir(&context.worktree_path).arg("show");
+                let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+                cmd.arg("show");
 
                 if suppress_diff {
                     cmd.arg("--no-patch");
@@ -123,9 +123,9 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
                     }
                 }
 
-                let output = cmd.output().await?;
+                let output = capped_output(&mut cmd).await?;
 
-                if !output.status.success() {
+                if !output.is_usable() {
                     return Err(anyhow!(
                         "git show failed: {}",
                         String::from_utf8_lossy(&output.stderr).trim()

@@ -1,0 +1,8 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: sashiko-self-cert
+  namespace: sashiko-self
+spec:
+  domains:
+    - sashiko.sashiko.dev

@@ -280,7 +280,9 @@ pub fn parse_email(raw_email: &[u8]) -> Result<(PatchsetMetadata, Option<Patch>)
     Ok((metadata, patch))
 }
 
-fn parse_subject_index(subject: &str) -> (u32, u32) {
+/// Read the `M/N` part counter out of a patch subject, as `(index, total)`.
+/// A subject that carries no counter reads as part 1 of 1.
+pub fn parse_subject_index(subject: &str) -> (u32, u32) {
     static RE_BRACKETS: OnceLock<Regex> = OnceLock::new();
     // Match [ ... M/N ... ] but strictly require PATCH, RFC, RESEND or vN before the M/N
     let re_brackets = RE_BRACKETS.get_or_init(|| {

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, classify_status_code,
@@ -181,6 +180,32 @@ fn extract_gemini_error_reason(error_text: &str) -> Option<String> {
     None
 }
 
+fn summarize_gemini_error(status: reqwest::StatusCode, error_text: &str) -> String {
+    if error_text.contains("DECODE_PREEMPTED") {
+        return format!("{} (request preempted in decode queue)", status);
+    }
+    if error_text.contains("Overloaded prefill queue") {
+        return format!("{} (request preempted in prefill queue)", status);
+    }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(error_text)
+        && let Some(err) = json.get("error")
+        && let Some(msg) = err.get("message").and_then(|m| m.as_str())
+    {
+        let first_line = msg.lines().next().unwrap_or(msg);
+        let clean = first_line
+            .split(" [type.googleapis.com/")
+            .next()
+            .unwrap_or(first_line)
+            .split(" (see ")
+            .next()
+            .unwrap_or(first_line)
+            .trim();
+        return format!("{}: {}", status, clean);
+    }
+    let first_line = error_text.lines().next().unwrap_or(error_text).trim();
+    format!("{}: {}", status, first_line)
+}
+
 #[derive(Debug)]
 pub enum GeminiError {
     QuotaExceeded(Duration),
@@ -236,21 +261,62 @@ impl ClassifyAiError for GeminiError {
     }
 }
 
+struct ProxyGuard {
+    child: std::sync::Mutex<Option<std::process::Child>>,
+    port_file: std::path::PathBuf,
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_file(&self.port_file);
+    }
+}
+
 pub struct GeminiClient {
     model: String,
     base_url: String,
     api_key: String,
+    proxy_command: Option<String>,
+    auth_token_command: Option<String>,
+    proxy_url: tokio::sync::OnceCell<String>,
+    proxy_guard: tokio::sync::Mutex<Option<std::sync::Arc<ProxyGuard>>>,
     client: RwLock<Client>,
 }
 
 impl GeminiClient {
     pub fn new(model: String) -> Self {
+        Self::new_with_settings(model, None)
+    }
+
+    pub fn new_with_settings(
+        model: String,
+        settings: Option<&crate::settings::GeminiSettings>,
+    ) -> Self {
         let api_key = std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
         let base_url = std::env::var("GOOGLE_GEMINI_BASE_URL")
             .or_else(|_| std::env::var("GEMINI_BASE_URL"))
-            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+            .ok()
+            .or_else(|| settings.and_then(|s| s.base_url.clone()))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+
+        let proxy_command = std::env::var("GEMINI_PROXY_COMMAND")
+            .ok()
+            .or_else(|| settings.and_then(|s| s.proxy_command.clone()))
+            .filter(|s| !s.trim().is_empty());
+
+        let auth_token_command = std::env::var("GEMINI_AUTH_TOKEN_COMMAND")
+            .ok()
+            .or_else(|| settings.and_then(|s| s.auth_token_command.clone()))
+            .filter(|s| !s.trim().is_empty());
 
         let client = Self::create_http_client(&api_key);
 
@@ -258,6 +324,10 @@ impl GeminiClient {
             model,
             base_url,
             api_key,
+            proxy_command,
+            auth_token_command,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(client),
         }
     }
@@ -281,6 +351,149 @@ impl GeminiClient {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    fn find_auto_proxy_helper() -> Option<String> {
+        let mut candidates = vec![std::path::PathBuf::from("scripts/gemini-proxy-helper.sh")];
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join("../../scripts/gemini-proxy-helper.sh"));
+            candidates.push(dir.join("../scripts/gemini-proxy-helper.sh"));
+        }
+        for candidate in candidates {
+            if !candidate.is_file() {
+                continue;
+            }
+            if let Ok(status) = std::process::Command::new(&candidate)
+                .arg("--check")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                && status.success()
+            {
+                return Some(format!("{} --port-file {{port_file}}", candidate.display()));
+            }
+        }
+        None
+    }
+
+    async fn start_proxy_command(
+        cmd_template: &str,
+    ) -> Result<(String, std::sync::Arc<ProxyGuard>)> {
+        static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = PROXY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port_file = std::env::temp_dir().join(format!(
+            "sashiko-gemini-proxy-{}-{}.port",
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_file(&port_file);
+
+        let port_file_str = port_file.to_string_lossy();
+        let full_cmd = if cmd_template.contains("{port_file}") {
+            cmd_template.replace("{port_file}", &port_file_str)
+        } else {
+            format!("{} --port-file {}", cmd_template, port_file_str)
+        };
+
+        tracing::info!("Starting local Gemini proxy: {}", full_cmd);
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&full_cmd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("Failed to spawn Gemini proxy command: {}", full_cmd))?;
+
+        let guard = std::sync::Arc::new(ProxyGuard {
+            child: std::sync::Mutex::new(Some(child)),
+            port_file: port_file.clone(),
+        });
+
+        for _ in 0..150 {
+            if let Ok(content) = tokio::fs::read_to_string(&port_file).await {
+                let trimmed = content.trim();
+                if !trimmed.is_empty()
+                    && let Ok(port) = trimmed.parse::<u16>()
+                {
+                    let url = format!("http://localhost:{}", port);
+                    tracing::info!("Local Gemini proxy ready at {}", url);
+                    return Ok((url, guard));
+                }
+            }
+            if let Ok(mut child_lock) = guard.child.lock()
+                && let Some(ref mut child_proc) = *child_lock
+                && let Ok(Some(status)) = child_proc.try_wait()
+            {
+                anyhow::bail!(
+                    "Gemini proxy command exited prematurely with status {} before writing port file",
+                    status
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        anyhow::bail!(
+            "Timed out waiting for Gemini proxy command to write port file: {}",
+            port_file.display()
+        )
+    }
+
+    async fn effective_base_url(&self) -> Result<String> {
+        if self.base_url != "https://generativelanguage.googleapis.com" {
+            return Ok(self.base_url.clone());
+        }
+        if !self.api_key.is_empty() && self.proxy_command.is_none() {
+            return Ok(self.base_url.clone());
+        }
+        let url = self
+            .proxy_url
+            .get_or_try_init(|| async {
+                let cmd = self
+                    .proxy_command
+                    .clone()
+                    .or_else(Self::find_auto_proxy_helper);
+                if let Some(cmd_str) = cmd {
+                    let (url, guard) = Self::start_proxy_command(&cmd_str).await?;
+                    *self.proxy_guard.lock().await = Some(guard);
+                    Ok::<String, anyhow::Error>(url)
+                } else {
+                    Ok(self.base_url.clone())
+                }
+            })
+            .await?;
+        Ok(url.clone())
+    }
+
+    fn resolve_bearer_token(&self) -> Result<Option<String>> {
+        if let Ok(token) = std::env::var("GEMINI_AUTH_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+        if let Some(ref cmd) = self.auth_token_command {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .with_context(|| format!("Failed to execute auth_token_command: {}", cmd))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "auth_token_command '{}' failed with status {}: {}",
+                    cmd,
+                    output.status,
+                    stderr.trim()
+                );
+            }
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                return Ok(Some(token));
+            }
+        }
+        Ok(None)
+    }
+
     /// Replaces the internal HTTP client with a fresh one.
     /// This is used to recover from degraded connection pools without restarting the service.
     async fn refresh_client(&self) {
@@ -296,10 +509,8 @@ impl GeminiClient {
     ) -> Result<GenerateContentResponse> {
         tracing::info!("Sending Gemini request...");
 
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent",
-            self.base_url, self.model
-        );
+        let base_url = self.effective_base_url().await?;
+        let url = format!("{}/v1beta/models/{}:generateContent", base_url, self.model);
         self.post_request(&url, request).await
     }
 
@@ -311,7 +522,13 @@ impl GeminiClient {
         let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
 
         let client = self.client.read().await.clone();
-        let res = match client.post(url).json(body).send().await {
+        let mut req_builder = client.post(url).json(body);
+        if let Some(token) = self.resolve_bearer_token()? {
+            req_builder =
+                req_builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token));
+        }
+
+        let res = match req_builder.send().await {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
@@ -397,12 +614,13 @@ impl GeminiClient {
             let retry_duration = retry_after_duration
                 .map(Duration::from_secs_f64)
                 .unwrap_or(Duration::from_secs(0));
-            tracing::warn!(
+            tracing::debug!(
                 "Gemini API Transient Error: status={}, body={}",
                 status,
                 error_text
             );
-            return Err(GeminiError::TransientError(retry_duration, error_text).into());
+            let summary = summarize_gemini_error(status, &error_text);
+            return Err(GeminiError::TransientError(retry_duration, summary).into());
         }
 
         let mut reason_str = String::new();
@@ -430,22 +648,13 @@ impl GenAiClient for GeminiClient {
     }
 }
 
-pub struct StdioGeminiClient {
-    registry: std::sync::Arc<crate::ai::IpcRegistry>,
-    writer: std::sync::Arc<crate::ai::AtomicWriter>,
-    reader_started: std::sync::atomic::AtomicBool,
-}
+// The registry and writer are process-wide, so holding them in fields would
+// only cache what the accessors already return.
+pub struct StdioGeminiClient;
 
 impl StdioGeminiClient {
     pub fn new() -> Self {
-        let registry = std::sync::Arc::new(crate::ai::IpcRegistry::new());
-        let writer = std::sync::Arc::new(crate::ai::AtomicWriter::new());
-
-        Self {
-            registry,
-            writer,
-            reader_started: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self
     }
 }
 
@@ -458,14 +667,10 @@ impl Default for StdioGeminiClient {
 #[async_trait]
 impl AiProvider for StdioGeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        if !self
-            .reader_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            crate::ai::start_stdin_reader(std::sync::Arc::downgrade(&self.registry));
-        }
+        crate::ai::ensure_stdin_reader();
 
-        let tx_id = self.registry.next_id();
+        let registry = crate::ai::ipc_registry();
+        let tx_id = registry.next_id();
         let envelope = json!({
             "type": "ai_request",
             "tx_id": tx_id,
@@ -474,9 +679,9 @@ impl AiProvider for StdioGeminiClient {
 
         let line = serde_json::to_string(&envelope)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.registry.register(tx_id, tx).await;
+        registry.register(tx_id, tx).await?;
 
-        self.writer.write_line(&line).await?;
+        crate::ai::ipc_writer().write_line(&line).await?;
 
         match rx.await {
             Ok(Ok(resp)) => Ok(resp),
@@ -485,10 +690,6 @@ impl AiProvider for StdioGeminiClient {
                 "IPC channel disconnected waiting for response"
             )),
         }
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -583,20 +784,29 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                 });
             }
             AiRole::Tool => {
-                // Gemini expects a 'function' role for tool responses
+                // Gemini expects a 'user' role for FunctionResponse parts.
+                // Consecutive tool responses and user messages must be merged into a single
+                // turn to preserve strict user/model turn alternation.
+                let part = Part::FunctionResponse {
+                    function_response: FunctionResponse {
+                        name: msg
+                            .tool_call_id
+                            .context("Tool message missing tool_call_id")?,
+                        response: serde_json::from_str(
+                            &msg.content.unwrap_or_else(|| "{}".to_string()),
+                        )
+                        .unwrap_or(json!({})),
+                    },
+                };
+                if let Some(last) = contents.last_mut()
+                    && last.role == "user"
+                {
+                    last.parts.push(part);
+                    continue;
+                }
                 contents.push(Content {
-                    role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponse {
-                            name: msg
-                                .tool_call_id
-                                .context("Tool message missing tool_call_id")?,
-                            response: serde_json::from_str(
-                                &msg.content.unwrap_or_else(|| "{}".to_string()),
-                            )
-                            .unwrap_or(json!({})),
-                        },
-                    }],
+                    role: "user".to_string(),
+                    parts: vec![part],
                 });
             }
         }
@@ -724,7 +934,9 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
                 tool_calls.push(ToolCall {
                     id: function_call.name.clone(), // Gemini doesn't have explicit call IDs in v1beta
                     function_name: function_call.name.clone(),
-                    arguments: function_call.args.clone(),
+                    arguments: crate::toolbox::utils::normalize_json_numbers(
+                        function_call.args.clone(),
+                    ),
                     thought_signature: thought_signature.clone(),
                 });
             }
@@ -774,29 +986,6 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    let mut total = 0;
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-    total
-}
-
 #[async_trait]
 impl AiProvider for GeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -805,15 +994,16 @@ impl AiProvider for GeminiClient {
         translate_ai_response(resp)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
             context_window_size: 1_000_000, // Gemini 1.5 Pro default
         }
+    }
+
+    fn cache_identity(&self) -> String {
+        // base_url separates two endpoints serving the same model name.
+        crate::ai::cache_identity_with(&self.model, &[("base_url", Some(self.base_url.as_str()))])
     }
 }
 
@@ -825,6 +1015,103 @@ mod tests {
         DEFAULT_RETRY_AFTER, ToolCall,
     };
     use serde_json::json;
+
+    #[test]
+    fn cache_identity_tracks_base_url() {
+        let client = |base_url: &str| GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+        assert_ne!(
+            client("https://generativelanguage.googleapis.com").cache_identity(),
+            client("https://proxy.invalid").cache_identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_command_lifecycle_and_port_discovery() {
+        let client = GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            proxy_command: Some("echo 18432 > {port_file}; sleep 10".to_string()),
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+
+        let resolved = client.effective_base_url().await.unwrap();
+        assert_eq!(resolved, "http://localhost:18432");
+
+        let port_file = {
+            let guard = client.proxy_guard.lock().await;
+            guard.as_ref().unwrap().port_file.clone()
+        };
+        assert!(port_file.exists());
+
+        drop(client);
+        assert!(!port_file.exists());
+    }
+
+    #[test]
+    fn test_auth_token_command_resolution() {
+        let client = GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: Some("echo mock-bearer-token-xyz".to_string()),
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+
+        let token = client.resolve_bearer_token().unwrap();
+        assert_eq!(token, Some("mock-bearer-token-xyz".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local proxy daemon"]
+    async fn test_live_auto_proxy_completion() {
+        let client = GeminiClient {
+            model: "gemini-3-flash-preview".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+        let req = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Reply with the exact word PONG".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            response_format: Some(AiResponseFormat::Text),
+            temperature: Some(0.0),
+            context_tag: None,
+        };
+        let resp = AiProvider::generate_content(&client, req)
+            .await
+            .expect("Live auto-proxy request should succeed");
+        let text = resp.content.unwrap_or_default();
+        println!("Live auto-proxy response: {}", text);
+        assert!(text.to_uppercase().contains("PONG"));
+    }
 
     #[test]
     fn test_quota_exceeded_classifies_as_rate_limit() {
@@ -1048,7 +1335,7 @@ mod tests {
         let gemini_req = translate_ai_request(request)?;
 
         assert_eq!(gemini_req.contents.len(), 1);
-        assert_eq!(gemini_req.contents[0].role, "function");
+        assert_eq!(gemini_req.contents[0].role, "user");
         if let Part::FunctionResponse { function_response } = &gemini_req.contents[0].parts[0] {
             assert_eq!(function_response.name, "call_123");
             assert_eq!(function_response.response["result"], "success");
@@ -1147,7 +1434,7 @@ mod tests {
         assert_eq!(gemini_req.contents.len(), 3);
         assert_eq!(gemini_req.contents[0].role, "user");
         assert_eq!(gemini_req.contents[1].role, "model");
-        assert_eq!(gemini_req.contents[2].role, "function");
+        assert_eq!(gemini_req.contents[2].role, "user");
 
         // Verify thought signature in middle of chain
         if let Part::FunctionCall {
@@ -1166,53 +1453,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn test_estimate_tokens_logic() {
-        let request = AiRequest {
-            system: None,
-            messages: vec![
-                AiMessage {
-                    role: AiRole::User,
-                    content: Some("Short message".to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                AiMessage {
-                    role: AiRole::Assistant,
-                    content: None,
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "c1".to_string(),
-                        function_name: "my_function".to_string(),
-                        arguments: json!({"key": "value"}),
-                        thought_signature: None,
-                    }]),
-                    tool_call_id: None,
-                },
-            ],
-            tools: Some(vec![AiTool {
-                name: "my_function".to_string(),
-                description: "Does something".to_string(),
-                parameters: json!({"type": "OBJECT"}),
-            }]),
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let tokens = estimate_tokens_generic(&request);
-        // "Short message" is ~2-3 tokens
-        // "my_function" is ~2 tokens
-        // "{\"key\": \"value\"}" is ~7 tokens
-        // tool metadata...
-        // Total should be around 20-40 tokens.
-        assert!(tokens > 10);
-        assert!(tokens < 200);
     }
 
     #[test]
@@ -1245,6 +1485,125 @@ mod tests {
         assert_eq!(
             normalized["properties"]["files"]["items"]["properties"]["start_line"]["type"],
             "INTEGER"
+        );
+    }
+
+    #[test]
+    fn test_translate_ai_request_merges_consecutive_tool_responses() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res1\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res2\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_2".to_string()),
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_merges_user_text_and_tool_response() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res1\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Now continue.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        assert!(matches!(
+            gemini_req.contents[0].parts[0],
+            Part::FunctionResponse { .. }
+        ));
+        assert!(matches!(gemini_req.contents[0].parts[1], Part::Text { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_summarize_gemini_error() {
+        let preempted_json = json!({
+            "error": {
+                "code": 500,
+                "status": "500",
+                "message": "A retriable error could not be retried [jax.wiz.servo.ServoErrorDetail] { error_code: DECODE_PREEMPTED }\n=== Source Location Trace: ===\nfoo.cc:123"
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            summarize_gemini_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &preempted_json),
+            "500 Internal Server Error (request preempted in decode queue)"
+        );
+
+        let prefill_json = json!({
+            "error": {
+                "code": 500,
+                "status": "500",
+                "message": "Overloaded prefill queue. (see go/debugonly for details)\n=== Source Location Trace: ==="
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            summarize_gemini_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &prefill_json),
+            "500 Internal Server Error (request preempted in prefill queue)"
+        );
+
+        let go_link_json = json!({
+            "error": {
+                "code": 503,
+                "message": "Service temporarily overloaded (see go/internal-link for info)"
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            summarize_gemini_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, &go_link_json),
+            "503 Service Unavailable: Service temporarily overloaded"
         );
     }
 }

@@ -214,12 +214,14 @@ Check the web UI at `http://localhost:8080/` to see the review progress.
 
 **Symptoms:** GitHub shows delivery failed with 403 status
 
-**Cause:** Sashiko's default security blocks non-localhost requests
+**Cause:** Sashiko could not authenticate the webhook. A tunnel or proxy does
+not help by itself: the source address is not consulted, so a forwarded
+request is treated exactly like any other.
 
 **Solutions:**
-1. **Recommended:** Use SSH tunnel or reverse proxy from localhost
+1. **Recommended:** Set `webhook_secret` and configure the same secret in GitHub
 2. **Quick test:** Run with `--enable-unsafe-all-submit` flag
-3. **Production:** Set up reverse proxy with TLS and authentication
+3. **Production:** Reverse proxy with TLS, plus the signature check above
 
 ### Webhook received but review not starting
 

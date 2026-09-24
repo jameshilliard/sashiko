@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::db::Database;
-use crate::events::Event;
+use crate::events::{Event, IngestTracker};
+pub use crate::mbox::{is_mbox_separator, split_mbox};
 use crate::nntp::NntpClient;
 use crate::settings::Settings;
 use anyhow::{Result, anyhow};
@@ -32,6 +33,9 @@ pub struct Ingestor {
     sender: Sender<Event>,
     download: Option<usize>,
     nntp_enabled: bool,
+    /// Follows handed-off articles so the high-water mark can trail behind
+    /// what is actually stored rather than what was merely queued.
+    tracker: IngestTracker,
 }
 
 impl Ingestor {
@@ -48,7 +52,35 @@ impl Ingestor {
             sender,
             download,
             nntp_enabled,
+            tracker: IngestTracker::new(),
         }
+    }
+
+    /// Moves the high-water mark up to whatever the pipeline confirms it
+    /// stored, and returns where it ended up.
+    ///
+    /// Waiting for the pipeline to go quiet is what makes the mark meaningful:
+    /// until then an article is only in memory, and a mark that has already
+    /// passed it means nothing will ever fetch it again.
+    async fn commit_article_mark(
+        &self,
+        group: &str,
+        committed: u64,
+        handed_off_up_to: u64,
+    ) -> Result<u64> {
+        self.tracker.wait_until_quiet().await;
+        // Article numbers are per group while the tracker is shared, so the
+        // already committed mark is the floor: everything at or below it is
+        // known stored and a loss recorded elsewhere must not undo that.
+        let safe = self.tracker.take_safe_mark(handed_off_up_to).max(committed);
+        if safe < handed_off_up_to {
+            warn!(
+                "Group {}: holding the high-water mark at {} instead of {} because articles above it were not stored",
+                group, safe, handed_off_up_to
+            );
+        }
+        self.db.update_last_article_num(group, safe).await?;
+        Ok(safe)
     }
 
     async fn get_tracked_groups(&self) -> Result<Vec<(String, String)>> {
@@ -56,64 +88,31 @@ impl Ingestor {
         let mut available_groups: Option<Vec<String>> = None;
 
         for entry in &self.settings.mailing_lists.track {
-            if let Some((name, group)) = entry.split_once(':') {
-                groups.push((name.to_string(), group.to_string()));
-            } else if entry.contains('.') {
-                groups.push((entry.clone(), entry.clone()));
-            } else {
-                // Heuristics for common lists
-                let mut resolved_group = None;
-
-                // Special case hardcoded mapping
-                if entry == "linux-mm" {
-                    resolved_group = Some("org.kvack.linux-mm".to_string());
-                } else {
-                    // Fetch available groups if we haven't already
-                    if available_groups.is_none() {
-                        match NntpClient::connect(
-                            &self.settings.nntp.server,
-                            self.settings.nntp.port,
-                        )
-                        .await
-                        {
-                            Ok(mut client) => match client.list().await {
-                                Ok(list) => available_groups = Some(list),
-                                Err(e) => warn!(
-                                    "Failed to fetch NNTP group list for dynamic resolution: {}",
-                                    e
-                                ),
-                            },
-                            Err(e) => {
-                                warn!("Failed to connect to NNTP for dynamic resolution: {}", e)
-                            }
+            if !entry.contains(':') && !entry.contains('.') && available_groups.is_none() {
+                match NntpClient::connect(
+                    &self.settings.nntp.server,
+                    self.settings.nntp.port,
+                    self.settings.nntp.tls,
+                )
+                .await
+                {
+                    Ok(mut client) => match client.list().await {
+                        Ok(list) => available_groups = Some(list),
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch NNTP group list for dynamic resolution: {}",
+                                e
+                            )
                         }
-                    }
-
-                    // Try to find a group that ends with .entry
-                    if let Some(list) = &available_groups {
-                        let suffix = format!(".{}", entry);
-                        if let Some(found) = list.iter().find(|g| g.ends_with(&suffix)) {
-                            info!(
-                                "Dynamically resolved short name '{}' to NNTP group '{}'",
-                                entry, found
-                            );
-                            resolved_group = Some(found.clone());
-                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to connect to NNTP for dynamic resolution: {}", e)
                     }
                 }
-
-                // Fallback to old vger default if resolution failed
-                let group = resolved_group.unwrap_or_else(|| {
-                    let fallback = format!("org.kernel.vger.{}", entry);
-                    warn!(
-                        "Could not dynamically resolve NNTP group for '{}', falling back to '{}'",
-                        entry, fallback
-                    );
-                    fallback
-                });
-
-                groups.push((entry.clone(), group));
             }
+
+            let (name, group) = resolve_tracked_group(entry, available_groups.as_deref());
+            groups.push((name, group));
         }
         Ok(groups)
     }
@@ -280,7 +279,7 @@ impl Ingestor {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let output = Command::new("git")
+            let output = crate::git_cmd::detached_async()
                 .arg("clone")
                 .arg("--bare")
                 .arg(format!("--depth={}", n))
@@ -297,10 +296,9 @@ impl Ingestor {
             }
         } else {
             // Repo exists, ensure remote is correct then fetch
-            let remote_output = Command::new("git")
+            let remote_output = crate::git_cmd::in_dir_async(path)
                 .arg("-c")
                 .arg("safe.bareRepository=all")
-                .current_dir(path)
                 .arg("remote")
                 .arg("get-url")
                 .arg("origin")
@@ -313,10 +311,9 @@ impl Ingestor {
                     .to_string();
                 if current_url != url {
                     info!("Updating remote origin from {} to {}", current_url, url);
-                    let set_url_output = Command::new("git")
+                    let set_url_output = crate::git_cmd::in_dir_async(path)
                         .arg("-c")
                         .arg("safe.bareRepository=all")
-                        .current_dir(path)
                         .arg("remote")
                         .arg("set-url")
                         .arg("origin")
@@ -334,10 +331,9 @@ impl Ingestor {
             }
 
             info!("Fetching latest changes in {:?} with depth {}", path, n);
-            let output = Command::new("git")
+            let output = crate::git_cmd::in_dir_async(path)
                 .arg("-c")
                 .arg("safe.bareRepository=all")
-                .current_dir(path)
                 .arg("fetch")
                 .arg(format!("--depth={}", n))
                 .arg("origin")
@@ -368,10 +364,14 @@ impl Ingestor {
     }
 
     async fn process_nntp_cycle(&self) -> Result<()> {
-        let mut client =
-            NntpClient::connect(&self.settings.nntp.server, self.settings.nntp.port).await?;
+        let mut client = NntpClient::connect(
+            &self.settings.nntp.server,
+            self.settings.nntp.port,
+            self.settings.nntp.tls,
+        )
+        .await?;
 
-        for (name, group_name) in self.get_tracked_groups().await? {
+        'groups: for (name, group_name) in self.get_tracked_groups().await? {
             let group_name = &group_name;
             self.db.ensure_mailing_list(&name, group_name).await?;
 
@@ -379,6 +379,15 @@ impl Ingestor {
                 Ok(i) => i,
                 Err(e) => {
                     error!("Failed to select group {}: {}", group_name, e);
+                    if let Ok(new_client) = NntpClient::connect(
+                        &self.settings.nntp.server,
+                        self.settings.nntp.port,
+                        self.settings.nntp.tls,
+                    )
+                    .await
+                    {
+                        client = new_client;
+                    }
                     continue;
                 }
             };
@@ -406,7 +415,30 @@ impl Ingestor {
                     "Initialized high-water mark to {} (overlap window: {})",
                     current, overlap
                 );
+            } else if current > info.high {
+                if info.high == 0 {
+                    warn!(
+                        "Group {}: server tip is 0 (possible spool logic error); ignoring high-water mark clamp to prevent mass re-ingestion",
+                        group_name
+                    );
+                } else {
+                    warn!(
+                        "Group {}: high-water mark {} is ahead of server tip {}; resetting to tip with overlap",
+                        group_name, current, info.high
+                    );
+                    let overlap = 100;
+                    current = info.high.saturating_sub(overlap);
+                    self.db.update_last_article_num(group_name, current).await?;
+                }
             }
+
+            // The mark stays where it is until the articles behind it are
+            // stored. It is committed in batches because each commit has to
+            // wait for the pipeline to drain, and a crash mid-batch only costs
+            // a refetch of that batch.
+            const MARK_COMMIT_BATCH: u64 = 100;
+            let mut committed = current;
+            let mut handed_off = current;
 
             // Fetch ALL pending messages
             while current < info.high {
@@ -421,10 +453,22 @@ impl Ingestor {
                                 content: lines,
                                 raw: None,
                                 baseline: None,
+                                receipt: Some(self.tracker.issue(next_id)),
                             })
                             .await?;
-                        self.db.update_last_article_num(group_name, next_id).await?;
+                        handed_off = next_id;
                         current = next_id;
+                        if handed_off.saturating_sub(committed) >= MARK_COMMIT_BATCH {
+                            committed = self
+                                .commit_article_mark(group_name, committed, handed_off)
+                                .await?;
+                            if committed < handed_off {
+                                // The tracker consumed this batch's loss record.
+                                // Refetch from the saved mark next cycle before
+                                // another batch or final flush can pass the gap.
+                                continue 'groups;
+                            }
+                        }
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -438,15 +482,32 @@ impl Ingestor {
                                 break;
                             } else {
                                 warn!("Article {} missing (423) below tip, skipping", next_id);
-                                self.db.update_last_article_num(group_name, next_id).await?;
+                                // Nothing was handed downstream, so there is
+                                // nothing to confirm: the article does not
+                                // exist and never will.
+                                handed_off = next_id;
                                 current = next_id;
                             }
                         } else {
                             error!("Failed to fetch article {}: {}", next_id, e);
+                            if let Ok(new_client) = NntpClient::connect(
+                                &self.settings.nntp.server,
+                                self.settings.nntp.port,
+                                self.settings.nntp.tls,
+                            )
+                            .await
+                            {
+                                client = new_client;
+                            }
                             break; // Stop and retry later (transient error or connection lost)
                         }
                     }
                 }
+            }
+
+            if handed_off > committed {
+                self.commit_article_mark(group_name, committed, handed_off)
+                    .await?;
             }
         }
 
@@ -464,11 +525,10 @@ impl Ingestor {
 
         // 1. Start git rev-list (Producer)
         info!("Starting object enumeration...");
-        let mut rev_list_cmd = Command::new("git");
+        let mut rev_list_cmd = crate::git_cmd::in_dir_async(path);
         rev_list_cmd
             .arg("-c")
             .arg("safe.bareRepository=all")
-            .current_dir(path)
             .arg("rev-list")
             .arg("--all")
             .arg("--objects");
@@ -489,11 +549,10 @@ impl Ingestor {
         let mut rev_list_reader = BufReader::new(rev_list_stdout).lines();
 
         // 2. Start git cat-file --batch (Consumer)
-        let mut cat_file_cmd = Command::new("git");
+        let mut cat_file_cmd = crate::git_cmd::in_dir_async(path);
         cat_file_cmd
             .arg("-c")
             .arg("safe.bareRepository=all")
-            .current_dir(path)
             .arg("cat-file")
             .arg("--batch")
             .stdin(Stdio::piped())
@@ -560,6 +619,9 @@ impl Ingestor {
                         content: Vec::new(),
                         raw: Some(content),
                         baseline: None,
+                        // The archive keeps the blob, so a crash here costs
+                        // nothing more than reading it again.
+                        receipt: None,
                     })
                     .await?;
 
@@ -580,38 +642,51 @@ impl Ingestor {
     }
 }
 
-pub fn split_mbox(raw: &[u8]) -> Vec<Vec<u8>> {
-    let mut emails = Vec::new();
-    let mut current_email = Vec::new();
+pub fn resolve_tracked_group(entry: &str, available_groups: Option<&[String]>) -> (String, String) {
+    if let Some((name, group)) = entry.split_once(':') {
+        (name.to_string(), group.to_string())
+    } else if entry.contains('.') {
+        (entry.to_string(), entry.to_string())
+    } else {
+        // Alias normalization before resolution
+        let normalized_entry = match entry {
+            "linux-rt" => "linux-rt-devel",
+            "linux-target" => "target-devel",
+            other => other,
+        };
 
-    for line in raw.split_inclusive(|&b| b == b'\n') {
-        if is_mbox_separator(line) {
-            if !current_email.is_empty() {
-                emails.push(std::mem::take(&mut current_email));
+        let mut resolved_group = None;
+
+        // Special case hardcoded mapping
+        if normalized_entry == "linux-mm" {
+            resolved_group = Some("org.kvack.linux-mm".to_string());
+        } else if let Some(list) = available_groups {
+            let suffix = format!(".{}", normalized_entry);
+            if let Some(found) = list
+                .iter()
+                .find(|g| g.as_str() == normalized_entry || g.ends_with(&suffix))
+            {
+                info!(
+                    "Dynamically resolved short name '{}' to NNTP group '{}'",
+                    entry, found
+                );
+                resolved_group = Some(found.clone());
             }
-            // Skip the "From " line
-        } else {
-            current_email.extend_from_slice(line);
         }
-    }
 
-    if !current_email.is_empty() {
-        emails.push(current_email);
-    }
+        // Fallback to old vger default if resolution failed
+        let group = resolved_group.unwrap_or_else(|| {
+            let fallback = format!("org.kernel.vger.{}", normalized_entry);
+            warn!(
+                "Could not dynamically resolve NNTP group for '{}', falling back to '{}'",
+                entry, fallback
+            );
+            fallback
+        });
 
-    emails
+        (entry.to_string(), group)
+    }
 }
-
-pub fn is_mbox_separator(line: &[u8]) -> bool {
-    if !line.starts_with(b"From ") {
-        return false;
-    }
-    // Heuristic: Mbox separator lines (From_ lines) usually contain a timestamp.
-    // We look for at least two colons (HH:MM:SS) to distinguish from
-    // "From " starting a sentence in the body.
-    line.iter().filter(|&&b| b == b':').count() >= 2
-}
-
 pub fn extract_message_id(raw_bytes: &[u8]) -> String {
     let raw_str = String::from_utf8_lossy(raw_bytes);
     for line in raw_str.lines() {
@@ -630,6 +705,84 @@ pub fn extract_message_id(raw_bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_batch_is_retried_before_the_checkpoint_advances() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        // Cover both a failed batch at the tip (final flush) and one followed
+        // by more articles (next batch).
+        for high in [101, 102] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut cycles = Vec::new();
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    stream.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+                    let mut articles = Vec::new();
+                    loop {
+                        let mut command = String::new();
+                        stream.read_line(&mut command).await.unwrap();
+                        let response = if command.starts_with("GROUP ") {
+                            format!("211 {high} 1 {high} test.group\r\n")
+                        } else if let Some(article) = command.trim().strip_prefix("ARTICLE ") {
+                            articles.push(article.parse::<u64>().unwrap());
+                            "220 article follows\r\nSubject: test\r\n.\r\n".into()
+                        } else {
+                            assert_eq!(command.trim(), "QUIT");
+                            stream.get_mut().write_all(b"205 bye\r\n").await.unwrap();
+                            break;
+                        };
+                        stream
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    cycles.push(articles);
+                }
+                cycles
+            });
+            let mut settings = Settings::new().unwrap();
+            settings.nntp.server = address.ip().to_string();
+            settings.nntp.port = address.port();
+            settings.mailing_lists.track = vec!["test:test.group".into()];
+            settings.database.url = ":memory:".into();
+            let db = Arc::new(Database::new(&settings.database).await.unwrap());
+            db.migrate().await.unwrap();
+            db.ensure_mailing_list("test", "test.group").await.unwrap();
+            db.update_last_article_num("test.group", 1).await.unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(100);
+            let consumer = tokio::spawn(async move {
+                let mut failed_once = false;
+                while let Some(Event::ArticleFetched {
+                    article_id,
+                    receipt: Some(mut receipt),
+                    ..
+                }) = receiver.recv().await
+                {
+                    if article_id == "5" && !failed_once {
+                        failed_once = true;
+                    } else {
+                        receipt.settle();
+                    }
+                }
+            });
+            let ingestor = Ingestor::new(settings, db.clone(), sender, None, true);
+            ingestor.process_nntp_cycle().await.unwrap();
+            assert_eq!(db.get_last_article_num("test.group").await.unwrap(), 4);
+            ingestor.process_nntp_cycle().await.unwrap();
+            assert_eq!(db.get_last_article_num("test.group").await.unwrap(), high);
+            let cycles = server.await.unwrap();
+            assert_eq!(cycles[0], (2..=101).collect::<Vec<_>>());
+            assert_eq!(cycles[1], (5..=high).collect::<Vec<_>>());
+            drop(ingestor);
+            consumer.await.unwrap();
+        }
+    }
 
     #[test]
     fn test_is_mbox_separator() {
@@ -1007,5 +1160,103 @@ index bbc440c93e08..1123ef3ccf90 100644
     fn test_extract_message_id_regression_no_brackets() {
         let raw = b"From: user\nMessage-ID: 12345@example.com\nSubject: Hi";
         assert_eq!(extract_message_id(raw), "12345@example.com");
+    }
+
+    #[test]
+    fn test_resolve_tracked_group() {
+        let groups = vec![
+            "org.kernel.vger.bpf".to_string(),
+            "org.kernel.vger.linux-kernel".to_string(),
+            "dev.linux.lists.linux-rt-devel".to_string(),
+            "org.kernel.vger.target-devel".to_string(),
+            "org.kvack.linux-mm".to_string(),
+        ];
+
+        // Explicit name:group
+        assert_eq!(
+            resolve_tracked_group("custom:org.custom.group", Some(&groups)),
+            ("custom".to_string(), "org.custom.group".to_string())
+        );
+
+        // Explicit full group name with dot
+        assert_eq!(
+            resolve_tracked_group("org.kernel.vger.bpf", Some(&groups)),
+            (
+                "org.kernel.vger.bpf".to_string(),
+                "org.kernel.vger.bpf".to_string()
+            )
+        );
+
+        // Dynamic resolution for standard list
+        assert_eq!(
+            resolve_tracked_group("bpf", Some(&groups)),
+            ("bpf".to_string(), "org.kernel.vger.bpf".to_string())
+        );
+
+        // Hardcoded linux-mm
+        assert_eq!(
+            resolve_tracked_group("linux-mm", Some(&groups)),
+            ("linux-mm".to_string(), "org.kvack.linux-mm".to_string())
+        );
+
+        // Canonical target-devel
+        assert_eq!(
+            resolve_tracked_group("target-devel", Some(&groups)),
+            (
+                "target-devel".to_string(),
+                "org.kernel.vger.target-devel".to_string()
+            )
+        );
+
+        // Legacy/alias linux-target
+        assert_eq!(
+            resolve_tracked_group("linux-target", Some(&groups)),
+            (
+                "linux-target".to_string(),
+                "org.kernel.vger.target-devel".to_string()
+            )
+        );
+
+        // Canonical linux-rt-devel
+        assert_eq!(
+            resolve_tracked_group("linux-rt-devel", Some(&groups)),
+            (
+                "linux-rt-devel".to_string(),
+                "dev.linux.lists.linux-rt-devel".to_string()
+            )
+        );
+
+        // Legacy/alias linux-rt
+        assert_eq!(
+            resolve_tracked_group("linux-rt", Some(&groups)),
+            (
+                "linux-rt".to_string(),
+                "dev.linux.lists.linux-rt-devel".to_string()
+            )
+        );
+
+        // Fallback when not in available groups
+        assert_eq!(
+            resolve_tracked_group("unknown-list", Some(&groups)),
+            (
+                "unknown-list".to_string(),
+                "org.kernel.vger.unknown-list".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_watermark_clamp_when_ahead_of_server_tip() {
+        let current: u64 = 145742;
+        let high: u64 = 144382;
+        assert!(current > high);
+        let recovered = high.saturating_sub(100);
+        assert_eq!(recovered, 144282);
+        assert!(recovered < high);
+
+        // Underflow protection
+        let low_high: u64 = 50;
+        let low_recovered = low_high.saturating_sub(100);
+        assert_eq!(low_recovered, 0);
     }
 }

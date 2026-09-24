@@ -17,7 +17,7 @@ use crate::email_policy::EmailPolicyConfig;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub struct PatchworkWorker {
     db: Arc<Database>,
@@ -40,13 +40,8 @@ impl PatchworkWorker {
     /// from the config file (and SASHIKO_PATCHWORK_TOKEN env var) at
     /// delivery time.
     fn resolve_token(&self, api_url: &str) -> Option<String> {
-        let config = match EmailPolicyConfig::load(&self.email_policy_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to load email policy for token resolution: {}", e);
-                return None;
-            }
-        };
+        let config = EmailPolicyConfig::load(&self.email_policy_path)
+            .expect("Failed to load email policy for token resolution");
 
         // Check subsystem policies for a matching api_url
         for sub in config.subsystems.values() {
@@ -111,10 +106,19 @@ impl PatchworkWorker {
                             }
                         }
                         Err(e) => {
-                            error!("Patchwork check failed for ID {}: {}", entry.id, e);
+                            match &e {
+                                crate::patchwork::PatchworkCheckError::NotIndexedYet => {
+                                    info!("Patchwork check ID {} not ready yet: {}", entry.id, e);
+                                }
+                                crate::patchwork::PatchworkCheckError::Api(_) => {
+                                    error!("Patchwork check failed for ID {}: {}", entry.id, e);
+                                }
+                            }
                             if entry.retry_count + 1 >= self.max_retries as i64 {
-                                if let Err(db_err) =
-                                    self.db.mark_patchwork_failed(entry.id, &e).await
+                                if let Err(db_err) = self
+                                    .db
+                                    .mark_patchwork_failed(entry.id, &e.to_string())
+                                    .await
                                 {
                                     error!(
                                         "Failed to mark patchwork {} as failed: {}",

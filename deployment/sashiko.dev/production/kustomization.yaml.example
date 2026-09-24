@@ -1,0 +1,91 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# ENVIRONMENT-SPECIFIC CONFIGURATION EXAMPLE
+# Copy this to 'kustomization.yaml' and modify IDs.
+# This file is ignored by git.
+#
+# The base manifest expects a 'sashiko-secrets' Secret in the sashiko
+# namespace holding LLM_API_KEY and SASHIKO__SERVER__JWT_SECRET; a container
+# referencing a missing key never starts. Generate the latter once and keep
+# it, because replacing it invalidates every session and sign-in link:
+#
+#   SECRET=$(openssl rand -hex 32)
+#   kubectl -n sashiko patch secret sashiko-secrets --type=merge \
+#     -p "{\"stringData\":{\"SASHIKO__SERVER__JWT_SECRET\":\"$SECRET\"}}"
+#
+# Optional keys in 'sashiko-secrets':
+#   SASHIKO__SERVER__ACL__SECURITY - comma-separated list of kernel security
+#                                    list addresses with global bug access.
+#
+#   kubectl -n sashiko patch secret sashiko-secrets --type=merge \
+#     -p '{"stringData":{"SASHIKO__SERVER__ACL__SECURITY":"first@example.org,second@example.org"}}'
+
+patches:
+  # 1. Deployment: Update image
+  - target:
+      kind: Deployment
+      name: sashiko-deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: us-docker.pkg.dev/gcp-project-xxxxx/sashiko-repository/sashiko:next
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: SASHIKO__SMTP__PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: sashiko-secrets
+              key: SASHIKO_SMTP__PASSWORD
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: SASHIKO_PATCHWORK_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sashiko-secrets
+              key: SASHIKO_PATCHWORK_TOKEN
+
+  # 2. ServiceAccount: Link to real GCP Service Account
+  - target:
+      kind: ServiceAccount
+      name: sashiko-ksa
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/iam.gke.io~1gcp-service-account
+        value: a-service-account@gcp-project-xxxxx.iam.gserviceaccount.com
+
+  # 3. Data Manager: Inject Bucket ID
+  - target:
+      kind: Deployment
+      name: data-manager
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx
+
+  # 4. CronJob: Inject Bucket ID
+  - target:
+      kind: CronJob
+      name: sashiko-nightly-backup
+    patch: |-
+      - op: add
+        path: /spec/jobTemplate/spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx
+
+  # 5. Ingress: Real IP and Certificate names
+  - target:
+      kind: Ingress
+      name: sashiko-ingress
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/kubernetes.io~1ingress.global-static-ip-name
+        value: "load-balancer"
+      - op: replace
+        path: /metadata/annotations/networking.gke.io~1managed-certificates
+        value: "certificate"

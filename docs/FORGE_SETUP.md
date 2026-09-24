@@ -138,7 +138,7 @@ port = 8080          # Port for webhook endpoint
 
 **Security:** Sashiko supports webhook signature verification via HMAC-SHA256
 (GitHub and GitLab 19.0+ signing tokens) and legacy secret tokens. When
-`webhook_secret` is configured, non-localhost requests are authenticated
+`webhook_secret` is configured, requests are authenticated by signature
 without requiring `--enable-unsafe-all-submit`. See the
 [Webhook Security Guide](WEBHOOK_SECURITY.md) for setup instructions and
 production deployment recommendations.

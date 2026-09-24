@@ -166,6 +166,61 @@ pub struct ForgeMetadata {
     pub pr_number: i64,
     pub pr_title: Option<String>,
     pub pr_url: Option<String>,
+    pub author: Option<String>,
+}
+
+/// Returns true if the authenticated forge username belongs to Dependabot
+/// (`dependabot[bot]` or `dependabot`).
+pub fn is_dependabot_author(author: &str) -> bool {
+    let lower = author.trim().to_ascii_lowercase();
+    lower == "dependabot" || lower == "dependabot[bot]"
+}
+
+/// Classification of a webhook request that passed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeEvent {
+    /// A pull or merge request carrying commits to review.
+    ChangeRequest,
+    /// A provider handshake sent to confirm the endpoint is reachable. It
+    /// carries nothing to review and must be acknowledged without side
+    /// effects.
+    Handshake,
+}
+
+/// Longest caller supplied value echoed into a log line.
+const MAX_LOGGED_LEN: usize = 32;
+
+/// Echo a caller supplied string into a log line only when it is short and
+/// printable. A webhook sender controls both the event header and the
+/// provider path segment, and a raw value could carry newlines that forge
+/// whole log entries.
+pub fn loggable(value: &str) -> &str {
+    let printable = !value.is_empty()
+        && value.len() <= MAX_LOGGED_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '[' | ']'));
+    if printable { value } else { "(invalid)" }
+}
+
+/// Name the event a webhook carried, for diagnostics only. Validation never
+/// consults this: it reads the provider specific header directly.
+pub fn event_label(headers: &HeaderMap) -> &str {
+    ["x-github-event", "x-gitlab-event"]
+        .into_iter()
+        .find_map(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+        .map(loggable)
+        .unwrap_or("(none)")
+}
+
+/// Whether an action reported for a change request asks for a review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewIntent {
+    /// The request carries commits that have not been reviewed yet.
+    Review,
+    /// The forge is reporting a change that leaves the commits untouched,
+    /// such as a label, an assignee or a title edit.
+    Skip,
 }
 
 /// Trait for forge provider implementations
@@ -177,17 +232,22 @@ pub trait ForgeProvider: Send + Sync {
     /// configured. When `secret` is `None`, only event-type validation is
     /// performed and the request is treated as unauthenticated — callers
     /// must enforce their own access control before calling this method.
-    /// Returns `UNAUTHORIZED` if the signature is missing or invalid,
-    /// `BAD_REQUEST` if the event type is wrong.
+    /// Returns the kind of event on success, `UNAUTHORIZED` if the signature
+    /// is missing or invalid, `BAD_REQUEST` if the event type is wrong.
     fn validate_event(
         &self,
         headers: &HeaderMap,
         body: &Bytes,
         secret: Option<&str>,
-    ) -> Result<(), StatusCode>;
+    ) -> Result<ForgeEvent, StatusCode>;
 
     /// Parse webhook payload and extract metadata
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode>;
+
+    /// Decide whether the action reported by `parse_payload` describes new
+    /// commits. The action vocabulary belongs to the provider, so each one
+    /// answers for itself.
+    fn review_intent(&self, action: &str) -> ReviewIntent;
 }
 
 /// GitHub forge provider
@@ -203,15 +263,21 @@ impl ForgeProvider for GitHubForge {
         headers: &HeaderMap,
         body: &Bytes,
         secret: Option<&str>,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<ForgeEvent, StatusCode> {
         let event = headers
             .get("x-github-event")
             .and_then(|v| v.to_str().ok())
             .ok_or(StatusCode::BAD_REQUEST)?;
 
-        if event != "pull_request" {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+        // A ping is what GitHub sends the moment a webhook is saved, and its
+        // delivery status is what an administrator checks to confirm the
+        // endpoint works. Rejecting it reports a broken integration that is
+        // in fact correctly configured.
+        let kind = match event {
+            "pull_request" => ForgeEvent::ChangeRequest,
+            "ping" => ForgeEvent::Handshake,
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
 
         if let Some(secret) = secret {
             let sig = headers
@@ -223,7 +289,7 @@ impl ForgeProvider for GitHubForge {
             }
         }
 
-        Ok(())
+        Ok(kind)
     }
 
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode> {
@@ -262,6 +328,10 @@ impl ForgeProvider for GitHubForge {
 
         let pr_title = pr["title"].as_str().map(|s| s.to_string());
         let pr_url = pr["html_url"].as_str().map(|s| s.to_string());
+        let author = pr["user"]["login"]
+            .as_str()
+            .or_else(|| payload["sender"]["login"].as_str())
+            .map(|s| s.to_string());
 
         let repo_url = payload["repository"]["clone_url"]
             .as_str()
@@ -280,9 +350,20 @@ impl ForgeProvider for GitHubForge {
             pr_number,
             pr_title,
             pr_url,
+            author,
         };
 
         Ok((action, metadata))
+    }
+
+    fn review_intent(&self, action: &str) -> ReviewIntent {
+        // GitHub reports roughly twenty actions on a pull request and sends
+        // every one of them to a subscriber. Only these four can leave the
+        // head commit different from the last time it was seen.
+        match action {
+            "opened" | "reopened" | "synchronize" | "ready_for_review" => ReviewIntent::Review,
+            _ => ReviewIntent::Skip,
+        }
     }
 }
 
@@ -299,12 +380,14 @@ impl ForgeProvider for GitLabForge {
         headers: &HeaderMap,
         body: &Bytes,
         secret: Option<&str>,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<ForgeEvent, StatusCode> {
         let event = headers
             .get("x-gitlab-event")
             .and_then(|v| v.to_str().ok())
             .ok_or(StatusCode::BAD_REQUEST)?;
 
+        // GitLab has no handshake event: its Test button replays a real hook,
+        // so a merge request is the only thing worth accepting here.
         if event != "Merge Request Hook" {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -323,7 +406,7 @@ impl ForgeProvider for GitLabForge {
                 if !verify_standard_webhook_signature(secret, msg_id, timestamp, body, sig) {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
-                return Ok(());
+                return Ok(ForgeEvent::ChangeRequest);
             }
 
             // Fallback: legacy secret token (X-Gitlab-Token)
@@ -331,14 +414,14 @@ impl ForgeProvider for GitLabForge {
                 if !verify_secret_token(secret, token) {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
-                return Ok(());
+                return Ok(ForgeEvent::ChangeRequest);
             }
 
             // Secret configured but no auth header present
             return Err(StatusCode::UNAUTHORIZED);
         }
 
-        Ok(())
+        Ok(ForgeEvent::ChangeRequest)
     }
 
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode> {
@@ -377,6 +460,7 @@ impl ForgeProvider for GitLabForge {
 
         let pr_title = attrs["title"].as_str().map(|s| s.to_string());
         let pr_url = attrs["url"].as_str().map(|s| s.to_string());
+        let author = payload["user"]["username"].as_str().map(|s| s.to_string());
 
         let repo_url = payload["project"]["git_http_url"]
             .as_str()
@@ -395,9 +479,19 @@ impl ForgeProvider for GitLabForge {
             pr_number,
             pr_title,
             pr_url,
+            author,
         };
 
         Ok((action, metadata))
+    }
+
+    fn review_intent(&self, _action: &str) -> ReviewIntent {
+        // parse_payload reports the object kind here, not the action inside
+        // object_attributes, so there is nothing to discriminate on yet and
+        // every merge request hook is reviewed as it always was. Narrowing
+        // this needs the action and oldrev fields, which is a change to
+        // GitLab parsing rather than to the route.
+        ReviewIntent::Review
     }
 }
 
@@ -411,17 +505,245 @@ pub fn extract_repo_name_from_url(url: &str) -> String {
         .to_string()
 }
 
-/// Extract repository name from a GitLab MR URL
+/// Extract repository name from a GitLab MR or GitHub PR URL
 pub fn extract_repo_name_from_mr_url(url: &str) -> Option<String> {
-    if let Some(before_sep) = url.split("/-/").next() {
-        let name = before_sep
-            .trim_end_matches('/')
-            .split('/')
-            .next_back()?
-            .to_string();
-        Some(name)
-    } else {
+    let before_sep = url
+        .split_once("/-/")
+        .or_else(|| url.split_once("/pull/"))
+        .map(|(prefix, _)| prefix)?;
+    let name = before_sep
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()?
+        .trim_end_matches(".git")
+        .to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Extract the `"owner/repo"` slug from a GitHub PR or GitLab MR URL.
+pub fn extract_owner_repo_from_mr_url(url: &str) -> Option<String> {
+    let before_sep = url
+        .split_once("/-/")
+        .or_else(|| url.split_once("/pull/"))
+        .map(|(prefix, _)| prefix)?;
+    let after_scheme = before_sep
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(before_sep);
+    let (_, path) = after_scheme.split_once('/')?;
+    let slug = path.trim_matches('/').trim_end_matches(".git");
+    if slug.is_empty() || !slug.contains('/') {
         None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+/// Summary and findings for one commit in a pull request series.
+#[derive(Debug, Clone)]
+pub struct PatchReviewSummaryItem {
+    pub part_index: usize,
+    pub total_parts: usize,
+    pub commit_id: Option<String>,
+    pub subject: String,
+    pub inline_review: Option<String>,
+}
+
+/// Maximum byte length of a GitHub issue/PR comment body (GitHub's hard limit
+/// is 65 536 bytes; leave safety margin for UTF-8 boundary and trailing link).
+const MAX_GITHUB_COMMENT_BYTES: usize = 60_000;
+
+/// Compose the markdown comment posted to a pull request thread when a review
+/// completes. Always produces a comment: clean pull requests receive a short
+/// confirmation with a link to the full review trace.
+pub fn compose_pr_review_comment(
+    version: Option<u32>,
+    total_commits: usize,
+    series_summary: Option<&str>,
+    patches: &[PatchReviewSummaryItem],
+    target_url: &str,
+) -> String {
+    let header = match version {
+        Some(v) if v > 1 => format!("### Sashiko review — v{}", v),
+        _ => "### Sashiko review".to_string(),
+    };
+
+    let link_host = target_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .filter(|h| !h.is_empty())
+        .unwrap_or("sashiko.sashiko.dev");
+
+    let commit_word = if total_commits == 1 {
+        "1 commit".to_string()
+    } else {
+        format!("{} commits", total_commits)
+    };
+
+    let patches_with_findings: Vec<&PatchReviewSummaryItem> = patches
+        .iter()
+        .filter(|p| {
+            p.inline_review.as_deref().is_some_and(|text| {
+                let t = text.trim();
+                !t.is_empty() && t != "No issues found."
+            })
+        })
+        .collect();
+
+    if patches_with_findings.is_empty() {
+        return format!(
+            "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on {link_host}]({target_url})\n"
+        );
+    }
+
+    let mut out = String::with_capacity(2048);
+    out.push_str(&header);
+    out.push_str("\n\n");
+
+    if let Some(summary) = series_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("<details>\n<summary>Series summary</summary>\n\n");
+        out.push_str(summary);
+        out.push_str("\n\n</details>\n\n");
+    }
+
+    for patch in patches_with_findings {
+        let short_sha = patch
+            .commit_id
+            .as_deref()
+            .filter(|s| s.len() >= 8)
+            .map(|s| &s[..8]);
+        let title_line = match short_sha {
+            Some(sha) => format!(
+                "#### Commit {}/{} — `{}` {}\n\n",
+                patch.part_index, patch.total_parts, sha, patch.subject
+            ),
+            None => format!(
+                "#### Commit {}/{} — {}\n\n",
+                patch.part_index, patch.total_parts, patch.subject
+            ),
+        };
+        out.push_str(&title_line);
+
+        if let Some(inline) = patch.inline_review.as_deref() {
+            out.push_str(inline.trim());
+            out.push_str("\n\n");
+        }
+    }
+
+    let footer = format!("[Full review and stage logs on {link_host}]({target_url})\n");
+
+    if out.len() + footer.len() > MAX_GITHUB_COMMENT_BYTES {
+        let mut cut = MAX_GITHUB_COMMENT_BYTES.saturating_sub(footer.len() + 64);
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n\n*(comment truncated; see full report below)*\n\n");
+    }
+
+    out.push_str(&footer);
+    out
+}
+
+/// Mint a short-lived RS256 JWT identifying a GitHub App (`iss = app_id`).
+pub fn mint_github_app_jwt(app_id: u64, pem: &str) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct Claims {
+        iat: i64,
+        exp: i64,
+        iss: String,
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        iat: now - 60,
+        exp: now + 540,
+        iss: app_id.to_string(),
+    };
+
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+        .map_err(|e| format!("invalid GitHub App RSA private key: {}", e))?;
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, &key)
+        .map_err(|e| format!("failed to sign GitHub App JWT: {}", e))
+}
+
+/// Exchange a GitHub App JWT for an installation access token.
+pub async fn exchange_github_installation_token(
+    client: &reqwest::Client,
+    api_base: &str,
+    installation_id: u64,
+    jwt: &str,
+) -> Result<String, String> {
+    let url = format!(
+        "{}/app/installations/{}/access_tokens",
+        api_base.trim_end_matches('/'),
+        installation_id
+    );
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", jwt))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sashiko")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub token request failed: {}", e))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        format!(
+            "invalid JSON from GitHub token endpoint ({}): {}",
+            status, e
+        )
+    })?;
+
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        return Err(format!(
+            "GitHub token exchange returned {}: {}",
+            status, msg
+        ));
+    }
+
+    body["token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "GitHub token response missing 'token' field".to_string())
+}
+
+/// Post a comment to a GitHub pull request (via the issue comments endpoint).
+pub async fn post_github_pr_comment(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    pr_number: i64,
+    token: &str,
+    body: &str,
+) -> Result<u16, String> {
+    let url = format!(
+        "{}/repos/{}/issues/{}/comments",
+        api_base.trim_end_matches('/'),
+        repo,
+        pr_number
+    );
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sashiko")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| format!("GitHub comment POST failed: {}", e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        Ok(status.as_u16())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(format!("GitHub returned {}: {}", status, text))
     }
 }
 
@@ -461,9 +783,106 @@ impl Default for ForgeRegistry {
     }
 }
 
+/// Format a pull request / merge request subject line with `#` (or `!` for GitLab)
+/// and an optional `[vN]` revision tag when `version >= 2`.
+pub fn format_mr_subject(mr_url: Option<&str>, number: i64, version: u32, title: &str) -> String {
+    let prefix = match mr_url {
+        Some(url) if url.contains("gitlab") => "!",
+        _ => "#",
+    };
+    let clean_title = strip_existing_mr_prefix(title, number);
+    if version >= 2 {
+        format!("{}{} [v{}]: {}", prefix, number, version, clean_title)
+    } else {
+        format!("{}{}: {}", prefix, number, clean_title)
+    }
+}
+
+fn strip_existing_mr_prefix(title: &str, number: i64) -> &str {
+    let trimmed = title.trim();
+    for pfx in ['#', '!'] {
+        let base = format!("{}{}", pfx, number);
+        if let Some(rest) = trimmed.strip_prefix(&base) {
+            let rest = rest.trim_start();
+            if let Some(after_v) = rest.strip_prefix("[v")
+                && let Some((_, after_bracket)) = after_v.split_once(']')
+            {
+                return after_bracket
+                    .trim_start()
+                    .strip_prefix(':')
+                    .unwrap_or(after_bracket)
+                    .trim_start();
+            }
+            if let Some(after_colon) = rest.strip_prefix(':') {
+                return after_colon.trim_start();
+            }
+        }
+    }
+    trimmed
+}
+
+/// Extract the version number from a pull request subject formatted by `format_mr_subject`.
+pub fn extract_mr_version_from_subject(subject: Option<&str>, number: i64) -> Option<u32> {
+    let trimmed = subject?.trim();
+    for pfx in ['#', '!'] {
+        let base = format!("{}{}", pfx, number);
+        if let Some(rest) = trimmed.strip_prefix(&base) {
+            let rest = rest.trim_start();
+            if let Some(after_v) = rest.strip_prefix("[v")
+                && let Some((digits, _)) = after_v.split_once(']')
+                && let Ok(v) = digits.parse::<u32>()
+            {
+                return Some(v);
+            }
+            return Some(1);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_mr_subject_versions() {
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/513"),
+                513,
+                1,
+                "baseline: route iwl-net and iwl-next series to dev-queue"
+            ),
+            "#513: baseline: route iwl-net and iwl-next series to dev-queue"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/513"),
+                513,
+                5,
+                "baseline: route iwl-net and iwl-next series to dev-queue"
+            ),
+            "#513 [v5]: baseline: route iwl-net and iwl-next series to dev-queue"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/513"),
+                513,
+                2,
+                "#513: baseline: route iwl-net and iwl-next series to dev-queue"
+            ),
+            "#513 [v2]: baseline: route iwl-net and iwl-next series to dev-queue"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://gitlab.com/org/repo/-/merge_requests/42"),
+                42,
+                3,
+                "fix race condition"
+            ),
+            "!42 [v3]: fix race condition"
+        );
+    }
 
     #[test]
     fn test_is_valid_git_sha_40_char() {
@@ -903,5 +1322,340 @@ mod tests {
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         let body = Bytes::from("{}");
         assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    #[test]
+    fn test_loggable_passes_plain_values() {
+        assert_eq!(loggable("pull_request"), "pull_request");
+        assert_eq!(loggable("Merge Request Hook"), "Merge Request Hook");
+        assert_eq!(loggable("github"), "github");
+    }
+
+    #[test]
+    fn test_loggable_rejects_forged_log_lines() {
+        assert_eq!(loggable("ping\nRejected nothing"), "(invalid)");
+        assert_eq!(loggable("ping\r\n"), "(invalid)");
+        assert_eq!(loggable(""), "(invalid)");
+        assert_eq!(loggable(&"a".repeat(MAX_LOGGED_LEN + 1)), "(invalid)");
+    }
+
+    #[test]
+    fn test_event_label_reports_the_event_header() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(event_label(&headers), "(none)");
+
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        assert_eq!(event_label(&headers), "ping");
+
+        let mut gitlab = HeaderMap::new();
+        gitlab.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
+        assert_eq!(event_label(&gitlab), "Merge Request Hook");
+    }
+
+    /// Build the header value GitHub sends for a given body and secret.
+    fn github_signature(secret: &str, body: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let mut hex = String::from("sha256=");
+        for b in mac.finalize().into_bytes() {
+            let _ = write!(hex, "{:02x}", b);
+        }
+        hex
+    }
+
+    #[test]
+    fn test_github_validate_event_classifies_ping_as_handshake() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        let body = Bytes::from(r#"{"zen":"Design for failure."}"#);
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap(),
+            ForgeEvent::Handshake
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_classifies_pull_request_as_change_request() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap(),
+            ForgeEvent::ChangeRequest
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_accepts_signed_ping() {
+        let forge = GitHubForge;
+        let body = Bytes::from(r#"{"zen":"Design for failure."}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature("my-secret", &body).parse().unwrap(),
+        );
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("my-secret"))
+                .unwrap(),
+            ForgeEvent::Handshake
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_rejects_unsigned_ping() {
+        // A handshake is acknowledged with 200, so it must prove the sender
+        // just like any other event when a secret is configured.
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "ping".parse().unwrap());
+        let body = Bytes::from(r#"{"zen":"Design for failure."}"#);
+        assert_eq!(
+            forge
+                .validate_event(&headers, &body, Some("my-secret"))
+                .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn test_github_validate_event_rejects_unrelated_event() {
+        let forge = GitHubForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "push".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_gitlab_validate_event_rejects_ping() {
+        let forge = GitLabForge;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gitlab-event", "ping".parse().unwrap());
+        let body = Bytes::from("{}");
+        assert_eq!(
+            forge.validate_event(&headers, &body, None).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn test_github_review_intent_accepts_commit_changing_actions() {
+        let forge = GitHubForge;
+        for action in ["opened", "reopened", "synchronize", "ready_for_review"] {
+            assert_eq!(
+                forge.review_intent(action),
+                ReviewIntent::Review,
+                "{action} should be reviewed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_review_intent_skips_metadata_actions() {
+        let forge = GitHubForge;
+        for action in [
+            "labeled",
+            "unlabeled",
+            "edited",
+            "assigned",
+            "review_requested",
+            "closed",
+            "converted_to_draft",
+            // An action GitHub has not invented yet is skipped rather than
+            // charged a review on the guess that it moved the head commit.
+            "some_future_action",
+        ] {
+            assert_eq!(
+                forge.review_intent(action),
+                ReviewIntent::Skip,
+                "{action} should be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gitlab_review_intent_reviews_every_merge_request_hook() {
+        let forge = GitLabForge;
+        assert_eq!(forge.review_intent("merge_request"), ReviewIntent::Review);
+    }
+
+    #[test]
+    fn test_extract_repo_name_from_mr_url() {
+        assert_eq!(
+            extract_repo_name_from_mr_url("https://gitlab.com/org/repo/-/merge_requests/10"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name_from_mr_url("https://github.com/sashiko-dev/sashiko/pull/501"),
+            Some("sashiko".to_string())
+        );
+        assert_eq!(
+            extract_repo_name_from_mr_url("https://example.com/not-a-pr"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_owner_repo_from_mr_url() {
+        assert_eq!(
+            extract_owner_repo_from_mr_url("https://github.com/sashiko-dev/sashiko/pull/501"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            extract_owner_repo_from_mr_url("https://gitlab.com/org/sub/repo/-/merge_requests/10"),
+            Some("org/sub/repo".to_string())
+        );
+        assert_eq!(
+            extract_owner_repo_from_mr_url("https://example.com/not-a-pr"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_clean() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 2,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "first clean patch".to_string(),
+                inline_review: None,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 2,
+                commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
+                subject: "second clean patch".to_string(),
+                inline_review: Some("No issues found.".to_string()),
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(1),
+            2,
+            None,
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def",
+        );
+        assert!(body.starts_with("### Sashiko review\n\n"));
+        assert!(body.contains("✓ **No issues found** across 2 commits."));
+        assert!(
+            body.contains(
+                "[Full review log on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_with_findings_and_version() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 2,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "clean commit".to_string(),
+                inline_review: None,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 2,
+                commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
+                subject: "commit with bug".to_string(),
+                inline_review: Some("Severity: HIGH\nMissing check on input buffer.".to_string()),
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(3),
+            2,
+            Some("Series summary text here."),
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/mr-501-v3",
+        );
+        assert!(body.starts_with("### Sashiko review — v3\n\n"));
+        assert!(body.contains("<details>\n<summary>Series summary</summary>\n\nSeries summary text here.\n\n</details>"));
+        assert!(!body.contains("clean commit"));
+        assert!(body.contains("#### Commit 2/2 — `fedcba09` commit with bug"));
+        assert!(body.contains("Severity: HIGH\nMissing check on input buffer."));
+        assert!(
+            body.contains(
+                "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_mint_github_app_jwt_valid_rsa_key() {
+        let test_pem = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDpmekVGfs9pOaJ\n\
+Fwiha1czG7AKrJOV3vMY5TOTpUdS78e9K0x5aq7GiVesTQE+SWpL6Z+YJ34kfP7F\n\
+IMYJdyWe2i8nZIunMsZixNr9ljiGC19FZZeUelgWf5YyocJ3JfJfuqYnif0gZuUL\n\
+HevyBwEItFXMmj6ZGVCTvHHeo8g4eSqvwCcD7c1TfcRgHc/hy82+nALsuifyvxjo\n\
+vkXNKsJCm+W/FEhsXNxQ0Ros4H8BcDpJw1HI2XHJHcX+ouonEjTzMX7lzxdvbNp6\n\
+XbPf1ANJJPtq/KVjNFTUrrMeLdph0J0KDJtDK3bK/Uls+2VS12YKQHJs0ylq05l8\n\
+Bavic5wZAgMBAAECggEAGDKYkaur+h9iFK1NeDsVlfZg7pogfOkn/ATcqjH4CL/3\n\
+IWyiHVRPCm3LpnjLj4Isqp8RUxeJhN9rHKG1IeHfrxbMGk6F+38noa+L57IZ5M4P\n\
+blwvBB2wO5Ride2KUVadnAufjn+dYtqFu028KnP4nXLguF2kl638ShwTx4uQ/+21\n\
+M3SYoKl+FQCUs4kts1pYgzGa3NpV0LCJnfGz1eGwajO2saYLCBaimrX/hprexzmm\n\
+Th2ITsZab75tDaMKbpyVZIfN3wOCxthV9byXOIFndVaDmzrghzPBL1iGKWcMCnMT\n\
+onlB27jVXnrGlTGkVLH9qKQ7Z6Lyj9GV6xddx9oQSQKBgQD2ayKONlQGwzLUB8s5\n\
+eKRT6d/uhTl9WeNX0KXAsiYjDH8vXZqDR2YUPs3hSqABpQuH+EEeF8h/5BMmq/da\n\
+M9+sZyqsH/B27N5JbnhseOnYccd+4PsfRISEwkLa9DkKS2tQZy2A1lnLWo6TAe37\n\
+8bq2LXAPZiOeEEc7GCt0yVDpfwKBgQDyrzEDrQPJr/6MvHWi4qDumSYK2+fXNP1B\n\
+FqnP3L09C0TTvj1Ia5HLHJ/CeiHq6suC8D+QrDbiu01DbyACBeNq9y2fzv5cixZx\n\
+V58aNZd7w45SqmSieYgnCi+z/YN6VDkTNVp6Pyn4ZK/I8oxWAkWm1q8ZjAoxBaua\n\
+OQQKVAtWZwKBgQCSB8+Eo6GMGGWoza2bs2j+6ZxxR7ZYGMrnoZh455o+Lwu4UCpf\n\
+HhLacJWlq4nDL8HzpCVC5ilF0S2gP0zowdEN5F2ff5YLhDf/IF5xOf6q7FKjWES5\n\
+tOsrmcvw4cZj2WoRTfPjZCP2pQXVDNGx+wEBMVA1b/wvkcoEtUAbh6pRlQKBgQDe\n\
+uK2xA+4AAYcJvkPv0zGDCAaD3MHvHfB29ceuvpTmGxt1gJhZiG9rCsAMCW5rXESd\n\
+zMNpkMNmXiNQigHEGYdXObYjfiKu5+8W4iVgNmLp8NUDROHKwuKTgaO5+iXZ9MXU\n\
+vRhmLOXl0vII56CnpropnclhFsabquqMRVtR50PobQKBgBhRj6Wi9QDQ/6/kk5VG\n\
+2evCz2SRP0Mua25y3+gNDNcjfIVaiQdCd5lJMG3G9esdc3SJ2lbz+QQUbk1U5Jcz\n\
+NS77VgBQLugIAhcS11DAtF4vd29/Jc1kDsQQ30Or5ONNGjMe0x0WN+uGRzrmLI6U\n\
+bfBnKqGjJguuHd5ta5Vh5B51\n\
+-----END PRIVATE KEY-----";
+
+        let jwt = mint_github_app_jwt(4982337, test_pem).expect("should sign JWT");
+        assert_eq!(jwt.split('.').count(), 3);
+    }
+
+    #[test]
+    fn test_is_dependabot_author_and_github_payload() {
+        assert!(is_dependabot_author("dependabot[bot]"));
+        assert!(is_dependabot_author("dependabot"));
+        assert_eq!(loggable("dependabot[bot]"), "dependabot[bot]");
+        assert!(!is_dependabot_author("kfree"));
+        assert!(!is_dependabot_author(
+            "Roman Gushchin <roman.gushchin@linux.dev>"
+        ));
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "action": "opened",
+                "pull_request": {
+                    "number": 42,
+                    "title": "Bump tokio from 1.40.0 to 1.41.0",
+                    "html_url": "https://github.com/sashiko-dev/sashiko/pull/42",
+                    "user": { "login": "dependabot[bot]" },
+                    "head": { "sha": "1111111111111111111111111111111111111111" },
+                    "base": { "sha": "2222222222222222222222222222222222222222" }
+                },
+                "repository": {
+                    "clone_url": "https://github.com/sashiko-dev/sashiko.git"
+                }
+            })
+            .to_string(),
+        );
+
+        let forge = GitHubForge;
+        let (_action, metadata) = forge.parse_payload(&body).expect("valid payload");
+        assert_eq!(metadata.author.as_deref(), Some("dependabot[bot]"));
+        assert!(metadata.author.as_deref().is_some_and(is_dependabot_author));
     }
 }

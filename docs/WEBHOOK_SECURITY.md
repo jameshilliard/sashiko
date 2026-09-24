@@ -22,8 +22,10 @@ GitLab.com ──HTTPS──▶ nginx (TLS) ──HTTP──▶ Sashiko :8080 (l
 ```
 
 Sashiko binds to localhost; a reverse proxy (nginx, Caddy) terminates TLS.
-Configure `webhook_secret` in `Settings.toml` — non-localhost requests from
-the proxy are authenticated via the signature check.
+Configure `webhook_secret` in `Settings.toml` — requests from the proxy are
+authenticated via the signature check. Nothing is inferred from the source
+address, because a proxied request arrives from localhost exactly as a local
+one does.
 
 - No `--enable-unsafe-all-submit` flag needed
 - Example config: `docs/examples/Settings.forge-gitlab-production.toml`
@@ -335,8 +337,9 @@ the GitLab or GitHub UI for the request headers and response status.
 
 ### 403 Forbidden
 
-The request was rejected because Sashiko is not configured to accept
-non-localhost requests.
+The request was rejected because Sashiko cannot authenticate it. A webhook
+is authenticated by its signature, and a forge has no other credential to
+offer, so there is nothing to fall back on.
 
 **Common causes:**
 
@@ -389,7 +392,8 @@ same time.
 **Do I still need `--enable-unsafe-all-submit`?**
 
 Not when `webhook_secret` is configured. The signature check authenticates
-non-localhost requests. The flag is only needed for unauthenticated setups.
+the request wherever it came from. The flag is only needed for unauthenticated
+setups, which no deployment reachable by a forge should be running.
 
 **What about replay attacks?**
 

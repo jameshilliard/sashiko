@@ -12,11 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use anyhow::Result;
 use regex::Regex;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// The XDG data directory, where anything Sashiko keeps between runs lives:
+/// the installed prompt bundle, and the response cache for a review with no
+/// database beside it.
+pub fn data_home() -> Result<PathBuf> {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(data_home));
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(Path::new(&home).join(".local/share"));
+    }
+
+    Ok(std::env::current_dir()?.join(".local/share"))
+}
 
 static KEY_REGEX: OnceLock<Regex> = OnceLock::new();
 static URL_CRED_REGEX: OnceLock<Regex> = OnceLock::new();
+
+/// Returns the longest prefix of `input` that is valid UTF-8 and no longer
+/// than `max_bytes` bytes.
+///
+/// This is useful when text must fit a byte-limited preview. Direct string
+/// slicing can panic when the byte limit falls inside a multi-byte character.
+pub fn utf8_prefix(input: &str, max_bytes: usize) -> &str {
+    let mut end = input.len().min(max_bytes);
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
 
 /// Redacts sensitive information from a string.
 ///
@@ -87,6 +117,15 @@ pub fn clean_json_string(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_utf8_prefix_preserves_character_boundaries() {
+        assert_eq!(utf8_prefix("plain text", 5), "plain");
+        assert_eq!(utf8_prefix("abc🙂def", 7), "abc🙂");
+        assert_eq!(utf8_prefix("abc🙂def", 6), "abc");
+        assert_eq!(utf8_prefix("🙂", 0), "");
+        assert_eq!(utf8_prefix("short", 100), "short");
+    }
 
     #[test]
     fn test_redact_gemini_key() {

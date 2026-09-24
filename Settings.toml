@@ -39,6 +39,8 @@ track = ["linux-kernel"]
 [nntp]
 server = "nntp.lore.kernel.org"
 port = 119
+# Wrap the session in TLS (NNTPS). Servers listen for NNTPS on 563.
+# tls = false
 
 # [smtp]
 # **WARNING: BE VERY CAREFUL WHEN ENABLING EMAIL SENDING.**
@@ -83,6 +85,12 @@ temperature = 1.0
 # max_input_tokens = 40000
 # max_interactions = 50
 
+# To use Claude via AWS Bedrock (requires --features bedrock):
+# provider = "bedrock"
+# model = "us.anthropic.claude-sonnet-4-6-20250514-v1:0"
+# max_input_tokens = 40000
+# max_interactions = 50
+
 # To use Kiro CLI (fixed-cost subscription, no API key needed):
 # provider = "kiro-cli"
 # model = "claude-opus-4.6"
@@ -95,11 +103,30 @@ temperature = 1.0
 # max_input_tokens = 200000
 # max_interactions = 150
 
+# To use goose in front of a local server (no API key needed), see
+# docs/examples/Settings.goose-cli.toml for the matching [ai.goose_cli.env]:
+# provider = "goose"
+# model = "qwen3-8b-ov"
+# max_input_tokens = 4000
+# max_interactions = 50
+
 # To use OpenRouter, also export OPENAI_API_KEY with the API key in the environment
 # provider = "openai-compatible"
 # model = "openrouter/free"
 # max_input_tokens = 128000
 # max_interactions = 100
+
+# To use OrcaRouter (OpenAI-compatible gateway), also export OPENAI_API_KEY with the API key in the environment
+# provider = "openai-compatible"
+# model = "openai/gpt-4o-mini"
+# max_input_tokens = 128000
+# max_interactions = 100
+
+# [ai.gemini]
+# explicit_prompt_caching = false
+# base_url = "http://localhost:8000"  # Or set GOOGLE_GEMINI_BASE_URL env var
+# proxy_command = "scripts/gemini-proxy-helper.sh --port-file {port_file}"
+# auth_token_command = "gcloud auth print-access-token"
 
 [ai.claude]
 prompt_caching = true
@@ -111,19 +138,69 @@ prompt_caching = true
 
 # [ai.openai_compat]        # Enable openrouter url
 # base_url = "https://openrouter.ai/api/v1"
+# base_url = "https://api.orcarouter.ai/v1"  # Enable for OrcaRouter
 
 # [ai.vertex]
 # project_id = "my-gcp-project"  # Or set ANTHROPIC_VERTEX_PROJECT_ID env var
 # region = "us-east5"            # Or set CLOUD_ML_REGION env var (default: "us-east5")
 # prompt_caching = true
 
+# [ai.bedrock]
+# region = "us-east-1"
+# prompt_caching = true
+# max_tokens = 8192
+
 # [ai.kiro_cli]
 # binary = "kiro-cli"
 # context_window_size = 200000
 
+# [ai.goose_cli]
+# binary = "goose"
+# goose_provider = "openai"        # Backend goose itself talks to
+# context_window_size = 32768
+# [ai.goose_cli.env]               # Whatever that backend needs
+# OPENAI_HOST = "http://localhost:8000"
+
 [server]
 host = "::"
 port = 8080
+# The URL this service is reachable at from outside, with no trailing slash.
+# Required whenever [smtp] is configured, because sign-in links are mailed and
+# the bind address above does not name a host a recipient can open. The server
+# refuses to start if SMTP is on and this is unset or names a bind address.
+# public_base_url = ""
+
+# Local tooling authenticates with a token rather than an address. The server
+# writes a random one to .sashiko-local-token beside the database on every
+# start, readable only by the user it runs as, and sashiko-cli and the
+# benchmark present it automatically.
+#
+# Nothing is inferred from where a request comes from. The deployed topology
+# puts a reverse proxy in front of a loopback bind, so a request from the
+# public internet arrives exactly as a local one does; reading a file owned by
+# the server's user is a claim that caller cannot make.
+
+# Identity-based Capabilities: Defines what authenticated (JWT) entities can do.
+# If these lists are empty or the section is missing, nobody is allowed to perform any mutations (Fail-Closed secure default).
+# Do NOT list arbitrary users here.
+[server.acl]
+# Admins have all capabilities, including root-level maintenance operations.
+admins = []
+# The kernel security list. Reads and comments on every bug and reads the raw
+# AI transcripts. Deliberately not admins: this grants no ingest, cancel or
+# review capability, and no authority over bugs outside the member's own
+# maintained subsystems beyond commenting.
+security = []
+# Principals permitted to file new bugs over HTTP. Empty means only admins can.
+bug_reporters = []
+# Ingest limits users/bots to only submit new patches into the system (/api/submit).
+ingest = []
+# Cancel permits halting workloads (useful for automation / cron scripts).
+cancel = []
+# Review allows triggering intensive AI analyses on existing patches.
+review = []
+# Blocklist explicitly denies all capabilities and access, overriding any grants.
+blocklist = []
 
 [git]
 repository_path = "third_party/linux"

@@ -1,0 +1,70 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# ENVIRONMENT-SPECIFIC CONFIGURATION EXAMPLE
+# Copy this to 'kustomization.yaml' and modify IDs.
+# This file is ignored by git.
+#
+# The base manifest expects a 'sashiko-self-secrets' Secret in the
+# sashiko-self namespace holding LLM_API_KEY, SASHIKO_SMTP__PASSWORD,
+# SASHIKO__SERVER__JWT_SECRET and SASHIKO__FORGE__WEBHOOK_SECRET; a container
+# referencing a missing key never starts. SASHIKO__FORGE__API_TOKEN is optional
+# and only raises the GitHub API rate limit. Generate the JWT secret once and
+# keep it, because replacing it invalidates every session and sign-in link:
+#
+#   SECRET=$(openssl rand -hex 32)
+#   kubectl -n sashiko-self patch secret sashiko-self-secrets --type=merge \
+#     -p "{\"stringData\":{\"SASHIKO__SERVER__JWT_SECRET\":\"$SECRET\"}}"
+
+patches:
+  # 1. Deployment: Update image
+  - target:
+      kind: Deployment
+      name: sashiko-self-deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: us-docker.pkg.dev/gcp-project-xxxxx/sashiko-repository/sashiko:next
+
+  # 2. ServiceAccount: Link to real GCP Service Account
+  - target:
+      kind: ServiceAccount
+      name: sashiko-self-ksa
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/iam.gke.io~1gcp-service-account
+        value: a-service-account@gcp-project-xxxxx.iam.gserviceaccount.com
+
+  # 3. Data Manager: Inject Bucket ID
+  - target:
+      kind: Deployment
+      name: data-manager
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx/sashiko-self
+
+  # 4. CronJob: Inject Bucket ID
+  - target:
+      kind: CronJob
+      name: sashiko-self-nightly-backup
+    patch: |-
+      - op: add
+        path: /spec/jobTemplate/spec/template/spec/containers/0/env
+        value:
+          - name: BACKUP_BUCKET
+            value: gs://bucket-xxxxx/sashiko-self
+
+  # 5. Ingress: Real IP and Certificate names
+  - target:
+      kind: Ingress
+      name: sashiko-self-ingress
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/kubernetes.io~1ingress.global-static-ip-name
+        value: "load-balancer"
+      - op: replace
+        path: /metadata/annotations/networking.gke.io~1managed-certificates
+        value: "certificate"

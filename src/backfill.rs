@@ -1,0 +1,301 @@
+// Copyright 2026 The Sashiko Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! One-shot repairs of data that predates the code which would have produced
+//! it.
+//!
+//! These are not migrations. A migration is SQL and runs inside the version
+//! ladder; the work here needs the MAINTAINERS index, which is a file read
+//! from a git tree and cannot be consulted from SQL.
+
+use crate::db::{AttributedSubsystem, Database};
+use anyhow::Result;
+use tracing::{info, warn};
+
+/// Marks the attribution walk as finished, so it happens once per database
+/// rather than on every boot.
+const SECTIONS_BACKFILLED_KEY: &str = "patchset_maintainer_sections_backfilled";
+
+/// How many patchsets to look at per query. Small enough that the walk never
+/// holds a large result set on the single shared connection, large enough that
+/// a production sized archive does not cost thousands of round trips.
+const PAGE: usize = 500;
+
+/// Attributes patchsets that were ingested before attribution existed.
+///
+/// Every patchset ingested from now on records its MAINTAINERS sections as it
+/// arrives, but the archive already holds series that predate that. Until they
+/// are attributed they have no sections, and an unattributed patchset is
+/// closed rather than open, so the effect of not running this is that old
+/// series' transcripts stay visible only to operators. That is the safe
+/// direction to fail, which is why this is best effort and never blocks
+/// startup.
+///
+/// Runs once and records that it did. Re-running would be harmless, because
+/// the writes are upserts keyed on the patchset and section, but it would walk
+/// the whole archive on every boot to discover that the patchsets it keeps
+/// finding are the ones that genuinely match no section.
+pub async fn backfill_patchset_maintainer_sections(db: &Database) -> Result<()> {
+    if db.get_meta(SECTIONS_BACKFILLED_KEY).await?.is_some() {
+        return Ok(());
+    }
+
+    // Startup installs an empty index when the kernel tree cannot be read, and
+    // for projects that have no MAINTAINERS file at all, so an index being
+    // present is not the same as it being usable. Walking against an empty one
+    // would attribute every patchset to nothing and then stamp itself done,
+    // restricting the whole archive permanently. Leaving the marker unset lets
+    // a later boot, with the tree in place, do the real work.
+    if crate::maintainers::get_global_maintainers().is_none_or(|index| index.is_empty()) {
+        warn!(
+            "Skipping patchset MAINTAINERS attribution backfill: no sections are loaded. \
+             Old patchsets' review transcripts stay restricted to operators until a \
+             boot that has the kernel tree available."
+        );
+        return Ok(());
+    }
+
+    let mut after_id = 0i64;
+    let mut walked = 0usize;
+    let mut attributed = 0usize;
+
+    loop {
+        let ids = db
+            .patchsets_missing_maintainer_sections(after_id, PAGE)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+        for id in ids {
+            after_id = after_id.max(id);
+            walked += 1;
+
+            let sections = match sections_for_patchset(db, id).await {
+                Ok(sections) => sections,
+                Err(e) => {
+                    // One unreadable series must not stop the walk, or every
+                    // series after it stays unattributed too.
+                    warn!("Could not read diffs for patchset {id} during backfill: {e}");
+                    continue;
+                }
+            };
+            if sections.is_empty() {
+                continue;
+            }
+            if let Err(e) = db.replace_patchset_maintainer_sections(id, &sections).await {
+                warn!("Could not attribute patchset {id} during backfill: {e}");
+                continue;
+            }
+            attributed += 1;
+        }
+    }
+
+    db.set_meta(SECTIONS_BACKFILLED_KEY, "1").await?;
+    info!(
+        "Attributed {attributed} of {walked} previously unattributed patchsets to \
+         MAINTAINERS sections."
+    );
+    Ok(())
+}
+
+/// The union of the sections every part of this patchset touches.
+async fn sections_for_patchset(db: &Database, id: i64) -> Result<Vec<AttributedSubsystem>> {
+    let mut names: Vec<String> = Vec::new();
+    for diff in db.patch_diffs_only(id).await? {
+        for name in crate::maintainers::sections_for_diff(&diff) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names
+        .into_iter()
+        .map(AttributedSubsystem::from_maintainers)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maintainers::{
+        GLOBAL_INDEX_TEST_LOCK, MaintainersIndex, clear_global_maintainers, init_global_maintainers,
+    };
+    use crate::settings::DatabaseSettings;
+    use std::sync::Arc;
+
+    /// Everything before the "Maintainers List" header is preamble the parser
+    /// skips, so the fixture has to carry it.
+    const SAMPLE_MAINTAINERS: &str = r#"
+Maintainers List
+===================
+
+BTRFS FILE SYSTEM
+M:	Chris Mason <clm@fb.com>
+S:	Maintained
+F:	fs/btrfs/
+
+NETWORKING [GENERAL]
+M:	David S. Miller <davem@davemloft.net>
+S:	Maintained
+F:	net/
+
+"#;
+
+    async fn setup_db() -> Database {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db
+    }
+
+    async fn patchset_with_diffs(db: &Database, id: i64, diffs: &[&str]) {
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status)
+                 VALUES (?, '[PATCH] subject', 'An Author <a@b.com>', 1000, 'Reviewed')",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        for (part, diff) in diffs.iter().enumerate() {
+            let message_id = format!("msg-{id}-{part}");
+            // patches.message_id is a foreign key, so the message has to exist
+            // before the part that points at it.
+            db.conn
+                .execute(
+                    "INSERT INTO messages (message_id, subject, author, date)
+                     VALUES (?, '[PATCH] subject', 'An Author <a@b.com>', 1000)",
+                    libsql::params![message_id.clone()],
+                )
+                .await
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO patches (patchset_id, message_id, part_index, diff)
+                     VALUES (?, ?, ?, ?)",
+                    libsql::params![id, message_id, part as i64 + 1, diff.to_string()],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backfill_attributes_old_patchsets_once() {
+        let _guard = GLOBAL_INDEX_TEST_LOCK.lock().await;
+        let db = setup_db().await;
+
+        // Two parts touching different subsystems, so the attribution has to
+        // be the union rather than whichever part is read last.
+        patchset_with_diffs(
+            &db,
+            1,
+            &[
+                "diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c\n",
+                "diff --git a/net/core/dev.c b/net/core/dev.c\n",
+            ],
+        )
+        .await;
+        // Matches no section, so it stays closed.
+        patchset_with_diffs(&db, 2, &["diff --git a/unclaimed/x.c b/unclaimed/x.c\n"]).await;
+        // A cover letter only series has no diffs at all.
+        patchset_with_diffs(&db, 3, &[]).await;
+
+        clear_global_maintainers();
+        init_global_maintainers(Arc::new(
+            MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap(),
+        ));
+
+        backfill_patchset_maintainer_sections(&db).await.unwrap();
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(1).await.unwrap(),
+            vec![
+                "BTRFS FILE SYSTEM".to_string(),
+                "NETWORKING [GENERAL]".to_string()
+            ],
+            "the walk unions every part of the series"
+        );
+        assert!(
+            db.authorizing_sections_for_patchset(2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a series matching no section is attributed to nobody, not to a guess"
+        );
+        assert!(
+            db.authorizing_sections_for_patchset(3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Having run, it records that and does not walk again.
+        assert_eq!(
+            db.get_meta(SECTIONS_BACKFILLED_KEY).await.unwrap(),
+            Some("1".to_string())
+        );
+
+        // A patchset added later is ingestion's job, not the backfill's, so a
+        // second call must leave it alone.
+        patchset_with_diffs(
+            &db,
+            4,
+            &["diff --git a/net/core/sock.c b/net/core/sock.c\n"],
+        )
+        .await;
+        backfill_patchset_maintainer_sections(&db).await.unwrap();
+        assert!(
+            db.authorizing_sections_for_patchset(4)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the walk does not run a second time"
+        );
+
+        clear_global_maintainers();
+    }
+
+    #[tokio::test]
+    async fn test_backfill_without_an_index_leaves_the_work_for_later() {
+        let _guard = GLOBAL_INDEX_TEST_LOCK.lock().await;
+        let db = setup_db().await;
+        patchset_with_diffs(&db, 1, &["diff --git a/net/core/dev.c b/net/core/dev.c\n"]).await;
+
+        clear_global_maintainers();
+        backfill_patchset_maintainer_sections(&db).await.unwrap();
+
+        // Nothing was attributed, and crucially nothing was marked done, so a
+        // boot that can read MAINTAINERS still will.
+        assert!(
+            db.authorizing_sections_for_patchset(1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.get_meta(SECTIONS_BACKFILLED_KEY).await.unwrap(), None);
+
+        // An index that loaded but holds no sections is the shape startup
+        // produces when the kernel tree is unreadable, and it must be treated
+        // the same way rather than as a walk that found nothing.
+        init_global_maintainers(Arc::new(MaintainersIndex::new()));
+        backfill_patchset_maintainer_sections(&db).await.unwrap();
+        assert_eq!(db.get_meta(SECTIONS_BACKFILLED_KEY).await.unwrap(), None);
+
+        clear_global_maintainers();
+    }
+}

@@ -62,7 +62,7 @@ impl PatchworkCheckResult {
                 Severity::Critical => &mut critical,
                 Severity::High => &mut high,
                 Severity::Medium => &mut medium,
-                Severity::Low => &mut low,
+                Severity::Low | Severity::Unknown => &mut low,
             };
 
             if is_preexisting {
@@ -158,11 +158,37 @@ struct PatchworkCheckRequest {
     context: String,
 }
 
+/// Why a Patchwork check attempt did not succeed.
+///
+/// Distinguished from a plain string so the caller can tell a transient,
+/// self-resolving condition apart from an outright API failure without
+/// pattern-matching on message text.
+#[derive(Debug)]
+pub enum PatchworkCheckError {
+    /// Patchwork's own mailing list mirror has not indexed this message
+    /// yet. Sashiko can complete a review and attempt the check before
+    /// Patchwork's mirror catches up; retrying once it does succeeds.
+    NotIndexedYet,
+    /// The API rejected the request or the network call itself failed.
+    Api(String),
+}
+
+impl std::fmt::Display for PatchworkCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotIndexedYet => write!(f, "Patchwork has not indexed this message yet"),
+            Self::Api(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for PatchworkCheckError {}
+
 /// Post a check result to the Patchwork REST API for a given patch.
 ///
 /// Looks up the patch by message-ID, then POSTs the check. Returns Ok
-/// on success or Err with a description on failure so the caller can
-/// decide whether to retry.
+/// on success or Err describing the failure so the caller can decide
+/// whether and how to retry.
 pub async fn post_patchwork_check(
     client: &Client,
     api_url: &str,
@@ -171,7 +197,7 @@ pub async fn post_patchwork_check(
     status: &str,
     description: &str,
     target_url: &str,
-) -> Result<(), String> {
+) -> Result<(), PatchworkCheckError> {
     let api_url = api_url.trim_end_matches('/');
 
     // Strip angle brackets from the message-ID.
@@ -180,7 +206,7 @@ pub async fn post_patchwork_check(
     // Build the lookup URL with proper URL-encoding for the msgid.
     let base_url = format!("{}/patches/", api_url);
     let patches_url = reqwest::Url::parse_with_params(&base_url, &[("msgid", clean_msgid)])
-        .map_err(|e| format!("failed to build patchwork URL: {}", e))?;
+        .map_err(|e| PatchworkCheckError::Api(format!("failed to build patchwork URL: {}", e)))?;
     debug!("Fetching Patchwork patch by msgid: {}", clean_msgid);
 
     let mut get_req = client.get(patches_url);
@@ -188,25 +214,26 @@ pub async fn post_patchwork_check(
         get_req = get_req.header(header::AUTHORIZATION, format!("Token {}", token));
     }
 
-    let resp = get_req
-        .send()
-        .await
-        .map_err(|e| format!("failed to fetch patchwork patch list: {}", e))?;
+    let resp = get_req.send().await.map_err(|e| {
+        PatchworkCheckError::Api(format!("failed to fetch patchwork patch list: {}", e))
+    })?;
 
     if !resp.status().is_success() {
         let status_code = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("patchwork API returned {}: {}", status_code, body));
+        return Err(PatchworkCheckError::Api(format!(
+            "patchwork API returned {}: {}",
+            status_code, body
+        )));
     }
 
-    let patches: Vec<PatchworkListResponse> = resp
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse patchwork list response: {}", e))?;
+    let patches: Vec<PatchworkListResponse> = resp.json().await.map_err(|e| {
+        PatchworkCheckError::Api(format!("failed to parse patchwork list response: {}", e))
+    })?;
 
     if patches.is_empty() {
-        debug!("Patchwork returned no patches for msgid {}", msgid);
-        return Ok(());
+        debug!("Patchwork has not indexed msgid {} yet", msgid);
+        return Err(PatchworkCheckError::NotIndexedYet);
     }
 
     if patches.len() > 1 {
@@ -238,7 +265,7 @@ pub async fn post_patchwork_check(
     let post_resp = post_req
         .send()
         .await
-        .map_err(|e| format!("failed to post patchwork check: {}", e))?;
+        .map_err(|e| PatchworkCheckError::Api(format!("failed to post patchwork check: {}", e)))?;
 
     if post_resp.status().is_success() {
         info!("Successfully posted check to Patchwork for msgid {}", msgid);
@@ -246,10 +273,10 @@ pub async fn post_patchwork_check(
     } else {
         let status_code = post_resp.status();
         let body = post_resp.text().await.unwrap_or_default();
-        Err(format!(
+        Err(PatchworkCheckError::Api(format!(
             "patchwork check post failed with status {}: {}",
             status_code, body
-        ))
+        )))
     }
 }
 
@@ -335,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_preexisting_produces_success() {
+    fn test_only_produces_success() {
         let findings = vec![finding_preexisting("Critical"), finding_preexisting("High")];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);
         assert_eq!(result.state, "success");
@@ -356,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_new_and_preexisting_same_severity() {
+    fn test_mixed_new_and_same_severity() {
         let findings = vec![
             finding_new("High"),
             finding_new("High"),
@@ -437,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_preexisting_treated_as_new() {
+    fn test_missing_treated_as_new() {
         // findings without preexisting field default to new
         let findings = vec![serde_json::json!({"severity": "High", "problem": "test"})];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);
@@ -447,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_null_preexisting_treated_as_new() {
+    fn test_null_treated_as_new() {
         let findings =
             vec![serde_json::json!({"severity": "High", "problem": "test", "preexisting": null})];
         let result = PatchworkCheckResult::from_policy(&default_policy(), &findings);
@@ -519,5 +546,104 @@ mod tests {
         assert!(lines[2].starts_with("description: "));
         assert!(lines[3].starts_with("target_url: "));
         assert!(lines[4].starts_with("context: "));
+    }
+
+    // -- post_patchwork_check tests --
+
+    #[test]
+    fn test_patchwork_check_error_display() {
+        assert_eq!(
+            PatchworkCheckError::NotIndexedYet.to_string(),
+            "Patchwork has not indexed this message yet"
+        );
+        assert_eq!(
+            PatchworkCheckError::Api("boom".to_string()).to_string(),
+            "boom"
+        );
+    }
+
+    /// Spawn a one-shot HTTP server that replies to the first request on
+    /// its single connection with a canned status line and body, then
+    /// stops. Mirrors the raw-socket test server already used for NNTP in
+    /// `src/ingestor.rs`; there is no HTTP mocking crate in this codebase.
+    async fn one_shot_http_server(status_line: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+
+            // Drain the request line and headers up to the blank line.
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            stream.get_mut().flush().await.unwrap();
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_empty_patch_list_is_retryable_not_success() {
+        // Patchwork's mailing list mirror has not indexed this message yet:
+        // a 200 with an empty list, not an HTTP error.
+        let api_url = one_shot_http_server("HTTP/1.1 200 OK", "[]").await;
+        let client = Client::new();
+
+        let result = post_patchwork_check(
+            &client,
+            &api_url,
+            None,
+            "<no-such-patch@kernel.org>",
+            "success",
+            "desc",
+            "https://example.com",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PatchworkCheckError::NotIndexedYet)),
+            "expected NotIndexedYet, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_error_status_is_not_mistaken_for_not_indexed() {
+        let api_url = one_shot_http_server("HTTP/1.1 500 Internal Server Error", "boom").await;
+        let client = Client::new();
+
+        let result = post_patchwork_check(
+            &client,
+            &api_url,
+            None,
+            "<any@kernel.org>",
+            "success",
+            "desc",
+            "https://example.com",
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(PatchworkCheckError::Api(_))),
+            "expected Api error, got {result:?}"
+        );
     }
 }

@@ -1,7 +1,7 @@
 extends: relaxed
 
 ignore: |
-  sashiko.dev/base/routing/maintenance-setup.yaml
+  deployment/sashiko.dev/base/routing/maintenance-setup.yaml
   benchmarks/smoke-repo/
   review_trees/
   third_party/

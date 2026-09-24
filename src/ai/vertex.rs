@@ -271,15 +271,25 @@ impl AiProvider for VertexClient {
         }
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        claude::estimate_tokens_generic(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
             context_window_size: self.context_window_size,
         }
+    }
+
+    fn cache_identity(&self) -> String {
+        // max_tokens is what truncates a response, so a raised limit has to
+        // miss the entry recorded under the lower one rather than replay it.
+        let max_tokens = self.max_tokens.to_string();
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("thinking", self.thinking.as_deref()),
+                ("effort", self.effort.as_deref()),
+                ("max_tokens", Some(max_tokens.as_str())),
+            ],
+        )
     }
 }
 

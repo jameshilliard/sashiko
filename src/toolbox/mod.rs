@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+pub mod command;
 pub mod framework;
 pub mod utils;
 
@@ -103,6 +104,16 @@ impl ToolBox {
         }
     }
 
+    /// Registers an extra tool. Test-only: the review toolbox is fixed, and
+    /// this exists so a test can drive the tool loop with a tool of its own.
+    #[cfg(test)]
+    pub(crate) fn register_tool(
+        &mut self,
+        tool: impl framework::LlmTool<SashikoToolContext> + 'static,
+    ) {
+        self.registry.register(tool);
+    }
+
     /// Sets the virtual head commit SHA for the current review session.
     pub fn set_virtual_head(&mut self, sha: String) {
         let mut vhead = self.context.virtual_head.write().unwrap();
@@ -145,6 +156,7 @@ impl ToolBox {
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
         let should_cache = name_normalized != "todowrite";
+        let args = utils::normalize_json_numbers(args);
 
         let normalized_args = self.registry.normalize_tool_args(&name_normalized, &args);
 

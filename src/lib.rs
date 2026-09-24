@@ -13,27 +13,38 @@ pub mod metrics;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod access;
 pub mod ai;
 pub mod api;
+pub mod auth;
+pub mod backfill;
 pub mod baseline;
+pub mod compression;
 pub mod db;
 pub mod email_policy;
 pub mod email_router;
 pub mod events;
 pub mod fetcher;
 pub mod forge;
+pub mod git_cmd;
 pub mod git_ops;
 pub mod ingestor;
 pub mod local_review;
+pub mod maintainers;
+pub mod mbox;
 pub mod nntp;
 pub mod patch;
 pub mod patchwork;
+pub mod prerequisites;
+pub mod project;
 pub mod prompt_bundle;
 pub mod reviewer;
 pub mod settings;
 pub mod toolbox;
 pub mod utils;
 pub mod worker;
+pub mod workflow;
+pub mod workflows;
 
 use std::fmt;
 use std::str::FromStr;

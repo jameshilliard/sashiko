@@ -12,15 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::OnceLock;
-use tiktoken_rs::{CoreBPE, cl100k_base};
-
 pub struct TokenBudget {
     pub max_tokens: usize,
     pub current: usize,
 }
-
-static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
 impl TokenBudget {
     pub fn new(max_tokens: usize) -> Self {
@@ -46,14 +41,26 @@ impl TokenBudget {
         self.current = 0;
     }
 
-    /// Estimate token count for a string using cl100k_base (GPT-4/Gemini approximation).
-    pub fn estimate_tokens(text: &str) -> usize {
-        if text.is_empty() {
-            return 0;
-        }
-        let bpe =
-            TOKENIZER.get_or_init(|| cl100k_base().expect("Failed to load cl100k_base tokenizer"));
-        bpe.encode_with_special_tokens(text).len()
+    /// Bytes of text assumed to make up one token.
+    ///
+    /// Three is what the content these budgets are spent on actually measures:
+    /// source code, diffs and lock files all sit near three bytes per token.
+    /// Prose runs closer to four, so assuming three over-counts it and
+    /// truncates a little early. That is the direction to be wrong in, because
+    /// the opposite lets a tool result overrun the budget it was given.
+    pub const BYTES_PER_TOKEN: usize = 3;
+
+    /// Approximates the token count of a string from its byte length.
+    ///
+    /// This is deliberately arithmetic rather than a real encode. Sashiko
+    /// talks to several providers and each has its own vocabulary, so a count
+    /// produced by any single tokenizer is an approximation of the model
+    /// actually in use no matter how exact that tokenizer is. Callers spend
+    /// the number on context budgets that are orders of magnitude larger than
+    /// the error, while a real encode over a large tool output costs enough
+    /// CPU to stall the async runtime that asked for it.
+    pub fn approximate_tokens(text: &str) -> usize {
+        text.len().div_ceil(Self::BYTES_PER_TOKEN)
     }
 }
 
@@ -75,37 +82,50 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_tokens() {
-        assert_eq!(TokenBudget::estimate_tokens(""), 0);
-        // Use strings that are more stable across tokenizer versions if possible,
-        // or just accept what the tokenizer says.
-        let t1 = TokenBudget::estimate_tokens("hello");
-        assert!(t1 >= 1);
-        let t2 = TokenBudget::estimate_tokens("hello world");
-        assert!(t2 > t1);
+    fn test_approximate_tokens() {
+        assert_eq!(TokenBudget::approximate_tokens(""), 0);
+
+        // Rounding up keeps anything non-empty from being free.
+        assert_eq!(TokenBudget::approximate_tokens("a"), 1);
+        assert_eq!(TokenBudget::approximate_tokens("abc"), 1);
+        assert_eq!(TokenBudget::approximate_tokens("abcd"), 2);
+
+        let short = TokenBudget::approximate_tokens("hello");
+        let longer = TokenBudget::approximate_tokens("hello world");
+        assert!(longer > short);
     }
 
     #[test]
-    fn test_estimate_tokens_performance() {
-        let text = "Hello world this is a test string to estimate tokens for.";
-        let start = std::time::Instant::now();
-        // 1,000 iterations is enough to detect regression.
-        // Optimized: ~0.15s.
-        // Unoptimized: ~30s.
-        let iterations = 1_000;
-
-        for _ in 0..iterations {
-            let _ = TokenBudget::estimate_tokens(text);
-        }
-
-        let duration = start.elapsed();
-        println!("Time for {} iterations: {:?}", iterations, duration);
+    fn test_approximate_tokens_does_not_undercount_real_text() {
+        // Budgets are only safe if the estimate errs high: a count below the
+        // true one lets a tool result overrun the context it was given.
+        // English prose is the worst case, sitting near four bytes per token.
+        let prose = "The quick brown fox jumps over the lazy dog. ".repeat(100);
+        let generous_true_count = prose.len() / 4;
 
         assert!(
-            duration.as_secs() < 5,
-            "Token estimation is too slow! {:?} for {} iterations",
-            duration,
-            iterations
+            TokenBudget::approximate_tokens(&prose) >= generous_true_count,
+            "estimate must not fall below a four-bytes-per-token reading"
+        );
+    }
+
+    #[test]
+    fn test_approximate_tokens_is_cheap_on_large_input() {
+        // The encode this replaced took minutes on input of this size, which
+        // is what wedged a runtime worker in production.
+        let content =
+            "drivers/gpu/drm/xe/xe_tlb_inval.c:42: xe_tlb_inval_issue(inval);\n".repeat(200_000);
+
+        let start = std::time::Instant::now();
+        let tokens = TokenBudget::approximate_tokens(&content);
+        let duration = start.elapsed();
+
+        assert!(tokens > 0);
+        assert!(
+            duration < std::time::Duration::from_millis(100),
+            "estimating {} bytes took {:?}",
+            content.len(),
+            duration
         );
     }
 }

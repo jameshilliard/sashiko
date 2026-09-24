@@ -9,11 +9,22 @@ use tracing::{error, info, warn};
 pub struct EmailWorker {
     db: std::sync::Arc<crate::db::Database>,
     settings: SmtpSettings,
+    /// Mirrors server.log_sign_in_links, so that the one switch governs every
+    /// place a link could reach the log.
+    log_sign_in_links: bool,
 }
 
 impl EmailWorker {
-    pub fn new(db: std::sync::Arc<crate::db::Database>, settings: SmtpSettings) -> Self {
-        Self { db, settings }
+    pub fn new(
+        db: std::sync::Arc<crate::db::Database>,
+        settings: SmtpSettings,
+        log_sign_in_links: bool,
+    ) -> Self {
+        Self {
+            db,
+            settings,
+            log_sign_in_links,
+        }
     }
 
     pub async fn run(&self) {
@@ -28,8 +39,10 @@ impl EmailWorker {
             match self.db.lock_pending_email().await {
                 Ok(Some(email)) => {
                     info!(
-                        "Locked pending email ID {} for patch {:?}",
-                        email.id, email.patch_id
+                        "Locked pending {} email ID {} for patch {:?}",
+                        email.kind.as_str(),
+                        email.id,
+                        email.patch_id
                     );
                     match self.send_email(&email).await {
                         Ok(_) => {
@@ -66,13 +79,32 @@ impl EmailWorker {
                 "DRY RUN: Would have sent email to {}, cc {}, subject '{}'",
                 email_row.to_addresses, email_row.cc_addresses, email_row.subject
             );
-            info!("DRY RUN Body:\n{}", email_row.body);
+            // The body of a sign-in mail carries the link, which is a bearer
+            // credential and so is withheld from the log by default. Every
+            // other kind of mail is safe to show in full.
+            if email_row.kind == crate::db::EmailKind::SignInLink && !self.log_sign_in_links {
+                info!(
+                    "DRY RUN Body withheld because it contains a sign-in link. Set \
+                     server.log_sign_in_links to print it."
+                );
+            } else {
+                info!("DRY RUN Body:\n{}", email_row.body);
+            }
             return Ok(());
         }
 
+        let from = parse_lenient(&self.settings.sender_address)?;
         let mut builder = Message::builder()
-            .from(self.settings.sender_address.parse()?)
+            .from(from.clone())
             .subject(&email_row.subject);
+
+        if email_row.kind == crate::db::EmailKind::SignInLink {
+            // Mail a person receives because they just asked for it must not
+            // provoke a vacation autoresponder, and should be filable.
+            builder = builder
+                .header(AutoSubmitted("auto-generated".to_string()))
+                .header(ListId(format!("<sashiko-auth.{}>", from.email.domain())));
+        }
 
         if let Some(reply_to) = &self.settings.reply_to {
             match reply_to.parse() {
@@ -133,6 +165,40 @@ impl EmailWorker {
         Ok(())
     }
 }
+
+/// Headers lettre does not model, declared here so the builder can carry them.
+macro_rules! text_header {
+    ($name:ident, $wire:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone)]
+        struct $name(String);
+
+        impl lettre::message::header::Header for $name {
+            fn name() -> lettre::message::header::HeaderName {
+                lettre::message::header::HeaderName::new_from_ascii_str($wire)
+            }
+
+            fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Self(s.to_string()))
+            }
+
+            fn display(&self) -> lettre::message::header::HeaderValue {
+                lettre::message::header::HeaderValue::new(Self::name(), self.0.clone())
+            }
+        }
+    };
+}
+
+text_header!(
+    AutoSubmitted,
+    "Auto-Submitted",
+    "Tells autoresponders that nobody is waiting for a reply."
+);
+text_header!(
+    ListId,
+    "List-Id",
+    "Gives recipients something stable to filter transactional mail on."
+);
 
 fn parse_lenient(s: &str) -> anyhow::Result<lettre::message::Mailbox> {
     if let Some(start) = s.find('<')

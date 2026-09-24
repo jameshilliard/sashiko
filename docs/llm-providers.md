@@ -140,7 +140,8 @@ cp docs/examples/Settings.copilot-cli.toml Settings.toml
 ## AWS Bedrock
 
 Uses AWS Bedrock via the Converse API. Works with any Bedrock-hosted
-model (Claude, Llama, Mistral, etc.).
+model (Claude, Llama, Mistral, etc.). Requires building with
+`--features bedrock`.
 
 **Prerequisites:** Enable model access in the
 [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your
@@ -226,6 +227,74 @@ cp docs/examples/Settings.kiro-cli.toml Settings.toml
 - An isolated temporary agent with a deny-all hook prevents accidental
   tool execution
 
+## goose
+
+Uses [goose](https://goose-docs.ai/) as the completion backend.
+goose speaks the Agent Client Protocol on stdio, and it fronts any backend
+goose itself supports, which makes this the shortest path to a fully local
+review: goose in front of a vLLM or Ollama server.
+
+Like Sashiko, goose is a Linux Foundation project -- it sits under the
+[Agentic AI Foundation (AAIF)](https://aaif.io/).
+
+**Prerequisites:** Install `goose` and make sure the backend it points at is
+reachable.
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.goose-cli.toml Settings.toml
+```
+
+**What you get:**
+
+- Runs `goose acp` as a stateless completion backend
+- Each request gets a throwaway `XDG_CONFIG_HOME` whose `config.yaml` pins
+  goose to chat mode, so goose never runs a tool of its own and Sashiko's
+  tool protocol stays the only tool layer
+- The throwaway config also keeps the user's own goose configuration and
+  extensions out of a review
+- `XDG_DATA_HOME` and `XDG_STATE_HOME` are redirected alongside it, so the
+  session database and the logs goose writes per request are discarded with
+  the request instead of accumulating in the user's home directory, and
+  concurrent reviews never share one session database
+- Token usage is taken from goose's own `session/prompt` accounting rather
+  than estimated
+
+**Pointing goose at a local model:**
+
+```toml
+[ai]
+provider = "goose"
+model = "qwen3-8b-ov"
+
+[ai.goose_cli]
+goose_provider = "openai"
+context_window_size = 32768
+
+[ai.goose_cli.env]
+OPENAI_HOST = "http://localhost:8000"
+OPENAI_BASE_PATH = "v1/chat/completions"
+OPENAI_API_KEY = "dummy"
+```
+
+`goose_provider` accepts any goose provider id (`openai`, `ollama`,
+`anthropic`, `google`, ...). The `[ai.goose_cli.env]` table is passed to the
+goose child process; goose inherits Sashiko's environment, so exported
+variables work too and the table overrides them. Keep real API keys in
+the environment rather than in the settings file.
+
+The table cannot override the variables that make goose a completion
+backend. `GOOSE_MODE`, the three XDG directories and the model and provider
+taken from `[ai]` are pinned after it, so a stray entry cannot hand goose
+back its own tools, its own session history or the user's own
+configuration.
+
+goose prepends its own system prompt and platform tool schemas to every
+request, which costs roughly 5k tokens before Sashiko's prompt is even
+counted. Set `max_input_tokens` well below `context_window_size` so a review
+prompt plus that overhead still fits.
+
 ## Codex CLI
 
 Uses a local [Codex CLI](https://github.com/openai/codex) (OpenAI)
@@ -240,11 +309,30 @@ subscription -- no per-token charge, no API key.
 cp docs/examples/Settings.codex-cli.toml Settings.toml
 ```
 
+For OpenAI's coding-optimized model, use
+`docs/examples/Settings.gpt-5-codex.toml` instead (same backend,
+`model = "gpt-5-codex"`).
+
 **What you get:**
 
 - Runs `codex exec --json --sandbox read-only` as a stateless backend
 - Prompt sent via stdin to avoid `ARG_MAX` issues
 - No tool access -- sandbox is read-only
+
+**Reasoning effort:**
+
+```toml
+[ai.codex_cli]
+effort = "xhigh"    # "none", "minimal", "low", "medium", "high", "xhigh", "max"
+```
+
+Sashiko passes this as `codex exec -c model_reasoning_effort=<effort>`,
+so the setting applies only to a reasoning model such as `gpt-5-codex`.
+A `-c` override outranks `~/.codex/config.toml`. It does not outrank an
+enterprise-managed requirements layer, which substitutes its own value
+whatever the origin. A run whose effort that layer substitutes fails
+rather than record a review at an effort other than the one configured.
+Leave the setting unset to accept the account default.
 
 #### Devin CLI Setup
 
@@ -267,6 +355,59 @@ Copy `examples/Settings.devin-cli.toml` to your `Settings.toml` and adjust as ne
 - Each review may spawn many `devin` processes. Lower `review.concurrency`
   if you hit subscription rate limits.
 
+## Ollama
+
+[Ollama](https://ollama.com/) allows running LLMs locally.
+
+**Prerequisites:** Install Ollama and pull your desired model (e.g., `ollama pull deepseek-v3`).
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.ollama.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Support for reasoning models via the `think` setting
+- No API key or subscription required
+- `context_window_size` maps to Ollama's `num_ctx`
+
+## vLLM
+
+[vLLM](https://docs.vllm.ai/) serves local models behind an
+OpenAI-compatible API.
+
+**Prerequisites:** Start a vLLM server, e.g.:
+
+```bash
+vllm serve Qwen/Qwen3-8B --max-model-len 32768 --host 0.0.0.0 --port 8000
+```
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.vllm.toml Settings.toml
+```
+
+**What you get:**
+
+- Private, local execution of LLMs
+- Reasoning model support: `<think>` blocks and `reasoning_content` are
+  separated from the answer automatically, and thinking can be toggled via
+  the `enable_thinking` setting
+- Leaving `max_tokens` unset lets vLLM generate up to the remaining context,
+  which is useful for servers running with a small `--max-model-len`
+- Optional `guided_json` setting to enforce JSON responses through guided
+  decoding on backends that support it
+- Optional `enable_tools` setting to forward tool definitions; requires a
+  server started with `--enable-auto-tool-choice` and `--tool-call-parser`
+- If the server was started with `--api-key`, export it as `VLLM_API_KEY`
+  (or `LLM_API_KEY`)
+
+Set `context_window_size` to match the server's `--max-model-len`.
+
 ## OpenAI-Compatible Providers
 
 Sashiko includes an OpenAI-compatible provider for endpoints that
@@ -279,3 +420,53 @@ cp docs/examples/Settings.openai-compat.toml Settings.toml
 ```
 
 Adjust `base_url` to point to your provider's endpoint.
+
+`base_url` may be either:
+
+- a shorthand such as `http://localhost:8080/v1` (the `/chat/completions`
+  suffix is appended automatically), or
+- the full chat completions URL, e.g.
+  `https://api.z.ai/api/coding/paas/v4/chat/completions`. Use this form for
+  providers whose path is not a recognised shorthand.
+
+**z.ai / Zhipu (glm-*) example:**
+
+z.ai exposes two OpenAI-compatible gateways with **separate billing**: a
+direct API (`…/api/paas/v4/…`, billed to the API resource package) and a
+coding-plan gateway (`…/api/coding/paas/v4/…`, billed to the coding-plan
+subscription). To review against the coding-plan quota, point `base_url` at
+the full coding endpoint and set `LLM_API_KEY` (or `OPENAI_API_KEY`):
+
+```toml
+[ai]
+provider = "openai-compatible"
+model = "glm-5.2"
+
+[ai.openai_compat]
+base_url = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+context_window_size = 128000
+max_tokens = 16384
+```
+
+**OrcaRouter example:**
+
+[OrcaRouter](https://www.orcarouter.ai) is an OpenAI-compatible gateway to
+models from OpenAI, Anthropic, Google, and other providers behind a single
+endpoint and API key. Point `base_url` at `https://api.orcarouter.ai/v1` and
+use a namespaced model id such as `openai/gpt-4o-mini`:
+
+```toml
+[ai]
+provider = "openai-compatible"
+model = "openai/gpt-4o-mini"
+
+[ai.openai_compat]
+base_url = "https://api.orcarouter.ai/v1"
+context_window_size = 128000
+max_tokens = 16384
+```
+
+For OpenAI's own API with an API key (rather than a self-hosted
+compatible endpoint), use `docs/examples/Settings.openai-api.toml`:
+set `provider = "openai"`, `model = "gpt-5.6-sol"`, and export
+`OPENAI_API_KEY`.

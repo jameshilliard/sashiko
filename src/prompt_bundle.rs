@@ -13,15 +13,41 @@
 // limitations under the License.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use crate::project::ProjectId;
 
 include!(concat!(env!("OUT_DIR"), "/prompts_generated.rs"));
 
 const COMPLETE_MARKER: &str = ".sashiko-prompts-complete";
 
-pub fn default_kernel_prompts_path() -> Result<PathBuf> {
+/// The installed prompt directory for a project.
+///
+/// A missing directory is an error rather than a path returned anyway. Every
+/// `@include` resolves against this root and silently yields nothing when the
+/// file is absent, which is deliberate for an optional guide but would turn a
+/// project with no prompts at all into a review that runs with an empty system
+/// prompt and reports nothing.
+pub fn project_prompts_path(project: ProjectId) -> Result<PathBuf> {
     let root = install_prompt_bundle(false)?;
-    Ok(root.join("kernel"))
+    let path = root.join(project.prompt_dir());
+    if !path.is_dir() {
+        anyhow::bail!(
+            "no prompts for project {project}: expected a {} directory in the prompt bundle at {}",
+            project.prompt_dir(),
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Returns the compiled-in content of `kernel/severity.md`.
+pub fn kernel_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "kernel/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("kernel/severity.md must exist in prompt bundle")
 }
 
 pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
@@ -54,21 +80,9 @@ pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
 }
 
 pub fn prompt_bundle_root() -> Result<PathBuf> {
-    Ok(data_home()?
+    Ok(crate::utils::data_home()?
         .join("sashiko/prompts")
         .join(PROMPT_BUNDLE_REVISION))
-}
-
-fn data_home() -> Result<PathBuf> {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(data_home));
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(Path::new(&home).join(".local/share"));
-    }
-
-    Ok(std::env::current_dir()?.join(".local/share"))
 }
 
 #[cfg(test)]
@@ -82,6 +96,14 @@ mod tests {
                 .iter()
                 .any(|(path, _)| *path == "kernel/review-core.md")
         );
+    }
+
+    #[test]
+    fn test_kernel_severity_guide_not_empty() {
+        let guide = kernel_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("## Critical"));
+        assert!(guide.contains("## High"));
     }
 
     #[test]
@@ -105,6 +127,62 @@ mod tests {
             } else {
                 std::env::remove_var("XDG_DATA_HOME");
             }
+        }
+    }
+
+    #[test]
+    fn test_sashiko_prompt_bundle_integrity() {
+        let required_framing = [
+            "sashiko/review-core.md",
+            "sashiko/severity.md",
+            "sashiko/false-positive-guide.md",
+            "sashiko/prompt-injection.md",
+            "sashiko/github-summary-template.md",
+            "sashiko/subsystem/subsystem.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing framing file in bundle: {path}"
+            );
+        }
+
+        let subsystem_index = PROMPT_BUNDLE_FILES
+            .iter()
+            .find(|(p, _)| *p == "sashiko/subsystem/subsystem.md")
+            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+            .expect("sashiko/subsystem/subsystem.md must be valid UTF-8");
+
+        let mut referenced_guides = Vec::new();
+        for line in subsystem_index.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('|') && trimmed.ends_with('|') {
+                let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+                // Markdown table row: ["", "Component/Pattern", "Triggers", "File", ""]
+                if cols.len() >= 4 {
+                    let file_col = cols[cols.len() - 2];
+                    if file_col.ends_with(".md") && !file_col.contains(' ') {
+                        referenced_guides.push(file_col);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !referenced_guides.is_empty(),
+            "should parse referenced guides from subsystem.md"
+        );
+
+        for guide in referenced_guides {
+            let in_subsystem = format!("sashiko/subsystem/{guide}");
+            let in_patterns = format!("sashiko/patterns/{guide}");
+            let found = PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
+            assert!(
+                found,
+                "guide {guide} referenced in sashiko/subsystem/subsystem.md not found in bundle under subsystem/ or patterns/"
+            );
         }
     }
 }

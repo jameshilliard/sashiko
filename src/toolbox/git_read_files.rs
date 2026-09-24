@@ -14,11 +14,11 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitReadFilesTool;
 
@@ -136,16 +136,21 @@ impl GitReadFilesTool {
     ) -> Result<Value> {
         let revision_virt = context.virtualize_ref(revision);
         let revision = revision_virt.as_str();
+        // Revision and path are joined into a single argument, so a leading
+        // dash on either end makes git read the whole thing as an option
+        // rather than as a rev:path pair.
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision name: {}", revision));
+        }
         if path_str.starts_with('-') {
             return Err(anyhow!("Invalid path name: {}", path_str));
         }
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
-            .args(["show", &format!("{}:{}", revision, path_str)]);
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.args(["show", &format!("{}:{}", revision, path_str)]);
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
+        let output = capped_output(&mut cmd).await?;
+        if !output.is_usable() {
             return Err(anyhow!(
                 "git show failed to read file {} at {}: {}",
                 path_str,
@@ -163,8 +168,11 @@ impl GitReadFilesTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        let start_line = start_line.map(|s| s.clamp(1, total_lines));
-        let end_line = end_line.map(|e| e.clamp(1, total_lines));
+        // total_lines is 0 for an empty file, and clamp() panics when its
+        // lower bound exceeds its upper one. The bounds below already handle
+        // the empty case; this pre-clamp only has to avoid tripping over it.
+        let start_line = start_line.map(|s| s.clamp(1, total_lines.max(1)));
+        let end_line = end_line.map(|e| e.clamp(1, total_lines.max(1)));
 
         let (start, end) = match (start_line, end_line) {
             (Some(s), Some(e)) => (s.max(1) - 1, e.min(total_lines)),

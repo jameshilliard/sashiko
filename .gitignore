@@ -8,11 +8,17 @@
 target/
 archives/
 third_party/linux/
+third_party/sashiko/
 benchmarks/smoke-repo/
 review_trees/
 sashiko.log
 Settings.toml
+Settings.*.toml
 email_policy.toml
 *.skill
 .gemini/
 .claude/
+benchmark_results*.json
+.sashiko-local-token
+.sashiko/
+

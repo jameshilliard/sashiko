@@ -1,0 +1,18 @@
+-- Indexes the column that message-id lookups actually filter on.
+--
+-- get_patchset_summary_by_msgid and get_patchset_details_by_msgid both run
+--
+--   SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC
+--
+-- The patches table already carries UNIQUE(patchset_id, message_id), but that
+-- index leads with patchset_id, and SQLite cannot seek an index whose leading
+-- column the query does not constrain. The planner therefore fell back to
+-- SCAN patches, reading every row -- including the diff column that holds the
+-- full text of every patch ever ingested.
+--
+-- Both callers try several spellings of a message id in turn, so a lookup that
+-- finds nothing scans the table once per candidate. On a production sized
+-- database that is several gigabytes of reads for a single request that
+-- returns 404, and the whole process shares one connection, so those scans
+-- stall every other query alongside them.
+CREATE INDEX IF NOT EXISTS idx_patches_message_id ON patches(message_id);

@@ -14,11 +14,11 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitBlameTool;
 
@@ -64,14 +64,21 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
             .ok_or_else(|| anyhow!("Missing revision"))?;
         let revision_virt = context.virtualize_ref(revision_raw);
         let revision = revision_virt.as_str();
+        // The revision sits before the "--", where git still reads options, so
+        // a leading dash turns a model-chosen string into a flag. Patches come
+        // from a public list and can steer the model, so this is reachable.
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision name: {}", revision));
+        }
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
+
         let start_line = args["start_line"].as_u64();
         let end_line = args["end_line"].as_u64();
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).arg("blame");
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.arg("blame");
 
         if let (Some(s), Some(e)) = (start_line, end_line) {
             cmd.arg(format!("-L{},{}", s, e));
@@ -79,8 +86,8 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
 
         cmd.arg(revision).arg("--").arg(path_str);
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
+        let output = capped_output(&mut cmd).await?;
+        if !output.is_usable() {
             return Err(anyhow!(
                 "git blame failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()

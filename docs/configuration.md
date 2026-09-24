@@ -15,6 +15,24 @@ the [LLM Provider Configuration Guide](llm-providers.md).
 
 ## Settings.toml sections
 
+### Top-level keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `log_level` | string | `"info"` | Default log filter for the daemon (e.g. `"warn"`, `"info"`, `"debug"`). `RUST_LOG` overrides it when set, `--debug` forces `"info"`, and `sashiko review` defaults to `"warn"` regardless of this value. |
+
+### `[project]`
+
+Optional. Describes the project this configuration is for.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `kind` | string | -- | Project this file is for: `"linux"` or `"sashiko"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
+| `name` | string | `""` | Display name shown in the web UI. |
+| `description` | string | `""` | Short description shown in the web UI. |
+| `domain` | string | `""` | Public hostname used to build links to the web UI in forge comments (`https://<domain>/#/patchset/...`). Falls back to `sashiko.sashiko.dev` when empty. |
+| `attribution` | string | -- | Actor name recorded on bug discoveries. Defaults to `domain`, or `"sashiko"` when neither is set. |
+
 ### `[forge]`
 
 Optional. Controls forge (GitHub/GitLab) webhook integration.
@@ -24,7 +42,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 | `enabled` | bool | `false` | Enable forge webhook endpoint. |
 | `disable_nntp` | bool | `true` | Disable NNTP ingestion when forge is enabled. |
 | `provider` | string | -- | Forge provider: `"github"` or `"gitlab"`. |
-| `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, non-localhost requests are authenticated via signature verification. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
+| `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, requests are authenticated via signature verification, which is the only way a forge can authenticate. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
 | `api_token` | string | -- | Forge API token (for future API-based features). |
 
 > **Security:** When `Settings.toml` contains secrets, restrict file
@@ -49,6 +67,12 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 |-----|------|---------|-------------|
 | `server` | string | `"nntp.lore.kernel.org"` | NNTP server hostname. |
 | `port` | integer | `119` | NNTP server port. |
+| `tls` | bool | `false` | Wrap the session in TLS (implicit NNTPS). |
+
+Setting `tls` does not change `port`; set it to `563` as well when
+enabling NNTPS. The certificate is verified against the host trust
+store, so an internal CA must be installed there. `lore.kernel.org`
+offers no TLS-protected NNTP, so this is for internal mirrors.
 
 ### `[smtp]`
 
@@ -71,15 +95,15 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `goose`, `openai`, `openai-compatible`. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
 | `temperature` | float | `1.0` | Sampling temperature. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
-| `response_cache` | bool | `false` | Cache AI responses to disk. |
-| `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). |
+| `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |
+| `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). Entries stranded by a settings change age out on this schedule. |
 
 #### `[ai.claude]`
 
@@ -101,6 +125,14 @@ Settings for the Claude Code CLI provider (`provider = "claude-cli"`).
 |-----|------|---------|-------------|
 | `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
 
+#### `[ai.codex_cli]`
+
+Settings for the Codex CLI provider (`provider = "codex-cli"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `effort` | string | -- | Reasoning effort: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Passed as `-c model_reasoning_effort=<effort>`, which outranks `~/.codex/config.toml` but not an enterprise-managed requirements layer. A run whose effort that layer substitutes fails. |
+
 #### `[ai.gemini]`
 
 Settings for the Gemini provider (`provider = "gemini"`).
@@ -111,13 +143,13 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 #### `[ai.openai_compat]`
 
-Settings for OpenAI-compatible providers (`provider = "openai-compat"`).
+Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-compatible"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `base_url` | string | -- | API endpoint URL. |
-| `context_window_size` | integer | -- | Context window size (optional). |
-| `max_tokens` | integer | -- | Max output tokens (optional). |
+| `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
+| `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
+| `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
 
 #### `[ai.kiro_cli]`
 
@@ -129,6 +161,17 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `agent` | string | -- | Custom agent name (optional). |
 | `context_window_size` | integer | `200000` | Context window size. |
 
+#### `[ai.goose_cli]`
+
+Settings for the goose provider (`provider = "goose"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `binary` | string | `"goose"` | Path to the goose binary. |
+| `goose_provider` | string | `"openai"` | Backend goose itself talks to, passed as GOOSE_PROVIDER. |
+| `env` | table | `{}` | Environment for the goose child process, e.g. `OPENAI_HOST`. goose inherits Sashiko's environment and these entries win over it, but they cannot override the variables Sashiko pins to keep goose a completion backend (`GOOSE_MODE`, `GOOSE_MODEL`, `GOOSE_PROVIDER`, `GOOSE_CONTEXT_LIMIT`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`). |
+| `context_window_size` | integer | `128000` | Context window size. goose adds roughly 5k tokens of its own prompt, so keep `max_input_tokens` well below this. |
+
 ### `[server]`
 
 | Key | Type | Default | Description |
@@ -136,6 +179,35 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `host` | string | `"::"` | Listen address. `"::"` binds to all interfaces (IPv4 and IPv6). |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
+| `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
+| `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
+| `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |
+
+### `[server.acl]`
+
+Capability lists, matched against the address a caller signed in with. Every
+list is empty by default, which grants nothing (fail-closed). The local
+operator token covers `ingest`, `cancel` and `review` for tooling that can read
+the server's token file, so these lists are only about remote, identified
+callers.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `admins` | list | All capabilities, including root-level maintenance operations. |
+| `security` | list | Reads and comments on every bug and reads raw AI transcripts. Grants no ingest, cancel or review. |
+| `bug_reporters` | list | May file new bugs over HTTP. Empty means only admins can. |
+| `ingest` | list | May submit patches (`/api/submit`). |
+| `cancel` | list | May halt running workloads. |
+| `review` | list | May trigger AI analyses of existing patches. |
+| `blocklist` | list | Denies everything, overriding every grant above. |
+
+Each list accepts either a TOML array or a comma separated string, so a
+deployment can name its operators through the environment instead of baking
+them into the image:
+
+```bash
+SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
+```
 
 ### `[git]`
 
@@ -149,10 +221,34 @@ Optional array of additional git remotes to track.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `name` | string | -- | Remote name. |
-| `url` | string | -- | Remote URL. |
-| `check_all_branches` | bool | -- | Try all branches as baselines. |
-| `only_branches` | list | -- | Restrict to specific branches (optional). |
+| `name` | string | -- | Remote name. Required. |
+| `url` | string | -- | Remote URL. Required. |
+| `check_all_branches` | bool | -- | Try all branches as baselines. Required -- omitting it is a parse error, not a default of `false`. |
+| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` is also true, these are appended to the full branch list rather than replacing it. |
+
+Baselines are tried in order and the first one the series applies to wins.
+Custom remotes are tried after any `base-commit:` trailer and the MAINTAINERS
+subsystem heuristic, but **before** linux-next and mainline. A subsystem topic
+branch is where a series was actually developed, whereas linux-next carries a
+snapshot of that branch which lags by at least one daily build -- and shares no
+SHAs with it once the maintainer rebases.
+
+Use this to reach topic branches that the MAINTAINERS `T:` entry doesn't name.
+For example, the NFSD entry lists a tree but no branch, so the only candidate it
+yields is `cel/HEAD` (a symref to `cel/master`):
+
+```toml
+[[git.custom_remotes]]
+name = "cel"
+url = "git://git.kernel.org/pub/scm/linux/kernel/git/cel/linux.git"
+check_all_branches = false
+only_branches = ["nfsd-next", "nfsd-testing"]
+```
+
+Match `name` and `url` to a remote already in the repository when one exists.
+`ensure_remote` rewrites the URL whenever the configured one differs, so an
+`https://` URL here against a `git://` remote flips it back and forth on every
+pass.
 
 ### `[review]`
 
@@ -168,6 +264,16 @@ Optional array of additional git remotes to track.
 | `email_policy_path` | string | `"email_policy.toml"` | Path to the email policy file. |
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
+
+### `[linux_bug]`
+
+Tuning for the worker that analyses Linux kernel bugs. Both keys are
+optional; omitting the whole section uses the defaults below.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `lease_ttl_seconds` | integer | `1800` | How long a worker's claim on a bug stays valid. If the worker dies, the bug becomes claimable again once this elapses. Must exceed the longest expected analysis, or a slow run will be reclaimed and analysed twice in parallel. |
+| `max_attempts` | integer | `3` | How many analysis attempts a bug gets before it is abandoned. Abandoned bugs are never retried automatically. |
 
 ### `[subsystems]`
 
@@ -214,7 +320,7 @@ annotated example.
 | `defaults.cc` | list | `[]` | Static CC addresses. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to ignore entirely. |
 | `defaults.subject_prefixes` | list | `[]` | Subject prefix patterns to match for this scope. |
-| `defaults.embargo_hours` | integer | -- | Hours to wait before sending a review. When a patch matches multiple subsystems, the shortest configured embargo wins. |
+| `defaults.embargo_hours` | integer | -- | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. When a patch matches multiple subsystems, the shortest configured embargo wins. |
 | `defaults.send_positive_review` | bool | `false` | Send email even when no issues are found. |
 
 The email policy also supports per-subsystem overrides via
@@ -230,6 +336,29 @@ fields as `[defaults]`, plus:
 | `patchwork.email` | string | -- | Email address for email-based Patchwork notifications. |
 | `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
 | `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
+
+### Author-only delivery
+
+A subsystem can **track** a mailing list (its patches are ingested and
+reviewed) while **not pinging** that list with the review email — sending
+only to the patch author instead. This is useful for silent /
+dashboard-only lists where individual contributors want direct reviews of
+their own patches without spamming the whole list.
+
+It is achieved with the existing flags, no extra key needed:
+
+```toml
+[subsystems.drm-intel]
+lists = ["intel-xe@lists.freedesktop.org"]
+reply_all = false          # never send to the public list
+reply_to_author = true     # send the review to the patch author
+cc_individuals = false     # drop non-list individual recipients
+```
+
+The list address is still matched via `lists` (so reviews happen), but
+`reply_all = false` strips it from the outgoing recipients, leaving only
+the author. Because each review targets exactly one author, this delivers
+reviews to individual developers without pinging the list.
 
 ### Patchwork integration
 

@@ -14,12 +14,12 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use crate::toolbox::utils::format_git_grep_output;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitGrepTool;
 
@@ -81,12 +81,12 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         let count_only = args["count_only"].as_bool().unwrap_or(false);
         let is_literal = args["is_literal"].as_bool().unwrap_or(false);
 
-        if revision.starts_with('-') || pattern.starts_with('-') {
-            return Err(anyhow!("Invalid revision or pattern"));
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision: {}", revision));
         }
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).arg("grep");
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.arg("grep");
 
         if count_only {
             cmd.arg("-c");
@@ -100,7 +100,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             cmd.arg("-P");
         }
 
-        cmd.arg(pattern).arg(revision);
+        cmd.arg("-e").arg(pattern).arg(revision);
 
         if let Some(p) = path_str
             && p != "."
@@ -112,8 +112,8 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             }
         }
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
+        let output = capped_output(&mut cmd).await?;
+        if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
                 return Ok(json!({

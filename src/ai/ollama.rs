@@ -14,7 +14,6 @@
 
 // This code was based on openai.rs
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, classify_status_code,
@@ -340,37 +339,6 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
     })
 }
 
-/// Estimate token count for a request.
-fn estimate_tokens(request: &AiRequest) -> usize {
-    let mut total = 0;
-
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-
-    total
-}
-
 #[async_trait]
 impl AiProvider for OllamaClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -390,15 +358,30 @@ impl AiProvider for OllamaClient {
         translate_ollama_response(resp)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
             context_window_size: self.context_window_size,
         }
+    }
+
+    fn cache_identity(&self) -> String {
+        // All four knobs reach translate_ollama_request() from this struct
+        // rather than from the request the cache hashes.  max_tokens caps the
+        // reply, context_window_size becomes num_ctx and decides how much of
+        // the prompt the model sees, think_mode turns reasoning on, and
+        // base_url separates two daemons serving the same model name.
+        let max_tokens = self.max_tokens.to_string();
+        let context_window_size = self.context_window_size.to_string();
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("max_tokens", Some(max_tokens.as_str())),
+                ("num_ctx", Some(context_window_size.as_str())),
+                ("think_mode", self.think_mode.as_deref()),
+                ("base_url", Some(self.base_url.as_str())),
+            ],
+        )
     }
 }
 
@@ -612,29 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_tokens_basic() {
-        let request = AiRequest {
-            system: Some("System prompt".to_string()),
-            messages: vec![AiMessage {
-                role: AiRole::User,
-                content: Some("Hello world".to_string()),
-                thought: None,
-                thought_signature: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            tools: None,
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let tokens = estimate_tokens(&request);
-        assert!(tokens > 0);
-        assert!(tokens < 100);
-    }
-
-    #[test]
     fn test_translate_request_preserves_temperature() -> Result<()> {
         let request = AiRequest {
             system: None,
@@ -686,5 +646,31 @@ mod tests {
         assert_eq!(options.num_predict, Some(2048));
 
         Ok(())
+    }
+
+    fn test_client(base_url: &str, max_tokens: u32, think_mode: Option<&str>) -> OllamaClient {
+        OllamaClient::new(
+            base_url.to_string(),
+            "qwen3:32b".to_string(),
+            128_000,
+            max_tokens,
+            60,
+            think_mode.map(str::to_string),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_identity_tracks_the_knobs_outside_the_request() {
+        let base = test_client("http://localhost:11434", 2048, None);
+
+        let raised = test_client("http://localhost:11434", 65536, None);
+        assert_ne!(base.cache_identity(), raised.cache_identity());
+
+        let thinking = test_client("http://localhost:11434", 2048, Some("high"));
+        assert_ne!(base.cache_identity(), thinking.cache_identity());
+
+        let elsewhere = test_client("http://gpu-box:11434", 2048, None);
+        assert_ne!(base.cache_identity(), elsewhere.cache_identity());
     }
 }

@@ -14,14 +14,165 @@
 
 use crate::ReviewStatus;
 use crate::settings::DatabaseSettings;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use std::str::FromStr;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+/// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
+/// that have to ask the question of a row they are updating. The two must
+/// answer alike, which a test below checks.
+const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
+      OR (status IN ('Reviewed', 'Failed', 'Failed To Apply')
+          AND received_parts >= total_parts))";
+
+fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
+    get_optional_text(row, index)?
+        .ok_or_else(|| anyhow::anyhow!("database column {index} is unexpectedly NULL"))
+}
+
+fn get_optional_text(row: &libsql::Row, index: i32) -> Result<Option<String>> {
+    match row.get::<libsql::Value>(index)? {
+        libsql::Value::Null => Ok(None),
+        libsql::Value::Text(value) => Ok(Some(value)),
+        _ => bail!("database column {index} is not text or NULL"),
+    }
+}
+
+fn get_optional_integer(row: &libsql::Row, index: i32) -> Result<Option<i64>> {
+    match row.get::<libsql::Value>(index)? {
+        libsql::Value::Null => Ok(None),
+        libsql::Value::Integer(value) => Ok(Some(value)),
+        _ => bail!("database column {index} is not an integer or NULL"),
+    }
+}
+
+const PATCH_WRITE_MAX_ATTEMPTS: usize = 3;
+
+struct StoredPatchState {
+    diff: Arc<libsql::Value>,
+    git_patch_id: Option<String>,
+}
+
+enum PatchWriteOutcome {
+    Written(i64),
+    SnapshotChanged,
+}
+
+async fn get_stored_patch_state(
+    conn: &libsql::Connection,
+    patchset_id: i64,
+    message_id: &str,
+) -> Result<Option<StoredPatchState>> {
+    let mut rows = conn
+        .query(
+            "SELECT diff, git_patch_id FROM patches
+             WHERE patchset_id = ? AND message_id = ?",
+            libsql::params![patchset_id, message_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(StoredPatchState {
+        diff: Arc::new(row.get(0)?),
+        git_patch_id: get_optional_text(&row, 1)?,
+    }))
+}
+
+async fn select_git_patch_id(
+    old_patch: Option<&StoredPatchState>,
+    diff: Arc<str>,
+    git_patch_id: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(git_patch_id) = git_patch_id {
+        return Ok(Some(git_patch_id.to_owned()));
+    }
+    let Some(old_patch) = old_patch else {
+        return Ok(None);
+    };
+    let Some(old_patch_id) = old_patch.git_patch_id.clone() else {
+        return Ok(None);
+    };
+    let old_diff = Arc::clone(&old_patch.diff);
+    let unchanged = tokio::task::spawn_blocking(move || {
+        crate::compression::decompress_string_value(old_diff.as_ref())
+            .map(|old_diff| old_diff == diff.as_ref())
+    })
+    .await
+    .context("stored patch decompression task failed")??;
+
+    Ok(unchanged.then_some(old_patch_id))
+}
+
+async fn write_patch_if_unchanged(
+    conn: &libsql::Connection,
+    old_patch: Option<StoredPatchState>,
+    patchset_id: i64,
+    message_id: &str,
+    part_index: u32,
+    diff: libsql::Value,
+    git_patch_id: Option<String>,
+) -> Result<Option<(i64, bool)>> {
+    let existing_in_patchset = old_patch.is_some();
+    let mut rows = if let Some(old_patch) = old_patch {
+        let old_diff = match Arc::try_unwrap(old_patch.diff) {
+            Ok(diff) => diff,
+            Err(diff) => diff.as_ref().clone(),
+        };
+        conn.query(
+            "UPDATE patches SET part_index = ?, diff = ?, git_patch_id = ?
+             WHERE patchset_id = ? AND message_id = ?
+               AND diff IS ? AND git_patch_id IS ?
+             RETURNING id",
+            libsql::params![
+                part_index,
+                diff,
+                git_patch_id,
+                patchset_id,
+                message_id,
+                old_diff,
+                old_patch.git_patch_id
+            ],
+        )
+        .await?
+    } else {
+        conn.query(
+            "INSERT INTO patches
+                (patchset_id, message_id, part_index, diff, git_patch_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(patchset_id, message_id) DO NOTHING
+             RETURNING id",
+            libsql::params![patchset_id, message_id, part_index, diff, git_patch_id],
+        )
+        .await?
+    };
+
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.get(0))
+        .transpose()?
+        .map(|patch_id| (patch_id, existing_in_patchset)))
+}
 
 pub struct Database {
     pub conn: libsql::Connection,
+    bug_actor: String,
+    bug_tool: String,
+    bug_model: Option<String>,
+    bug_claim: Option<BugAnalysisClaim>,
+}
+
+/// Ownership of one analysis attempt, separate from its audit attribution.
+#[derive(Clone)]
+struct BugAnalysisClaim {
+    bug_id: i64,
+    owner: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +193,7 @@ pub struct PatchsetRow {
     pub message_id: Option<String>,
     pub total_parts: Option<u32>,
     pub received_parts: Option<u32>,
+    pub mailing_lists: Vec<String>,
     pub subsystems: Vec<String>,
     pub findings_low: Option<i64>,
     pub findings_medium: Option<i64>,
@@ -66,6 +218,7 @@ pub struct PatchsetRow {
 
 #[derive(Debug, Clone)]
 pub struct ReleaseReview {
+    pub id: i64,
     pub patch_id: i64,
     pub patch_message_id: String,
     pub index: i64,
@@ -73,6 +226,45 @@ pub struct ReleaseReview {
     pub summary: String,
     pub findings: Vec<serde_json::Value>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchsetReviewOutcome {
+    Clean,
+    HasFindings,
+    Incomplete,
+}
+
+const CLEAN_PATCHSET_PREDICATE: &str = "
+    EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        WHERE r.patchset_id = p.id AND r.status = 'Skipped'
+          AND r.result_description = 'Skipped AI review via --no-ai'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM patches pa
+        WHERE pa.patchset_id = p.id
+          AND COALESCE(pa.status, '') != 'Skipped'
+          AND NOT EXISTS (
+              SELECT 1 FROM reviews skipped
+              WHERE skipped.patch_id = pa.id
+                AND skipped.status = 'Skipped'
+                AND skipped.result_description = 'Skipped: touches only ignored files'
+          )
+          AND (
+              SELECT COUNT(*) FROM reviews completed
+              WHERE completed.patch_id = pa.id
+                AND completed.status = 'Reviewed'
+          ) < COALESCE(p.target_review_count, 1)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM reviews r
+        JOIN findings f ON f.review_id = r.id
+        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MessageRow {
@@ -116,8 +308,11 @@ pub struct ToolUsage {
     pub output_length: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
 pub enum Severity {
+    #[default]
+    Unknown = 0,
     Low = 1,
     Medium = 2,
     High = 3,
@@ -125,6 +320,34 @@ pub enum Severity {
 }
 
 impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Unknown => "Unknown",
+            Severity::Low => "Low",
+            Severity::Medium => "Medium",
+            Severity::High => "High",
+            Severity::Critical => "Critical",
+        }
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl Severity {
+    pub fn from_i32(val: i32) -> Self {
+        match val {
+            4 => Severity::Critical,
+            3 => Severity::High,
+            2 => Severity::Medium,
+            1 => Severity::Low,
+            _ => Severity::Unknown,
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let s = s.trim();
@@ -134,8 +357,141 @@ impl Severity {
             Severity::High
         } else if s.to_lowercase().starts_with("medium") {
             Severity::Medium
-        } else {
+        } else if s.to_lowercase().starts_with("low") {
             Severity::Low
+        } else {
+            Severity::Unknown
+        }
+    }
+}
+
+/// Triage lifecycle of a Linux kernel bug.
+///
+/// Owned by humans, the API, and the deduplication stage. Deliberately separate
+/// from [`BugPipelineState`]: re-running analysis must never be able to discard
+/// a triage decision that a person made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BugLifecycleStatus {
+    /// Recorded but not yet triaged.
+    #[default]
+    New,
+    /// Confirmed as a real, actionable defect.
+    Open,
+    /// Resolved by a fix that has landed.
+    Fixed,
+    /// Determined not to be a real defect.
+    Dismissed,
+    /// Folded into a canonical bug; implies duplicate_of_id is set.
+    Duplicate,
+    /// Closed without a fix, for example obsolete or will not fix.
+    Closed,
+}
+
+impl BugLifecycleStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BugLifecycleStatus::New => "new",
+            BugLifecycleStatus::Open => "open",
+            BugLifecycleStatus::Fixed => "fixed",
+            BugLifecycleStatus::Dismissed => "dismissed",
+            BugLifecycleStatus::Duplicate => "duplicate",
+            BugLifecycleStatus::Closed => "closed",
+        }
+    }
+
+    /// Reports whether the bug has reached a state that needs no further triage.
+    pub fn is_resolved(&self) -> bool {
+        matches!(
+            self,
+            BugLifecycleStatus::Fixed
+                | BugLifecycleStatus::Dismissed
+                | BugLifecycleStatus::Duplicate
+                | BugLifecycleStatus::Closed
+        )
+    }
+}
+
+impl std::fmt::Display for BugLifecycleStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for BugLifecycleStatus {
+    type Err = anyhow::Error;
+
+    /// Parses strictly. An unrecognised value means the row disagrees with the
+    /// CHECK constraint on the column, which is a corrupt database rather than
+    /// something to paper over with a default.
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "new" => Ok(BugLifecycleStatus::New),
+            "open" => Ok(BugLifecycleStatus::Open),
+            "fixed" => Ok(BugLifecycleStatus::Fixed),
+            "dismissed" => Ok(BugLifecycleStatus::Dismissed),
+            "duplicate" => Ok(BugLifecycleStatus::Duplicate),
+            "closed" => Ok(BugLifecycleStatus::Closed),
+            other => bail!("unknown bug lifecycle status: {other:?}"),
+        }
+    }
+}
+
+/// Execution state of the analysis pipeline for a Linux kernel bug.
+///
+/// Written exclusively by the bug worker. Crash recovery only ever touches this
+/// field, which is what keeps triage state safe across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BugPipelineState {
+    /// Waiting to be claimed by a worker.
+    #[default]
+    Pending,
+    /// Claimed by a worker holding an unexpired lease.
+    Running,
+    /// Analysis completed.
+    Succeeded,
+    /// Analysis errored and remains eligible for retry.
+    Failed,
+    /// Analysis errored too many times; never claimed again without operator action.
+    Abandoned,
+}
+
+impl BugPipelineState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BugPipelineState::Pending => "pending",
+            BugPipelineState::Running => "running",
+            BugPipelineState::Succeeded => "succeeded",
+            BugPipelineState::Failed => "failed",
+            BugPipelineState::Abandoned => "abandoned",
+        }
+    }
+
+    /// Reports whether analysis is queued or in flight, and therefore whether
+    /// the user should be told that results are still on their way.
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, BugPipelineState::Pending | BugPipelineState::Running)
+    }
+}
+
+impl std::fmt::Display for BugPipelineState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for BugPipelineState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "pending" => Ok(BugPipelineState::Pending),
+            "running" => Ok(BugPipelineState::Running),
+            "succeeded" => Ok(BugPipelineState::Succeeded),
+            "failed" => Ok(BugPipelineState::Failed),
+            "abandoned" => Ok(BugPipelineState::Abandoned),
+            other => bail!("unknown bug pipeline state: {other:?}"),
         }
     }
 }
@@ -149,9 +505,611 @@ pub struct Finding {
     pub locations: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Bug {
+    #[serde(rename = "internal_id")]
+    pub id: i64,
+    #[serde(alias = "slug")]
+    pub bugid: String,
+    pub title: String,
+    /// Triage state. See [`BugLifecycleStatus`].
+    #[serde(default)]
+    pub lifecycle_status: BugLifecycleStatus,
+    /// Analysis execution state. See [`BugPipelineState`].
+    #[serde(default)]
+    pub pipeline_state: BugPipelineState,
+    pub reporter: String,
+    pub reported_at: i64,
+    /// Email address of whoever is working on this bug, if anyone.
+    pub assignee: Option<String>,
+    pub assigned_at: Option<i64>,
+    pub discovered_in_patchset_id: Option<i64>,
+    pub discovered_in_patch_id: Option<i64>,
+    pub discovered_in_commit: Option<String>,
+    pub source_ref: Option<String>,
+    /// Deduplication embedding, joined in from bug_vectors rather than
+    /// stored on the core row. Only populated by queries that need it.
+    pub vector_json: Option<String>,
+    pub duplicate_of_id: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+
+    #[serde(default)]
+    pub subsystems: Vec<String>,
+    #[serde(default)]
+    pub enrichments: Vec<BugEnrichment>,
+}
+
+impl std::fmt::Debug for Bug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bug")
+            .field("id", &self.id)
+            .field("bugid", &self.bugid)
+            .field("title", &self.title)
+            .field("lifecycle_status", &self.lifecycle_status)
+            .field("pipeline_state", &self.pipeline_state)
+            .field("reporter", &self.reporter)
+            .field("reported_at", &self.reported_at)
+            .field("assignee", &self.assignee)
+            .field("subsystems", &self.subsystems)
+            .field("enrichments", &self.enrichments.len())
+            .field("discovered_in_patchset_id", &self.discovered_in_patchset_id)
+            .field("discovered_in_patch_id", &self.discovered_in_patch_id)
+            .field("discovered_in_commit", &self.discovered_in_commit)
+            .field("source_ref", &self.source_ref)
+            .field("duplicate_of_id", &self.duplicate_of_id)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+impl Bug {
+    #[inline]
+    pub fn slug(&self) -> &str {
+        &self.bugid
+    }
+
+    #[inline]
+    pub fn problem(&self) -> &str {
+        &self.title
+    }
+
+    pub fn severity(&self) -> Severity {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "severity_calibration"
+                && let Some(ref data) = e.data_json
+            {
+                if let Some(sev_str) = data.get("severity").and_then(|v| v.as_str()) {
+                    return Severity::from_str(sev_str);
+                }
+                if let Some(sev_int) = data.get("severity_int").and_then(|v| v.as_i64()) {
+                    return Severity::from_i32(sev_int as i32);
+                }
+            }
+        }
+        Severity::Unknown
+    }
+
+    pub fn severity_explanation(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "severity_calibration" {
+                if let Some(ref content) = e.content
+                    && !content.is_empty()
+                {
+                    return Some(content.clone());
+                }
+                if let Some(ref data) = e.data_json
+                    && let Some(exp) = data.get("explanation").and_then(|v| v.as_str())
+                {
+                    return Some(exp.to_string());
+                }
+            } else if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(refutation) = data.get("refutation_evidence").and_then(|v| v.as_str())
+            {
+                return Some(refutation.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn description(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "report"
+                && let Some(ref content) = e.content
+            {
+                return Some(content.clone());
+            }
+        }
+        None
+    }
+
+    pub fn inline_review(&self) -> String {
+        self.description().unwrap_or_default()
+    }
+
+    pub fn verified_on_sha(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(sha) = data.get("verified_on_sha").and_then(|v| v.as_str())
+            {
+                return Some(sha.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn locations(&self) -> Option<serde_json::Value> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(locs) = data.get("locations")
+                && !locs.is_null()
+            {
+                return Some(locs.clone());
+            }
+        }
+        for e in &self.enrichments {
+            if (e.kind == "candidate" || e.kind == "raw_candidate")
+                && let Some(ref data) = e.data_json
+                && let Some(locs) = data.get("locations")
+                && !locs.is_null()
+            {
+                return Some(locs.clone());
+            }
+        }
+        None
+    }
+
+    pub fn source_files(&self) -> Option<Vec<String>> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "verification"
+                && let Some(ref data) = e.data_json
+                && let Some(files) = data
+                    .get("source_files")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            {
+                return Some(files);
+            }
+        }
+        None
+    }
+
+    pub fn introduced_in_commit(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "origin_discovery" {
+                if let Some(ref data) = e.data_json
+                    && let Some(sha) = data.get("introducing_commit_sha").and_then(|v| v.as_str())
+                {
+                    if let Some(title) = data
+                        .get("introducing_commit_title")
+                        .and_then(|v| v.as_str())
+                    {
+                        return Some(format!("{} ({})", &sha[..12.min(sha.len())], title));
+                    }
+                    return Some(sha.to_string());
+                }
+                if let Some(ref content) = e.content {
+                    return Some(content.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        if self.lifecycle_status == BugLifecycleStatus::Fixed {
+            return true;
+        }
+        for e in &self.enrichments {
+            if e.kind == "fix_candidate"
+                && let Some(ref data) = e.data_json
+                && data.get("status").and_then(|v| v.as_str()) == Some("merged")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn fixed_in_commit(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "fix_candidate"
+                && let Some(ref data) = e.data_json
+                && let Some(sha) = data.get("commit_sha").and_then(|v| v.as_str())
+            {
+                return Some(sha.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn raw_input(&self) -> Option<String> {
+        for e in &self.enrichments {
+            if e.kind == "candidate" || e.kind == "raw_candidate" {
+                if let Some(ref data) = e.data_json {
+                    return serde_json::to_string(data).ok();
+                }
+                if let Some(ref content) = e.content {
+                    return Some(content.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn tokens_in(&self) -> usize {
+        self.enrichments.iter().filter_map(|e| e.tokens_in).sum()
+    }
+
+    pub fn tokens_out(&self) -> usize {
+        self.enrichments.iter().filter_map(|e| e.tokens_out).sum()
+    }
+
+    pub fn tokens_cached(&self) -> usize {
+        self.enrichments
+            .iter()
+            .filter_map(|e| e.tokens_cached)
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BugEnrichment {
+    pub id: i64,
+    pub bug_id: i64,
+    pub kind: String,
+    pub tool: String,
+    pub model: Option<String>,
+    pub author: Option<String>,
+    pub created_at: i64,
+    pub content: Option<String>,
+    pub data_json: Option<serde_json::Value>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NewBugEnrichment {
+    pub kind: String,
+    pub tool: String,
+    pub model: Option<String>,
+    pub author: Option<String>,
+    pub created_at: i64,
+    pub content: Option<String>,
+    pub data_json: Option<serde_json::Value>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+    pub logs: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewBug {
+    #[serde(alias = "slug")]
+    pub bugid: String,
+    #[serde(default = "default_bug_title", alias = "problem")]
+    pub title: String,
+    /// Defaults to New: a freshly reported bug has not been triaged yet.
+    #[serde(default)]
+    pub lifecycle_status: BugLifecycleStatus,
+    /// Defaults to Pending: a freshly reported bug is awaiting analysis.
+    #[serde(default)]
+    pub pipeline_state: BugPipelineState,
+    #[serde(default = "default_bug_reporter")]
+    pub reporter: String,
+    #[serde(default = "default_now")]
+    pub reported_at: i64,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    pub discovered_in_patchset_id: Option<i64>,
+    pub discovered_in_patch_id: Option<i64>,
+    pub discovered_in_commit: Option<String>,
+    pub source_ref: Option<String>,
+    pub vector_json: Option<String>,
+    pub duplicate_of_id: Option<i64>,
+    #[serde(default)]
+    pub subsystems: Vec<AttributedSubsystem>,
+}
+
+/// Where a subsystem name attached to a bug came from.
+///
+/// Only [`SubsystemSource::MaintainersSection`] identifies a real kernel
+/// maintainer, so only that variant can confer access to a bug. The other two
+/// are useful for display and filtering and confer nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubsystemSource {
+    /// A section title matched out of the kernel MAINTAINERS file.
+    MaintainersSection,
+    /// A directory prefix derived from the touched paths, or the `kernel`
+    /// sentinel used when nothing more specific could be determined.
+    PathPrefix,
+    /// Supplied verbatim by whoever filed the bug. The default, because a name
+    /// of unknown origin must not be mistaken for a maintainer's jurisdiction.
+    #[default]
+    CallerSupplied,
+}
+
+impl SubsystemSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MaintainersSection => "maintainers_section",
+            Self::PathPrefix => "path_prefix",
+            Self::CallerSupplied => "caller_supplied",
+        }
+    }
+
+    /// Parses a stored value, treating anything unrecognised as caller
+    /// supplied so that an unexpected string cannot widen access.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "maintainers_section" => Self::MaintainersSection,
+            "path_prefix" => Self::PathPrefix,
+            _ => Self::CallerSupplied,
+        }
+    }
+
+    /// Whether a row with this provenance can grant a maintainer access to the
+    /// bug it is attached to.
+    pub fn confers_authority(&self) -> bool {
+        matches!(self, Self::MaintainersSection)
+    }
+}
+
+/// Attaches a subsystem to a bug, refreshing the provenance when the pair is
+/// already present. Rewriting the provenance matters: a name that used to be
+/// caller supplied and is later matched out of MAINTAINERS has to start
+/// conferring authority, and a name that stops matching has to stop.
+const UPSERT_BUG_SUBSYSTEM_SQL: &str = "INSERT INTO bug_subsystems (bug_id, subsystem, source) \
+     VALUES (?, ?, ?) \
+     ON CONFLICT(bug_id, subsystem) DO UPDATE SET source = excluded.source";
+
+/// The same statement for a patchset. Separate rather than generic over the
+/// table name, because building this SQL by interpolation would put a table
+/// name into a string that already carries a column named `source`, and the
+/// one thing that must never be interpolated here is which table decides who
+/// may read a transcript.
+const UPSERT_PATCHSET_SECTION_SQL: &str = "INSERT INTO patchset_maintainer_sections (patchset_id, subsystem, source) \
+     VALUES (?, ?, ?) \
+     ON CONFLICT(patchset_id, subsystem) DO UPDATE SET source = excluded.source";
+
+/// A subsystem name together with the provenance of that name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttributedSubsystem {
+    pub name: String,
+    pub source: SubsystemSource,
+}
+
+impl AttributedSubsystem {
+    pub fn new(name: impl Into<String>, source: SubsystemSource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+        }
+    }
+
+    /// A name matched out of MAINTAINERS, which is the only kind that grants
+    /// a maintainer authority over the bug.
+    pub fn from_maintainers(name: impl Into<String>) -> Self {
+        Self::new(name, SubsystemSource::MaintainersSection)
+    }
+
+    /// A directory prefix or sentinel derived from the touched paths.
+    pub fn from_path_prefix(name: impl Into<String>) -> Self {
+        Self::new(name, SubsystemSource::PathPrefix)
+    }
+}
+
+/// Accepts either a bare string or an object. A bare string is recorded as
+/// caller supplied, which is the fail-closed reading of a name whose origin
+/// was never stated.
+impl<'de> Deserialize<'de> for AttributedSubsystem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(String),
+            Attributed {
+                name: String,
+                #[serde(default)]
+                source: SubsystemSource,
+            },
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Bare(name) => Self::new(name, SubsystemSource::CallerSupplied),
+            Repr::Attributed { name, source } => Self::new(name, source),
+        })
+    }
+}
+
+fn default_bug_title() -> String {
+    String::new()
+}
+
+fn default_bug_reporter() -> String {
+    "sashiko".to_string()
+}
+
+fn default_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Canonical projection for reads of a core bug row.
+///
+/// Every query whose rows are handed to `Database::parse_bug_row_core` must
+/// select exactly these columns, in this order. Keeping the list in one place
+/// is what stops a new query from silently shifting the column indices.
+///
+/// The deduplication embedding is intentionally absent: it lives in
+/// bug_vectors and is only fetched by the dedup path, so ordinary reads
+/// never carry the blob.
+/// Renders the summary of a bug as it appears embedded in a patchset or review
+/// payload.
+///
+/// Shared by both callers so that the two views cannot drift apart. Both
+/// previously omitted the bug's state entirely, which left the badge on the
+/// patchset detail card permanently reading Open regardless of the bug's
+/// actual triage or analysis state.
+fn bug_reference_json(bug: &Bug, is_newly_discovered: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": bug.id,
+        "bugid": bug.bugid,
+        "slug": bug.bugid,
+        "problem": bug.problem(),
+        "severity": bug.severity().as_str(),
+        "subsystems": bug.subsystems,
+        "subsystem": bug.subsystems.first().cloned(),
+        "inline_review": bug.inline_review(),
+        "is_newly_discovered": is_newly_discovered,
+        "created_at": bug.created_at,
+        "lifecycle_status": bug.lifecycle_status.as_str(),
+        "pipeline_state": bug.pipeline_state.as_str(),
+        "is_fixed": bug.is_fixed(),
+        "assignee": bug.assignee,
+    })
+}
+
+const BUG_ROW_COLUMNS: &str = "id, bugid, title, lifecycle_status, pipeline_state,
+     reporter, reported_at, assignee, assigned_at,
+     discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit,
+     source_ref, duplicate_of_id, created_at, updated_at";
+
+#[derive(Default, Debug, Clone)]
+pub struct UpdateBugOutcomeParams<'a> {
+    /// Triage verdict reached by the analysis. Execution failures are reported
+    /// through `Database::fail_bug_analysis` instead, so that a crashed run can
+    /// never be mistaken for a triage decision.
+    pub lifecycle_status: BugLifecycleStatus,
+    pub problem: Option<&'a str>,
+    pub subsystems: Option<&'a [AttributedSubsystem]>,
+    pub source_files: Option<&'a [String]>,
+    pub locations: Option<&'a serde_json::Value>,
+    pub severity: Severity,
+    pub severity_explanation: Option<&'a str>,
+    pub inline_review: &'a str,
+    pub logs: Option<&'a str>,
+    pub vector_json: Option<&'a str>,
+    pub introduced_in_commit: Option<&'a str>,
+    pub verified_on_sha: Option<&'a str>,
+    pub is_fixed: bool,
+    pub fixed_in_commit: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct MarkDuplicateBugParams<'a> {
+    /// Automatic analysis may only fold a bug that has not been triaged.
+    pub preserve_triage: bool,
+    pub ephemeral_id: i64,
+    pub canonical_id: i64,
+    pub reasoning: &'a str,
+    pub logs: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+}
+
+/// Which bugs a listing may return.
+///
+/// The default is the empty scope rather than everything: a caller that forgets
+/// to say what the principal may see gets nothing back, so widening access has
+/// to be written down deliberately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BugVisibility<'a> {
+    /// Every bug. For Sashiko operators, the kernel security list, and
+    /// maintainers of a section that claims the whole tree.
+    Unrestricted,
+    /// Only bugs that the MAINTAINERS file attributes to one of these section
+    /// titles. Matching is ASCII case-insensitive, and rows attributed by a
+    /// directory prefix or by the caller are never matched.
+    Sections(&'a [String]),
+}
+
+impl Default for BugVisibility<'_> {
+    fn default() -> Self {
+        BugVisibility::Sections(&[])
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListBugsParams<'a> {
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+    pub min_severity: Option<Severity>,
+    pub subsystem: Option<&'a str>,
+    pub subsystems: Option<&'a [String]>,
+    pub lifecycle_status: Option<BugLifecycleStatus>,
+    pub pipeline_state: Option<BugPipelineState>,
+    pub assignee: Option<AssigneeFilter<'a>>,
+    pub search: Option<&'a str>,
+    pub sort_by: Option<&'a str>,
+    pub sort_order: Option<&'a str>,
+    /// What the calling principal is allowed to see. Applied on top of every
+    /// other filter, so a subsystem filter can only ever narrow the result.
+    pub visibility: BugVisibility<'a>,
+}
+
+/// Selects bugs by who they are assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssigneeFilter<'a> {
+    /// Only bugs nobody has picked up.
+    Unassigned,
+    /// Only bugs assigned to this exact address.
+    Is(&'a str),
+}
+
+/// What an outbox row is for.
+///
+/// Review notifications and transactional mail share a transport but differ in
+/// how they are deduplicated, rate limited and observed, so the purpose is
+/// carried explicitly rather than inferred from whether a patch is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmailKind {
+    /// A review result or a patchwork notification, tied to a patch.
+    #[default]
+    ReviewNotification,
+    /// A sign-in link, tied to a person.
+    SignInLink,
+}
+
+impl EmailKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmailKind::ReviewNotification => "review_notification",
+            EmailKind::SignInLink => "sign_in_link",
+        }
+    }
+
+    /// Reads a stored value.
+    ///
+    /// A value written by a newer binary is reported as a review notification,
+    /// which is the treatment that adds no headers and grants no exemption, so
+    /// an unrecognized row is delivered plainly rather than dropped.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "sign_in_link" => EmailKind::SignInLink,
+            "review_notification" => EmailKind::ReviewNotification,
+            other => {
+                tracing::warn!("Unrecognized email kind {:?}, treating as review", other);
+                EmailKind::ReviewNotification
+            }
+        }
+    }
+}
+
 pub struct EmailOutboxRow {
     pub id: i64,
     pub patch_id: Option<i64>,
+    pub kind: EmailKind,
     pub status: String,
     pub to_addresses: String,
     pub cc_addresses: String,
@@ -180,7 +1138,108 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForgeOutboxRow {
+    pub id: i64,
+    pub patchset_id: i64,
+    pub provider: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub head_sha: Option<String>,
+    pub body: String,
+    pub target_url: String,
+    pub status: String,
+    pub retry_count: i64,
+    pub next_retry_at: Option<i64>,
+    pub locked_at: Option<i64>,
+    pub error_log: Option<String>,
+    pub created_at: i64,
+}
+
 impl Database {
+    pub fn has_bug_actor(&self) -> bool {
+        self.bug_actor != "system" || self.bug_tool != "sashiko"
+    }
+
+    pub fn bug_actor(&self) -> &str {
+        &self.bug_actor
+    }
+
+    pub fn bug_tool(&self) -> &str {
+        &self.bug_tool
+    }
+
+    pub fn bug_model(&self) -> Option<&str> {
+        self.bug_model.as_deref()
+    }
+
+    /// Attribution is scoped to this handle, never shared mutable connection state.
+    pub fn with_bug_actor(&self, author: &str, tool: &str, model: Option<String>) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            bug_actor: author.into(),
+            bug_tool: tool.into(),
+            bug_model: model,
+            bug_claim: self.bug_claim.clone(),
+        }
+    }
+
+    /// Keeps attribution attached to writes performed inside a transaction.
+    fn with_connection(&self, conn: libsql::Connection) -> Self {
+        Self {
+            conn,
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+            bug_claim: self.bug_claim.clone(),
+        }
+    }
+
+    /// Binds analysis writes to the exact attempt that claimed this bug.
+    pub fn with_bug_claim(&self, bug_id: i64, owner: &str) -> Self {
+        let mut scoped = self.with_connection(self.conn.clone());
+        scoped.bug_claim = Some(BugAnalysisClaim {
+            bug_id,
+            owner: owner.into(),
+        });
+        scoped
+    }
+
+    /// Checks ownership under the same write lock as the ensuing mutation.
+    async fn begin_bug_write(&self, bug_id: i64) -> Result<libsql::Transaction> {
+        if self
+            .bug_claim
+            .as_ref()
+            .is_some_and(|claim| claim.bug_id != bug_id)
+        {
+            bail!("Analysis claim belongs to a different bug");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        if let Some(claim) = &self.bug_claim {
+            let held = {
+                let mut rows = tx
+                    .query(
+                        "SELECT 1 FROM bugs WHERE id = ? AND locked_by = ?
+                     AND lease_expires_at >= ? AND pipeline_state IN ('running', 'succeeded')",
+                        libsql::params![
+                            claim.bug_id,
+                            claim.owner.as_str(),
+                            chrono::Utc::now().timestamp()
+                        ],
+                    )
+                    .await?;
+                rows.next().await?.is_some()
+            };
+            if !held {
+                bail!("Bug analysis lease is no longer held");
+            }
+        }
+        Ok(tx)
+    }
+
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
             .conn
@@ -212,12 +1271,12 @@ impl Database {
                 row.get::<Option<String>>(4).ok().flatten(),
                 row.get::<Option<String>>(5).ok().flatten(),
                 row.get::<Option<i64>>(6).ok().flatten(),
-                row.get::<Option<String>>(7).ok().flatten(),
+                crate::compression::get_compressed_string_opt(&row, 7).unwrap_or(None),
                 row.get::<Option<String>>(8).ok().flatten(),
                 row.get::<Option<String>>(9).ok().flatten(),
                 row.get::<Option<String>>(10).ok().flatten(),
                 row.get::<Option<String>>(11).ok().flatten(),
-                row.get::<Option<String>>(12).ok().flatten(),
+                crate::compression::get_compressed_string_opt(&row, 12).unwrap_or(None),
                 row.get::<Option<String>>(13).ok().flatten(),
             ))
         } else {
@@ -313,39 +1372,91 @@ impl Database {
         }
     }
 
+    pub fn get_msgid_candidates(msg_id: &str) -> Vec<String> {
+        let trimmed = msg_id.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidates = vec![trimmed.to_string()];
+
+        let clean = trimmed.trim_matches(['<', '>']);
+        if clean != trimmed {
+            candidates.push(clean.to_string());
+        } else {
+            candidates.push(format!("<{}>", clean));
+        }
+
+        if let Some(stripped) = clean.strip_suffix("@sashiko.local") {
+            if !stripped.is_empty() {
+                candidates.push(stripped.to_string());
+                candidates.push(format!("<{}>", stripped));
+            }
+        } else {
+            candidates.push(format!("{}@sashiko.local", clean));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|c| seen.insert(c.clone()));
+        candidates
+    }
+
+    /// Resolve a message id to the patchset it names.
+    ///
+    /// Two patchsets answering to one message id is a state the database
+    /// should not be in, and a repair migration clears the rows that reached
+    /// it. The lookup still has to answer while such a row exists, so it
+    /// takes the first claimant: a message id is claimed by the series that
+    /// sent it before any later series can borrow it.
+    ///
+    /// A message id that names no cover letter is looked up as a patch, which
+    /// is how the parts of a series without a cover letter resolve. A patch
+    /// can sit in two patchsets while the database is in that state, so that
+    /// lookup takes the first claimant as well.
+    pub async fn find_patchset_id_by_msgid(&self, msg_id: &str) -> Result<Option<i64>> {
+        let candidates = Self::get_msgid_candidates(msg_id);
+
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
+                     ORDER BY id ASC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(Some(row.get(0)?));
+            }
+        }
+
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ?
+                     ORDER BY id ASC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(Some(row.get(0)?));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub async fn get_patchset_details_by_msgid(
         &self,
         msg_id: &str,
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        // 1. Try to find a patchset where this is the cover letter
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+        match self.find_patchset_id_by_msgid(msg_id).await? {
+            Some(id) => self.get_patchset_details(id, page, limit).await,
+            None => Ok(None),
         }
-
-        // 2. Fallback: Find a patchset that contains this message as a patch
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
-        }
-
-        Ok(None)
     }
 
     pub async fn get_message_body(&self, msg_id: &str) -> Result<Option<String>> {
@@ -358,7 +1469,8 @@ impl Database {
             .await?;
 
         if let Ok(Some(row)) = rows.next().await {
-            let body: Option<String> = row.get(0).ok();
+            let body: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 0).unwrap_or(None);
             if let Some(b) = body
                 && !b.is_empty()
             {
@@ -415,224 +1527,278 @@ impl Database {
             .await?
             .next()
             .await;
+        // Foreign keys are off by default in SQLite and must be re-enabled per
+        // connection. Without this every ON DELETE CASCADE in the schema is
+        // inert and orphaned child rows accumulate silently.
+        conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            bug_actor: "system".into(),
+            bug_tool: "sashiko".into(),
+            bug_model: None,
+            bug_claim: None,
+        })
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let schema = include_str!("schema.sql");
-        self.conn.execute_batch(schema).await?;
+        let current_version: u32 = {
+            let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
+            if let Some(row) = rows.next().await? {
+                row.get(0).unwrap_or(0)
+            } else {
+                0
+            }
+        };
 
-        // Consolidate 'Applying' and 'In Review' states
-        let _ = self
+        if current_version < 1 {
+            info!("Applying database migration version 1 (initial)...");
+            let schema = include_str!("migrations/001_initial.sql");
+            self.conn.execute_batch(schema).await?;
+            self.conn.execute("PRAGMA user_version = 1", ()).await?;
+        }
+
+        if current_version < 2 {
+            info!("Applying database migration version 2 (bugs)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/002_bugs.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 2", ()).await?;
+            tx.commit().await?;
+        }
+
+        if current_version < 3 {
+            info!("Applying database migration version 3 (email outbox kind)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/003_email_outbox_kind.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 3", ()).await?;
+            tx.commit().await?;
+        }
+
+        // Transition legacy linux_bug* tables from intermediate branch states if present.
+        let has_legacy_linux_bugs = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'linux_bugs'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if has_legacy_linux_bugs {
+            info!("Dropping legacy linux_bug* tables and applying bugs schema...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS linux_bug_vectors;
+                 DROP TABLE IF EXISTS linux_bug_reviews;
+                 DROP TABLE IF EXISTS linux_bug_subsystems;
+                 DROP TABLE IF EXISTS linux_bug_enrichments;
+                 DROP TABLE IF EXISTS linux_bugs;",
+            )
+            .await?;
+            tx.execute_batch(include_str!("migrations/002_bugs.sql"))
+                .await?;
+            tx.commit().await?;
+        }
+
+        let has_bugs = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bugs'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if !has_bugs {
+            info!("Applying database migration (bugs)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/002_bugs.sql"))
+                .await?;
+            tx.commit().await?;
+        }
+
+        // Version 4 runs after the compatibility blocks above rather than in
+        // sequence with the others, because it rewrites rows in the bugs table
+        // and those blocks are what create that table for databases left in an
+        // intermediate branch state.
+        if current_version < 4 {
+            info!("Applying database migration version 4 (retire folded bug pipelines)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!(
+                "migrations/004_retire_folded_bug_pipelines.sql"
+            ))
+            .await?;
+            tx.execute("PRAGMA user_version = 4", ()).await?;
+            tx.commit().await?;
+        }
+
+        // Built outside a transaction. CREATE INDEX on the patches table walks
+        // every row, and on a production sized database that is long enough
+        // that holding a write transaction open for it would stall the single
+        // shared connection for the duration.
+        if current_version < 5 {
+            info!("Applying database migration version 5 (index patches by message id)...");
+            self.conn
+                .execute_batch(include_str!("migrations/005_index_patches_message_id.sql"))
+                .await?;
+            self.conn.execute("PRAGMA user_version = 5", ()).await?;
+        }
+
+        if current_version < 6 {
+            info!("Applying database migration version 6 (repair borrowed series names)...");
+            let tx = self.conn.transaction().await?;
+            Self::repair_borrowed_series_names(&tx).await?;
+            tx.execute("PRAGMA user_version = 6", ()).await?;
+            tx.commit().await?;
+        }
+
+        if current_version < 7 {
+            info!("Applying database migration version 7 (fold shadow cover rows)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/007_fold_shadow_cover_rows.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 7", ()).await?;
+            tx.commit().await?;
+        }
+
+        if current_version < 8 {
+            info!("Applying database migration version 8 (meta table)...");
+            self.conn
+                .execute_batch(include_str!("migrations/008_meta_table.sql"))
+                .await?;
+            self.conn.execute("PRAGMA user_version = 8", ()).await?;
+        }
+
+        if current_version < 9 {
+            info!("Applying database migration version 9 (patchset maintainer sections)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!(
+                "migrations/009_patchset_maintainer_sections.sql"
+            ))
+            .await?;
+            tx.execute("PRAGMA user_version = 9", ()).await?;
+            tx.commit().await?;
+        }
+
+        if current_version < 10 {
+            info!("Applying database migration version 10 (forge outbox)...");
+            self.conn
+                .execute_batch(include_str!(
+                    "migrations/009_patchset_maintainer_sections.sql"
+                ))
+                .await?;
+            self.conn
+                .execute_batch(include_str!("migrations/010_forge_outbox.sql"))
+                .await?;
+            self.conn.execute("PRAGMA user_version = 10", ()).await?;
+        }
+
+        if current_version < 11 {
+            info!("Applying database migration version 11 (index patchsets mr_number)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/011_index_patchsets_mr_number.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 11", ()).await?;
+            tx.commit().await?;
+        }
+
+        // Builds predating the numbered migration may already have this
+        // column while still reporting an older schema version. Creating the
+        // index outside a transaction also avoids holding a write transaction
+        // while SQLite walks the potentially large patches table.
+        if current_version < 12 {
+            info!("Applying database migration version 12 (Git patch IDs)...");
+            let has_git_patch_id = {
+                let mut columns = self.conn.query("PRAGMA table_info(patches)", ()).await?;
+                let mut found = false;
+                while let Some(row) = columns.next().await? {
+                    let name: String = row.get(1)?;
+                    found |= name == "git_patch_id";
+                }
+                found
+            };
+            if has_git_patch_id {
+                self.conn
+                    .execute(
+                        "CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id
+                         ON patches(git_patch_id)",
+                        (),
+                    )
+                    .await?;
+            } else {
+                self.conn
+                    .execute_batch(include_str!("migrations/012_git_patch_id.sql"))
+                    .await?;
+            }
+            self.conn.execute("PRAGMA user_version = 12", ()).await?;
+        }
+
+        info!("Database schema is up to date at version 12.");
+
+        Ok(())
+    }
+
+    /// Repeats the borrowed name repair until it stops rewriting rows.
+    ///
+    /// A pass moves a series onto its own first patch only while no other
+    /// patchset holds that name, and the statement matches rows against the
+    /// table as it stood when the pass began. A series whose honest name is
+    /// held by a borrower therefore has to wait for the pass after the one
+    /// that moves the borrower away.
+    ///
+    /// Each rewritten row ends up named after one of its own patches, which
+    /// is the one thing the statement will not rewrite, so the work left
+    /// strictly shrinks and the repetition ends. The bound only guards
+    /// against that reasoning being broken by a later edit to the statement.
+    async fn repair_borrowed_series_names(tx: &libsql::Transaction) -> Result<()> {
+        const MAX_PASSES: u32 = 16;
+        let repair = include_str!("migrations/006_repair_borrowed_series_names.sql");
+
+        for pass in 1..=MAX_PASSES {
+            let renamed = tx.execute(repair, ()).await?;
+            if renamed == 0 {
+                return Ok(());
+            }
+            info!("Migration version 6 pass {pass} renamed {renamed} series.");
+        }
+
+        // A repair that will not settle leaves names no worse than it found
+        // them, because every row it touched now answers to one of its own
+        // patches. Refusing to start the server over that would cost more
+        // than the handful of rows left behind.
+        warn!("Repair of borrowed series names did not settle in {MAX_PASSES} passes.");
+        Ok(())
+    }
+
+    /// Ensures the database is stamped for `project`, preventing two instances
+    /// configured for different projects from sharing the same SQLite database.
+    pub async fn ensure_project_stamp(&self, project: crate::project::ProjectId) -> Result<()> {
+        let mut rows = self
             .conn
+            .query("SELECT value FROM meta WHERE key = 'project'", ())
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let existing: String = row.get(0)?;
+            if existing != project.as_str() {
+                anyhow::bail!(
+                    "database project mismatch: database is stamped for project '{}', but this instance is configured for project '{}'. Each project instance must use its own database file.",
+                    existing,
+                    project
+                );
+            }
+            return Ok(());
+        }
+
+        self.conn
             .execute(
-                "UPDATE patchsets SET status = 'In Review' WHERE status = 'Applying'",
-                (),
+                "INSERT INTO meta (key, value) VALUES ('project', ?1)",
+                libsql::params![project.as_str()],
             )
-            .await;
-        let _ = self
-            .conn
-            .execute(
-                "UPDATE reviews SET status = 'In Review' WHERE status = 'Applying'",
-                (),
-            )
-            .await;
-
-        // Manual migrations for existing tables
-        let _ = self
-            .try_add_column("messages", "to_recipients", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("messages", "cc_recipients", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("messages", "git_blob_hash", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("messages", "mailing_list", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("messages", "references_hdr", "TEXT")
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_patchsets_cover_message_id",
-                "patchsets",
-                "cover_letter_message_id",
-            )
-            .await;
-        let _ = self.try_add_column("patches", "status", "TEXT").await;
-        let _ = self.try_add_column("patches", "apply_error", "TEXT").await;
-        let _ = self.try_add_column("reviews", "provider", "TEXT").await;
-        let _ = self
-            .try_add_column("reviews", "prompts_git_hash", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("reviews", "result_description", "TEXT")
-            .await;
-        let _ = self.try_add_column("reviews", "status", "TEXT").await;
-        let _ = self.try_add_column("reviews", "logs", "TEXT").await;
-        let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
-        let _ = self
-            .try_add_column("reviews", "inline_review", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("patchsets", "baseline_id", "INTEGER")
-            .await;
-        let _ = self
-            .try_add_column("patchsets", "failed_reason", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("patchsets", "skip_filters", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("patchsets", "only_filters", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("patchsets", "target_review_count", "INTEGER DEFAULT 1")
-            .await;
-        let _ = self.try_add_column("patchsets", "model_name", "TEXT").await;
-        let _ = self
-            .try_add_column("patchsets", "prompts_git_hash", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("patchsets", "baseline_logs", "TEXT")
-            .await;
-        let _ = self.try_add_column("patchsets", "provider", "TEXT").await;
-        let _ = self
-            .try_add_column("patchsets", "embargo_until", "INTEGER")
-            .await;
-        let _ = self.try_add_column("patchsets", "slug", "TEXT").await;
-        let _ = self
-            .conn
-            .execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_patchsets_slug ON patchsets(slug) WHERE slug IS NOT NULL",
-                (),
-            )
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_patchsets_status_embargo_until",
-                "patchsets",
-                "status, embargo_until",
-            )
-            .await;
-        let _ = self.try_add_column("patchsets", "mr_url", "TEXT").await;
-        let _ = self.try_add_column("patchsets", "mr_title", "TEXT").await;
-        let _ = self
-            .try_add_column("patchsets", "mr_number", "INTEGER")
-            .await;
-
-        let _ = self
-            .conn
-            .execute(
-                "CREATE TABLE IF NOT EXISTS tool_usages (
-                    id INTEGER PRIMARY KEY,
-                    review_id INTEGER NOT NULL,
-                    provider TEXT,
-                    model TEXT,
-                    tool_name TEXT,
-                    arguments TEXT,
-                    output_length INTEGER,
-                    created_at INTEGER,
-                    FOREIGN KEY(review_id) REFERENCES reviews(id)
-                )",
-                (),
-            )
-            .await;
-        let _ = self
-            .try_create_index("idx_tool_usages_review", "tool_usages", "review_id")
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_ai_interactions_tokens",
-                "ai_interactions",
-                "id, tokens_in, tokens_out, tokens_cached",
-            )
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_reviews_grouping",
-                "reviews",
-                "provider, model, status, interaction_id",
-            )
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_tool_usages_stats",
-                "tool_usages",
-                "provider, model, tool_name, output_length",
-            )
-            .await;
-
-        // Manual migration for messages_mailing_lists
-        let _ = self
-            .conn
-            .execute(
-                "CREATE TABLE IF NOT EXISTS messages_mailing_lists (
-                    message_id INTEGER NOT NULL,
-                    mailing_list_id INTEGER NOT NULL,
-                    PRIMARY KEY (message_id, mailing_list_id),
-                    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
-                    FOREIGN KEY(mailing_list_id) REFERENCES mailing_lists(id) ON DELETE CASCADE
-                )",
-                (),
-            )
-            .await;
-
-        // Backfill messages_mailing_lists from messages.mailing_list
-        let _ = self
-            .conn
-            .execute(
-                "INSERT OR IGNORE INTO messages_mailing_lists (message_id, mailing_list_id)
-                 SELECT m.id, ml.id
-                 FROM messages m
-                 JOIN mailing_lists ml ON m.mailing_list = ml.nntp_group
-                 WHERE m.mailing_list IS NOT NULL",
-                (),
-            )
-            .await;
-
-        // Findings table migration
-        let _ = self
-            .try_add_column("findings", "severity_explanation", "TEXT")
-            .await;
-        let _ = self
-            .try_add_column("findings", "preexisting", "INTEGER")
-            .await;
-        let _ = self.try_add_column("findings", "locations", "TEXT").await;
-        // Ignore errors for these as they might fail on new DBs or if already migrated
-        let _ = self
-            .conn
-            .execute("ALTER TABLE findings RENAME COLUMN message TO problem", ())
-            .await;
-        let _ = self
-            .conn
-            .execute("ALTER TABLE findings DROP COLUMN file_path", ())
-            .await;
-        let _ = self
-            .conn
-            .execute("ALTER TABLE findings DROP COLUMN line_number", ())
-            .await;
-
-        let _ = self
-            .try_create_index("idx_patchsets_date", "patchsets", "date DESC")
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_reviews_patchset_status",
-                "reviews",
-                "patchset_id, status",
-            )
-            .await;
-        let _ = self
-            .try_create_index(
-                "idx_reviews_day",
-                "reviews",
-                "strftime('%Y-%m-%d', created_at, 'unixepoch'), status",
-            )
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -791,7 +1957,11 @@ impl Database {
             self.conn
                 .execute(
                     "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                    libsql::params![status, l, review_id],
+                    libsql::params![
+                        status,
+                        crate::compression::compress_string_if_needed(l),
+                        review_id
+                    ],
                 )
                 .await?;
         } else {
@@ -819,7 +1989,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
             )
             .await?;
         Ok(())
@@ -835,8 +2005,8 @@ impl Database {
                 params.workflow_id,
                 params.provider,
                 params.model,
-                params.input,
-                params.output,
+                crate::compression::compress_string_if_needed(params.input),
+                crate::compression::compress_string_if_needed(params.output),
                 params.tokens_in,
                 params.tokens_out,
                 params.tokens_cached,
@@ -886,7 +2056,7 @@ impl Database {
     }
 
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
-        let preexisting_val = finding.preexisting.map(|b| if b { 1 } else { 0 });
+        let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
         let locations_val = finding
             .locations
             .as_ref()
@@ -900,12 +2070,2188 @@ impl Database {
                     finding.severity as i32,
                     finding.severity_explanation,
                     finding.problem,
-                    preexisting_val,
+                    val,
                     locations_val,
                 ],
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn create_bug(&self, bug: &NewBug) -> Result<i64> {
+        self.create_bug_with_enrichment(bug, None).await
+    }
+
+    /// Queue the candidate and its original evidence atomically so a worker cannot
+    /// pick up a raw bug before its discovery record has been saved.
+    pub async fn create_bug_with_enrichment(
+        &self,
+        bug: &NewBug,
+        enrichment: Option<&NewBugEnrichment>,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction().await?;
+        let scoped = self.with_connection((*tx).clone());
+        let id = scoped.insert_bug(bug).await?;
+        if let Some(enrichment) = enrichment {
+            scoped.add_bug_enrichment(id, enrichment).await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn insert_bug(&self, bug: &NewBug) -> Result<i64> {
+        let now = if bug.reported_at > 0 {
+            bug.reported_at
+        } else {
+            chrono::Utc::now().timestamp()
+        };
+        let assignee = bug
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let assigned_at = assignee.as_ref().map(|_| now);
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO bugs (
+                    bugid, title, lifecycle_status, pipeline_state, reporter, reported_at,
+                    assignee, assigned_at,
+                    discovered_in_patchset_id, discovered_in_patch_id,
+                    discovered_in_commit, source_ref, duplicate_of_id,
+                    created_at, updated_at, audit_author, audit_tool, audit_model
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 RETURNING id",
+                libsql::params![
+                    bug.bugid.as_str(),
+                    bug.title.as_str(),
+                    bug.lifecycle_status.as_str(),
+                    bug.pipeline_state.as_str(),
+                    bug.reporter.as_str(),
+                    now,
+                    assignee,
+                    assigned_at,
+                    bug.discovered_in_patchset_id,
+                    bug.discovered_in_patch_id,
+                    bug.discovered_in_commit.clone(),
+                    bug.source_ref.clone(),
+                    bug.duplicate_of_id,
+                    now,
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                ],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            for sub in &bug.subsystems {
+                let trimmed = sub.name.trim();
+                if !trimmed.is_empty() {
+                    self.conn
+                        .execute(
+                            UPSERT_BUG_SUBSYSTEM_SQL,
+                            libsql::params![id, trimmed, sub.source.as_str()],
+                        )
+                        .await?;
+                }
+            }
+            if let Some(vector_json) = bug.vector_json.as_deref() {
+                self.store_bug_vector(id, vector_json).await?;
+            }
+            Ok(id)
+        } else {
+            bail!("Failed to insert bug: no id returned");
+        }
+    }
+
+    /// Records a deduplication embedding for a bug.
+    ///
+    /// Keyed by the model that produced it, so switching embedding models adds a
+    /// row rather than destroying the previous vector.
+    async fn store_bug_vector(&self, bug_id: i64, vector_json: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO bug_vectors (bug_id, model, vector_json, created_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(bug_id, model) DO UPDATE SET
+                     vector_json = excluded.vector_json,
+                     created_at = excluded.created_at",
+                libsql::params![
+                    bug_id,
+                    self.bug_model.clone().unwrap_or_default(),
+                    vector_json,
+                    chrono::Utc::now().timestamp(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn add_bug_enrichment(
+        &self,
+        bug_id: i64,
+        enrichment: &NewBugEnrichment,
+    ) -> Result<i64> {
+        if self.bug_claim.is_none() {
+            return self.insert_bug_enrichment(bug_id, enrichment).await;
+        }
+        let tx = self.begin_bug_write(bug_id).await?;
+        let id = self
+            .with_connection((*tx).clone())
+            .insert_bug_enrichment(bug_id, enrichment)
+            .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn insert_bug_enrichment(
+        &self,
+        bug_id: i64,
+        enrichment: &NewBugEnrichment,
+    ) -> Result<i64> {
+        let compressed_content = enrichment
+            .content
+            .as_ref()
+            .map(|c| crate::compression::compress_string_if_needed(c))
+            .unwrap_or(libsql::Value::Null);
+        let compressed_logs = enrichment
+            .logs
+            .as_ref()
+            .map(|l| crate::compression::compress_string_if_needed(l))
+            .unwrap_or(libsql::Value::Null);
+        let data_json_str = enrichment
+            .data_json
+            .as_ref()
+            .and_then(|d| serde_json::to_string(d).ok());
+        let now = if enrichment.created_at > 0 {
+            enrichment.created_at
+        } else {
+            chrono::Utc::now().timestamp()
+        };
+
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO bug_enrichments (
+                    bug_id, kind, tool, model, author, created_at, content, data_json,
+                    tokens_in, tokens_out, tokens_cached, logs
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 RETURNING id",
+                libsql::params![
+                    bug_id,
+                    enrichment.kind.as_str(),
+                    if enrichment.tool.is_empty() {
+                        self.bug_tool.as_str()
+                    } else {
+                        enrichment.tool.as_str()
+                    },
+                    enrichment.model.clone().or_else(|| self.bug_model.clone()),
+                    enrichment
+                        .author
+                        .clone()
+                        .or_else(|| Some(self.bug_actor.clone())),
+                    now,
+                    compressed_content,
+                    data_json_str,
+                    enrichment.tokens_in.map(|t| t as i64),
+                    enrichment.tokens_out.map(|t| t as i64),
+                    enrichment.tokens_cached.map(|t| t as i64),
+                    compressed_logs,
+                ],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let eid: i64 = row.get(0)?;
+            Ok(eid)
+        } else {
+            bail!("Failed to insert bug enrichment: no id returned");
+        }
+    }
+
+    pub async fn get_bug_enrichments(&self, bug_id: i64) -> Result<Vec<BugEnrichment>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
+                        tokens_in, tokens_out, tokens_cached, NULL as logs
+                 FROM bug_enrichments
+                 WHERE bug_id = ?
+                 ORDER BY created_at ASC, id ASC",
+                libsql::params![bug_id],
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Some(row) = rows.next().await? {
+            list.push(Self::parse_bug_enrichment_row(&row)?);
+        }
+        Ok(list)
+    }
+
+    fn parse_bug_enrichment_row(row: &libsql::Row) -> Result<BugEnrichment> {
+        let id: i64 = row.get(0)?;
+        let bug_id: i64 = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let tool: String = row.get(3)?;
+        let model: Option<String> = row.get(4).ok().flatten();
+        let author: Option<String> = row.get(5).ok().flatten();
+        let created_at: i64 = row.get(6)?;
+        let content: Option<String> = crate::compression::get_compressed_string_opt(row, 7)
+            .unwrap_or(None)
+            .or_else(|| row.get::<Option<String>>(7).ok().flatten());
+        let data_json_str: Option<String> = row.get(8).ok().flatten();
+        let data_json: Option<serde_json::Value> =
+            data_json_str.and_then(|s| serde_json::from_str(&s).ok());
+        let tokens_in: Option<usize> = row.get::<Option<i64>>(9).ok().flatten().map(|v| v as usize);
+        let tokens_out: Option<usize> = row
+            .get::<Option<i64>>(10)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
+        let tokens_cached: Option<usize> = row
+            .get::<Option<i64>>(11)
+            .ok()
+            .flatten()
+            .map(|v| v as usize);
+        let logs: Option<String> = crate::compression::get_compressed_string_opt(row, 12)
+            .unwrap_or(None)
+            .or_else(|| row.get::<Option<String>>(12).ok().flatten());
+
+        Ok(BugEnrichment {
+            id,
+            bug_id,
+            kind,
+            tool,
+            model,
+            author,
+            created_at,
+            content,
+            data_json,
+            tokens_in,
+            tokens_out,
+            tokens_cached,
+            logs,
+        })
+    }
+
+    pub async fn get_bug(&self, id: i64) -> Result<Option<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT {BUG_ROW_COLUMNS} FROM bugs WHERE id = ?"),
+                libsql::params![id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let mut bug = Self::parse_bug_row_core(&row)?;
+            bug.subsystems = self
+                .get_subsystems_for_bug(bug.id)
+                .await
+                .unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await?;
+            Ok(Some(bug))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_bug_by_bugid(&self, bugid: &str) -> Result<Option<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT {BUG_ROW_COLUMNS} FROM bugs WHERE bugid = ?"),
+                libsql::params![bugid],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let mut bug = Self::parse_bug_row_core(&row)?;
+            bug.subsystems = self
+                .get_subsystems_for_bug(bug.id)
+                .await
+                .unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await?;
+            Ok(Some(bug))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_bug_by_slug(&self, slug: &str) -> Result<Option<Bug>> {
+        self.get_bug_by_bugid(slug).await
+    }
+
+    pub async fn get_subsystems_for_bug(&self, bug_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subsystem FROM bug_subsystems WHERE bug_id = ? ORDER BY subsystem ASC",
+                libsql::params![bug_id],
+            )
+            .await?;
+        let mut subs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            subs.push(row.get(0)?);
+        }
+        Ok(subs)
+    }
+
+    /// Returns the MAINTAINERS section titles attributed to this bug.
+    ///
+    /// Rows whose provenance is a directory prefix or a caller-supplied string
+    /// are excluded, because they name nobody and therefore confer no
+    /// authority. Authorization must call this rather than read
+    /// `Bug::subsystems`, which `parse_bug_row_core` always leaves empty.
+    pub async fn authorizing_sections_for_bug(&self, bug_id: i64) -> Result<Vec<String>> {
+        Ok(self
+            .authorizing_sections_for_bugs(&[bug_id])
+            .await?
+            .remove(&bug_id)
+            .unwrap_or_default())
+    }
+
+    /// Batch form of [`Database::authorizing_sections_for_bug`], so that
+    /// filtering a page of bugs costs one query rather than one per bug.
+    pub async fn authorizing_sections_for_bugs(
+        &self,
+        bug_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let mut sections: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        if bug_ids.is_empty() {
+            return Ok(sections);
+        }
+        let placeholders = vec!["?"; bug_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT bug_id, subsystem FROM bug_subsystems
+             WHERE source = '{}' AND bug_id IN ({})
+             ORDER BY subsystem ASC",
+            SubsystemSource::MaintainersSection.as_str(),
+            placeholders
+        );
+        let params: Vec<libsql::Value> = bug_ids
+            .iter()
+            .map(|&id| libsql::Value::Integer(id))
+            .collect();
+        let mut rows = self.conn.query(&sql, params).await?;
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let subsystem: String = row.get(1)?;
+            sections.entry(bug_id).or_default().push(subsystem);
+        }
+        Ok(sections)
+    }
+
+    /// Adds MAINTAINERS sections to a patchset without removing any.
+    ///
+    /// Ingestion is the caller. A series arrives one part at a time and each
+    /// part contributes the sections its own files touch, so the attribution
+    /// is a union that grows as the series lands. Replacing here would let the
+    /// last part to arrive narrow the series to its own files, which for a
+    /// patch touching only Documentation would quietly strip the maintainers
+    /// of the code the rest of the series changes.
+    pub async fn add_patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+        sections: &[AttributedSubsystem],
+    ) -> Result<()> {
+        if sections.is_empty() {
+            return Ok(());
+        }
+        for section in sections {
+            let name = section.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    UPSERT_PATCHSET_SECTION_SQL,
+                    libsql::params![patchset_id, name, section.source.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Sets a patchset's MAINTAINERS sections to exactly this list.
+    ///
+    /// The backfill is the caller, because it computes the whole union from
+    /// every stored diff in one pass and a stale row from an earlier attempt
+    /// must not survive. Pruning matters for the same reason the bug side
+    /// prunes: a section that no longer matches has to stop conferring
+    /// authority.
+    pub async fn replace_patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+        sections: &[AttributedSubsystem],
+    ) -> Result<()> {
+        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = sections
+            .iter()
+            .map(|s| (s.name.trim(), s.source))
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
+
+        // The read is drained and the cursor dropped before any write, because
+        // libsql refuses to commit a transaction that still has a statement in
+        // progress, and deleting while iterating leaves the cursor open.
+        let existing: Vec<String> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT subsystem FROM patchset_maintainer_sections WHERE patchset_id = ?",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push(row.get::<String>(0)?);
+            }
+            found
+        };
+
+        for section in existing {
+            if !wanted.contains_key(section.as_str()) {
+                self.conn
+                    .execute(
+                        "DELETE FROM patchset_maintainer_sections \
+                         WHERE patchset_id = ? AND subsystem = ?",
+                        libsql::params![patchset_id, section],
+                    )
+                    .await?;
+            }
+        }
+        for (name, source) in wanted {
+            self.conn
+                .execute(
+                    UPSERT_PATCHSET_SECTION_SQL,
+                    libsql::params![patchset_id, name, source.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Returns the MAINTAINERS section titles that grant authority over this
+    /// patchset.
+    ///
+    /// Rows whose provenance is a directory prefix or a caller-supplied string
+    /// are excluded, because they name nobody. An empty result is meaningful
+    /// rather than a failure: it says nobody was identified as responsible for
+    /// this series, and the transcript rules treat that as closed.
+    pub async fn authorizing_sections_for_patchset(&self, patchset_id: i64) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT subsystem FROM patchset_maintainer_sections
+             WHERE source = '{}' AND patchset_id = ?
+             ORDER BY subsystem ASC",
+            SubsystemSource::MaintainersSection.as_str()
+        );
+        let mut rows = self.conn.query(&sql, libsql::params![patchset_id]).await?;
+        let mut sections = Vec::new();
+        while let Some(row) = rows.next().await? {
+            sections.push(row.get(0)?);
+        }
+        Ok(sections)
+    }
+
+    /// Every section attributed to a patchset, with its provenance, for
+    /// display. Authorization must not call this: it would see rows that
+    /// confer nothing.
+    pub async fn patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Vec<AttributedSubsystem>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subsystem, source FROM patchset_maintainer_sections
+                 WHERE patchset_id = ? ORDER BY subsystem ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut sections = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(0)?;
+            let source: String = row.get(1)?;
+            sections.push(AttributedSubsystem::new(
+                name,
+                SubsystemSource::from_stored(&source),
+            ));
+        }
+        Ok(sections)
+    }
+
+    /// Each candidate is a discovery; analysis stages never increase this count.
+    /// UNION makes historical malformed duplicate graphs terminate safely.
+    pub async fn bug_family(&self, id: i64, raw: bool) -> Result<Vec<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "WITH RECURSIVE ancestors(id, parent) AS (
+                SELECT id, duplicate_of_id FROM bugs WHERE id = ?
+                UNION SELECT b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
+             ), family(id) AS (
+                SELECT id FROM ancestors
+                UNION SELECT b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
+             ) SELECT id FROM family ORDER BY id",
+                libsql::params![id],
+            )
+            .await?;
+        let mut family = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(mut bug) = self.get_bug(row.get(0)?).await? {
+                if raw {
+                    let mut records = self.conn.query("SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json, tokens_in, tokens_out, tokens_cached, logs FROM bug_enrichments WHERE bug_id = ? ORDER BY created_at, id", libsql::params![bug.id]).await?;
+                    bug.enrichments.clear();
+                    while let Some(record) = records.next().await? {
+                        bug.enrichments
+                            .push(Self::parse_bug_enrichment_row(&record)?);
+                    }
+                }
+                family.push(bug);
+            }
+        }
+        Ok(family)
+    }
+
+    /// Fetch list-page evidence in one query without loading reports or payloads.
+    pub async fn bug_discovery_summaries(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, serde_json::Value>> {
+        let mut rows = self.conn.query(
+            "WITH RECURSIVE ancestors(root, id, parent) AS (
+                SELECT b.id, b.id, b.duplicate_of_id FROM bugs b JOIN json_each(?) requested ON b.id = requested.value
+                UNION SELECT a.root, b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
+             ), family(root, id) AS (
+                SELECT root, id FROM ancestors
+                UNION SELECT f.root, b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
+             ) SELECT f.root,
+                      COALESCE(
+                          NULLIF(trim(e.model), ''),
+                          (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                          (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                          (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
+                      ) AS model,
+                      COALESCE(
+                          NULLIF(trim(e.tool), ''),
+                          (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                      ) AS tool
+               FROM family f
+               JOIN bugs b ON b.id = f.id
+               LEFT JOIN bug_enrichments e ON e.bug_id = f.id AND e.kind IN ('candidate', 'discovery')",
+            libsql::params![serde_json::to_string(ids)?]).await?;
+        #[derive(Default, Serialize)]
+        struct Summary {
+            count: usize,
+            models: std::collections::BTreeSet<String>,
+            tools: std::collections::BTreeSet<String>,
+            unknown_models: usize,
+        }
+        let mut summaries: std::collections::HashMap<i64, Summary> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let summary = summaries.entry(row.get(0)?).or_default();
+            summary.count += 1;
+            if let Some(model) = row
+                .get::<Option<String>>(1)?
+                .filter(|s| !s.trim().is_empty())
+            {
+                summary.models.insert(model);
+            } else {
+                summary.unknown_models += 1;
+            }
+            if let Some(tool) = row
+                .get::<Option<String>>(2)?
+                .filter(|s| !s.trim().is_empty())
+            {
+                summary.tools.insert(tool);
+            }
+        }
+        summaries
+            .into_iter()
+            .map(|(id, summary)| Ok((id, serde_json::to_value(summary)?)))
+            .collect()
+    }
+
+    pub async fn resolve_bug_model_and_tool(
+        &self,
+        bug_id: i64,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    COALESCE(
+                        (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                        (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                        (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
+                    ) AS model,
+                    COALESCE(
+                        (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                    ) AS tool
+                 FROM bugs b WHERE b.id = ?",
+                libsql::params![bug_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let model: Option<String> = row.get(0).ok().flatten();
+            let tool: Option<String> = row.get(1).ok().flatten();
+            if model.is_none() && tool.is_none() {
+                Ok(None)
+            } else {
+                Ok(Some((model, tool)))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Builds evidence only from the family members authorized by the caller.
+    pub async fn bug_evidence(&self, family: &[Bug]) -> Result<serde_json::Value> {
+        struct RawDiscovery<'a> {
+            bug_id: i64,
+            bugid: String,
+            reporter: String,
+            reported_at: i64,
+            record: Option<&'a BugEnrichment>,
+            patchset_id: Option<i64>,
+            patch_id: Option<i64>,
+            commit: Option<String>,
+            model: Option<String>,
+            tool: Option<String>,
+        }
+
+        let mut raw_discoveries = Vec::new();
+        let mut patch_ids_to_query = std::collections::HashSet::new();
+        let mut bugs_needing_review_lookup = Vec::new();
+        let mut activity = Vec::new();
+        let mut models = std::collections::BTreeSet::new();
+        let mut tools = std::collections::BTreeSet::new();
+        let mut unknown_models = 0;
+
+        // Interaction logs are deliberately not loaded with the family, so ask
+        // the table which records carry one before assembling the events.
+        let family_ids: Vec<i64> = family.iter().map(|b| b.id).collect();
+        let mut logged_records = std::collections::HashSet::<i64>::new();
+        if !family_ids.is_empty() {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM bug_enrichments
+                     WHERE bug_id IN (SELECT value FROM json_each(?))
+                       AND logs IS NOT NULL AND length(logs) > 0",
+                    libsql::params![serde_json::to_string(&family_ids)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                logged_records.insert(row.get(0)?);
+            }
+        }
+
+        for bug in family {
+            let candidates: Vec<_> = bug
+                .enrichments
+                .iter()
+                .filter(|e| {
+                    e.kind == "candidate" || e.kind == "discovery" || e.kind == "raw_candidate"
+                })
+                .collect();
+            // A legacy report without a candidate still represents one discovery.
+            let records: Vec<Option<&BugEnrichment>> = if candidates.is_empty() {
+                vec![None]
+            } else {
+                candidates.into_iter().map(Some).collect()
+            };
+            for record in records {
+                let mut model = record
+                    .and_then(|e| e.model.as_deref())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string());
+                let mut tool = record
+                    .map(|e| e.tool.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string());
+
+                if (model.is_none() || tool.is_none())
+                    && let Ok(Some((fallback_model, fallback_tool))) =
+                        self.resolve_bug_model_and_tool(bug.id).await
+                {
+                    if model.is_none() {
+                        model = fallback_model;
+                    }
+                    if tool.is_none() {
+                        tool = fallback_tool;
+                    }
+                }
+
+                if let Some(ref m) = model {
+                    models.insert(m.clone());
+                } else {
+                    unknown_models += 1;
+                }
+                if let Some(ref t) = tool {
+                    tools.insert(t.clone());
+                }
+
+                let patchset_id = record
+                    .and_then(|e| e.data_json.as_ref())
+                    .and_then(|d| d.get("patchset_id"))
+                    .and_then(|v| v.as_i64())
+                    .or(bug.discovered_in_patchset_id);
+                let patch_id = record
+                    .and_then(|e| e.data_json.as_ref())
+                    .and_then(|d| d.get("patch_id"))
+                    .and_then(|v| v.as_i64())
+                    .or(bug.discovered_in_patch_id);
+                let commit = record
+                    .and_then(|e| e.data_json.as_ref())
+                    .and_then(|d| d.get("commit_sha"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| bug.discovered_in_commit.clone());
+
+                if let Some(pid) = patch_id {
+                    patch_ids_to_query.insert(pid);
+                }
+                if patch_id.is_none() || patchset_id.is_none() {
+                    bugs_needing_review_lookup.push(bug.id);
+                }
+
+                raw_discoveries.push(RawDiscovery {
+                    bug_id: bug.id,
+                    bugid: bug.bugid.clone(),
+                    reporter: bug.reporter.clone(),
+                    reported_at: bug.reported_at,
+                    record,
+                    patchset_id,
+                    patch_id,
+                    commit,
+                    model,
+                    tool,
+                });
+            }
+            for enrichment in &bug.enrichments {
+                let mut event = serde_json::to_value(enrichment)?;
+                event["bugid"] = json!(bug.bugid);
+                // The interaction log itself stays behind the raw endpoint, but
+                // callers need to know whether one exists to offer a link to it.
+                event["has_logs"] = json!(logged_records.contains(&enrichment.id));
+                // Payloads and token accounting are only exposed by the raw endpoint.
+                // BugEnrichment serializes as a JSON object.
+                let obj = event
+                    .as_object_mut()
+                    .expect("serialized enrichment is an object");
+                for key in [
+                    "data_json",
+                    "logs",
+                    "tokens_in",
+                    "tokens_out",
+                    "tokens_cached",
+                ] {
+                    obj.remove(key);
+                }
+                if enrichment.kind == "audit"
+                    && let Some(data) = &enrichment.data_json
+                {
+                    match data["field"].as_str() {
+                        Some("duplicate_of_id") => {
+                            event["content"] = json!("Duplicate relationship updated")
+                        }
+                        Some("status") => {
+                            event["content"] = json!(format!(
+                                "Status changed from {} to {}",
+                                data["old"].as_str().unwrap_or("unknown"),
+                                data["new"].as_str().unwrap_or("unknown")
+                            ))
+                        }
+                        Some("title") => {
+                            event["content"] = json!(format!(
+                                "Title changed to {}",
+                                data["new"].as_str().unwrap_or("untitled")
+                            ))
+                        }
+                        _ => {}
+                    }
+                }
+                // Old deduplication content could itself be a JSON payload.
+                if enrichment.kind == "deduplication"
+                    && let Some(content) = &enrichment.content
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+                {
+                    event["content"] = value
+                        .get("reasoning")
+                        .cloned()
+                        .unwrap_or(json!("Matched an existing bug"));
+                }
+                activity.push(event);
+            }
+        }
+
+        // If some discoveries have missing patch_id and patchset_id, query review_bugs
+        if !bugs_needing_review_lookup.is_empty() {
+            let mut review_links: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
+                std::collections::HashMap::new();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT rb.bug_id, r.patchset_id, r.patch_id
+                     FROM bug_reviews rb
+                     JOIN reviews r ON r.id = rb.review_id
+                     WHERE rb.bug_id IN (SELECT value FROM json_each(?))
+                     ORDER BY r.id ASC",
+                    libsql::params![serde_json::to_string(&bugs_needing_review_lookup)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let b_id: i64 = row.get(0)?;
+                let ps_id: Option<i64> = row.get(1).ok().flatten();
+                let p_id: Option<i64> = row.get(2).ok().flatten();
+                review_links.entry(b_id).or_insert((ps_id, p_id));
+            }
+            for raw in &mut raw_discoveries {
+                if (raw.patch_id.is_none() || raw.patchset_id.is_none())
+                    && let Some(&(ps_id, p_id)) = review_links.get(&raw.bug_id)
+                {
+                    if raw.patchset_id.is_none() {
+                        raw.patchset_id = ps_id;
+                    }
+                    if raw.patch_id.is_none() {
+                        raw.patch_id = p_id;
+                        if let Some(pid) = p_id {
+                            patch_ids_to_query.insert(pid);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Query patches table to resolve part_index and ensure patchset_id is populated
+        let mut patch_info: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
+            std::collections::HashMap::new();
+        if !patch_ids_to_query.is_empty() {
+            let pids: Vec<i64> = patch_ids_to_query.into_iter().collect();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, patchset_id, part_index
+                     FROM patches
+                     WHERE id IN (SELECT value FROM json_each(?))",
+                    libsql::params![serde_json::to_string(&pids)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let pid: i64 = row.get(0)?;
+                let ps_id: Option<i64> = row.get(1).ok().flatten();
+                let part: Option<i64> = row.get(2).ok().flatten();
+                patch_info.insert(pid, (ps_id, part));
+            }
+        }
+
+        let mut discoveries = Vec::new();
+        for raw in raw_discoveries {
+            let mut patchset_id = raw.patchset_id;
+            let mut patch_part = None;
+            if let Some(pid) = raw.patch_id
+                && let Some(&(p_ps_id, part)) = patch_info.get(&pid)
+            {
+                if patchset_id.is_none() {
+                    patchset_id = p_ps_id;
+                }
+                patch_part = part;
+            }
+
+            let author = raw
+                .record
+                .and_then(|e| e.author.as_deref())
+                .unwrap_or(&raw.reporter);
+            let author = if author == "sashiko" && self.has_bug_actor() {
+                self.bug_actor()
+            } else {
+                author
+            };
+
+            // Only discoveries that stored the payload handed to the workflow
+            // can offer a raw input view.
+            let has_input = raw
+                .record
+                .is_some_and(|e| e.data_json.is_some() || e.content.is_some());
+
+            discoveries.push(json!({
+                "bug_id": raw.bug_id,
+                "bugid": raw.bugid,
+                "enrichment_id": raw.record.map(|e| e.id),
+                "author": author,
+                "tool": raw.tool,
+                "model": raw.model,
+                "created_at": raw.record.map(|e| e.created_at).unwrap_or(raw.reported_at),
+                "patchset_id": patchset_id,
+                "patch_id": raw.patch_id,
+                "patch_part": patch_part,
+                "commit": raw.commit,
+                "has_input": has_input,
+                "legacy": raw.record.is_none()
+            }));
+        }
+
+        activity.sort_by_key(|e| {
+            (
+                e["created_at"].as_i64().unwrap_or(0),
+                e["id"].as_i64().unwrap_or(0),
+            )
+        });
+        activity.reverse();
+        Ok(
+            json!({ "count": discoveries.len(), "models": models, "tools": tools,
+            "unknown_models": unknown_models, "discoveries": discoveries, "activity": activity }),
+        )
+    }
+
+    pub async fn change_bug_status_with_reason(
+        &self,
+        id: i64,
+        status: BugLifecycleStatus,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction().await?;
+        let now = chrono::Utc::now().timestamp();
+        tx.execute("UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id]).await?;
+        if let Some(reason) = reason.filter(|s| !s.trim().is_empty()) {
+            tx.execute("INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
+                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason]).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Records who is working on a bug, or clears the assignment when given
+    /// `None`.
+    ///
+    /// The address is stored as plain text on purpose: Sashiko keeps no
+    /// persistent user records, so there is nothing to reference.
+    ///
+    /// Both columns are written in one statement because the schema requires
+    /// `assigned_at` to be set if and only if there is an assignee. An
+    /// optional reason is recorded as a comment so the audit feed explains the
+    /// handover rather than just noting that it happened.
+    ///
+    /// Returns false when no such bug exists, so the caller can tell a bad id
+    /// apart from a successful assignment.
+    pub async fn assign_bug(
+        &self,
+        id: i64,
+        assignee: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction().await?;
+        let updated = tx
+            .execute(
+                "UPDATE bugs
+                    SET assignee = ?1,
+                        assigned_at = CASE WHEN ?1 IS NULL THEN NULL ELSE ?2 END,
+                        updated_at = ?2,
+                        audit_author = ?3,
+                        audit_tool = ?4,
+                        audit_model = ?5
+                  WHERE id = ?6",
+                libsql::params![
+                    assignee,
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id,
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(reason) = reason.map(str::trim).filter(|s| !s.is_empty()) {
+            tx.execute(
+                "INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
+                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT tool, logs FROM bug_enrichments
+                 WHERE bug_id = ? AND logs IS NOT NULL
+                 ORDER BY created_at ASC, id ASC",
+                libsql::params![id],
+            )
+            .await?;
+        let mut combined = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let tool: String = row.get(0)?;
+            let logs_opt: Option<String> = crate::compression::get_compressed_string_opt(&row, 1)
+                .unwrap_or(None)
+                .or_else(|| row.get::<Option<String>>(1).ok().flatten());
+            if let Some(logs_str) = logs_opt {
+                if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&logs_str) {
+                    combined.extend(entries);
+                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(&logs_str) {
+                    combined.push(val);
+                } else {
+                    combined.push(serde_json::json!({
+                        "role": tool,
+                        "parts": [{"text": logs_str}]
+                    }));
+                }
+            }
+        }
+        if combined.is_empty() {
+            Ok(None)
+        } else {
+            Ok(serde_json::to_string(&combined).ok())
+        }
+    }
+
+    pub async fn get_bug_logs_by_bugid(&self, bugid: &str) -> Result<Option<String>> {
+        if let Some(bug) = self.get_bug_by_bugid(bugid).await? {
+            self.get_bug_logs(bug.id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_bug_logs_by_slug(&self, slug: &str) -> Result<Option<String>> {
+        self.get_bug_logs_by_bugid(slug).await
+    }
+
+    /// Claims the oldest bug awaiting analysis, taking a lease on it.
+    ///
+    /// The claim is a single statement so that two workers racing for the same
+    /// bug cannot both win: SQLite serialises writers, so the loser's subquery
+    /// no longer selects the row. The previous read-then-write version could
+    /// hand the same bug to both.
+    ///
+    /// Claimable bugs are those awaiting a first attempt, those whose last
+    /// attempt failed, and those whose lease has expired because the worker
+    /// holding it died. Bugs that have exhausted `max_attempts` are skipped;
+    /// [`Self::abandon_exhausted_bugs`] moves them to the dead letter state.
+    /// Bugs already folded into a canonical bug are skipped too: their finding
+    /// lives on the canonical row, so analysing them again would spend the
+    /// budget to rediscover something that is already recorded.
+    ///
+    /// `worker_id` identifies the holder so that a stuck lease can be traced
+    /// back to a process.
+    pub async fn claim_pending_bug(
+        &self,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+        max_attempts: i64,
+    ) -> Result<Option<Bug>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE bugs
+                    SET pipeline_state = 'running',
+                        locked_by = ?1,
+                        lease_expires_at = ?2,
+                        attempt_count = attempt_count + 1,
+                        updated_at = ?3,
+                        audit_author = 'system',
+                        audit_tool = 'sashiko:linux_bug',
+                        audit_model = NULL
+                  WHERE id = (
+                      SELECT id FROM bugs
+                       WHERE attempt_count < ?4
+                         AND lifecycle_status != 'duplicate'
+                         AND (pipeline_state IN ('pending', 'failed')
+                              OR (pipeline_state = 'running'
+                                  AND (lease_expires_at IS NULL OR lease_expires_at < ?3)))
+                       ORDER BY created_at ASC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![worker_id, now + lease_ttl_seconds, now, max_attempts],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => self.get_bug(row.get::<i64>(0)?).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Releases the lease on a bug that finished analysis.
+    ///
+    /// The pipeline state is left alone: whoever completed the run has already
+    /// recorded the outcome, and overwriting it here would race with them.
+    pub async fn release_bug_lease(&self, id: i64) -> Result<()> {
+        let tx = self.begin_bug_write(id).await?;
+        tx.execute(
+            "UPDATE bugs SET locked_by = NULL, lease_expires_at = NULL WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Extends the lease on a bug this worker is still analysing.
+    ///
+    /// Returns false when the claim is gone, which means another worker has
+    /// already taken the bug over. The caller cannot win that race back, so it
+    /// should stop rather than keep spending on work that will be discarded.
+    ///
+    /// The worker is matched on purpose: renewing by id alone would let a
+    /// worker whose lease already lapsed steal the row back from whoever
+    /// legitimately claimed it next.
+    pub async fn renew_bug_lease(
+        &self,
+        id: i64,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET lease_expires_at = ?1
+                  WHERE id = ?2
+                    AND locked_by = ?3
+                    AND pipeline_state IN ('running', 'succeeded')
+                    AND lease_expires_at >= ?4",
+                libsql::params![now + lease_ttl_seconds, id, worker_id, now],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Moves bugs that have used up their attempts into the dead letter state.
+    ///
+    /// Abandoned bugs are never claimed again. Requeueing one is a deliberate
+    /// operator action, so that a bug which reliably crashes the worker cannot
+    /// quietly consume the analysis budget forever.
+    pub async fn abandon_exhausted_bugs(&self, max_attempts: i64) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let count = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET pipeline_state = 'abandoned',
+                        locked_by = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?1,
+                        audit_author = 'system',
+                        audit_tool = 'sashiko:linux_bug',
+                        audit_model = NULL
+                  WHERE attempt_count >= ?2
+                    AND (pipeline_state IN ('pending', 'failed')
+                         OR (pipeline_state = 'running'
+                             AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))",
+                libsql::params![now, max_attempts],
+            )
+            .await?;
+        if count > 0 {
+            info!(
+                "Abandoned {} bugs that exhausted their analysis attempts",
+                count
+            );
+        }
+        Ok(count as usize)
+    }
+
+    /// Requeues bugs that are marked running but hold no valid lease.
+    ///
+    /// Only the pipeline state is touched. Triage state is owned by humans and
+    /// must survive a crash untouched.
+    ///
+    /// Claiming already reclaims expired leases on its own, so this exists to
+    /// make the requeue visible in the bug list rather than leaving a dead
+    /// worker's bugs displayed as running until someone happens to claim them.
+    ///
+    /// A missing lease counts as reclaimable alongside an expired one. Claiming
+    /// sets the state and the lease in one statement, so a running bug without
+    /// a lease is always the residue of a release that skipped the state, and
+    /// matching only on `lease_expires_at < now` would silently skip it forever
+    /// because a NULL comparison is never true.
+    pub async fn recover_stale_running_bugs(&self) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let count = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET pipeline_state = 'pending',
+                        locked_by = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?1,
+                        audit_author = 'system',
+                        audit_tool = 'sashiko:linux_bug',
+                        audit_model = NULL
+                  WHERE pipeline_state = 'running'
+                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
+                libsql::params![now],
+            )
+            .await?;
+        if count > 0 {
+            info!("Requeued {} bugs whose analysis lease expired", count);
+        }
+        Ok(count as usize)
+    }
+
+    /// Updates the triage state of a bug.
+    pub async fn set_bug_lifecycle_status(
+        &self,
+        id: i64,
+        status: BugLifecycleStatus,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Updates the analysis execution state of a bug.
+    pub async fn set_bug_pipeline_state(&self, id: i64, state: BugPipelineState) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET pipeline_state = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![state.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records that an analysis attempt failed.
+    ///
+    /// The triage state is left untouched: a crashed run says nothing about
+    /// whether the underlying defect is real.
+    pub async fn fail_bug_analysis(&self, id: i64, error: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_bug_write(id).await?;
+        let changed = tx
+            .execute(
+                "UPDATE bugs
+                 SET pipeline_state = ?, last_error = ?, locked_by = NULL,
+                     lease_expires_at = NULL, updated_at = ?,
+                     audit_author = ?, audit_tool = ?, audit_model = ?
+                 WHERE id = ? AND (? = 0 OR pipeline_state = 'running')",
+                libsql::params![
+                    BugPipelineState::Failed.as_str(),
+                    error,
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id,
+                    self.bug_claim.is_some() as i64,
+                ],
+            )
+            .await?;
+        if self.bug_claim.is_some() && changed == 0 {
+            bail!("A completed analysis cannot be marked failed");
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_bug_title(&self, id: i64, title: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET title = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![title, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_bug_vector(&self, id: i64, vector_json: &str) -> Result<()> {
+        self.store_bug_vector(id, vector_json).await
+    }
+
+    pub async fn update_bug_subsystems(
+        &self,
+        id: i64,
+        subsystems: &[AttributedSubsystem],
+    ) -> Result<()> {
+        let tx = self.conn.transaction().await?;
+        self.with_connection((*tx).clone())
+            .replace_bug_subsystems(id, subsystems)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn replace_bug_subsystems(
+        &self,
+        id: i64,
+        subsystems: &[AttributedSubsystem],
+    ) -> Result<()> {
+        self.conn.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
+        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
+            .iter()
+            .map(|s| (s.name.trim(), s.source))
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
+
+        // The read is drained and the cursor dropped before any write, because
+        // libsql refuses to commit a transaction that still has a statement in
+        // progress, and deleting while iterating leaves the cursor open.
+        let existing: Vec<String> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT subsystem FROM bug_subsystems WHERE bug_id = ?",
+                    libsql::params![id],
+                )
+                .await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push(row.get::<String>(0)?);
+            }
+            found
+        };
+
+        for sub in existing {
+            if !wanted.contains_key(sub.as_str()) {
+                self.conn
+                    .execute(
+                        "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
+                        libsql::params![id, sub],
+                    )
+                    .await?;
+            }
+        }
+        for (name, source) in wanted {
+            self.conn
+                .execute(
+                    UPSERT_BUG_SUBSYSTEM_SQL,
+                    libsql::params![id, name, source.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Commits the verdict, report, projections and successful state together.
+    pub async fn update_bug_outcome(
+        &self,
+        id: i64,
+        params: UpdateBugOutcomeParams<'_>,
+    ) -> Result<()> {
+        let tx = self.begin_bug_write(id).await?;
+        self.with_connection((*tx).clone())
+            .write_bug_outcome(id, params)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_bug_outcome(&self, id: i64, params: UpdateBugOutcomeParams<'_>) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(title) = params.problem {
+            self.update_bug_title(id, title).await?;
+        }
+        if let Some(subsystems) = params.subsystems {
+            self.replace_bug_subsystems(id, subsystems).await?;
+        }
+        if let Some(vector) = params.vector_json {
+            self.update_bug_vector(id, vector).await?;
+        }
+        // A verdict initializes triage; it must not undo a human decision
+        // made while this analysis was pending or running.
+        self.conn
+            .execute(
+                "UPDATE bugs SET lifecycle_status = ?, updated_at = ?,
+                    audit_author = ?, audit_tool = ?, audit_model = ?
+             WHERE id = ? AND lifecycle_status = 'new'",
+                libsql::params![
+                    params.lifecycle_status.as_str(),
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id
+                ],
+            )
+            .await?;
+        if params.verified_on_sha.is_some() || params.locations.is_some() {
+            let is_valid = params.lifecycle_status != BugLifecycleStatus::Dismissed;
+            let refutation = if !is_valid {
+                params.severity_explanation.map(|s| s.to_string())
+            } else {
+                None
+            };
+            let data = serde_json::json!({
+                "verified_on_sha": params.verified_on_sha,
+                "is_valid": is_valid,
+                "refutation_evidence": refutation,
+                "locations": params.locations,
+                "source_files": params.source_files,
+            });
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "verification".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: params.severity_explanation.map(|s| s.to_string()),
+                    data_json: Some(data),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        if let Some(intro) = params.introduced_in_commit {
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "origin_discovery".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: Some(intro.to_string()),
+                    data_json: Some(serde_json::json!({
+                        "introducing_commit_sha": intro,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        if params.severity != Severity::Unknown {
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "severity_calibration".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: params.severity_explanation.map(|s| s.to_string()),
+                    data_json: Some(serde_json::json!({
+                        "severity": params.severity.as_str(),
+                        "severity_int": params.severity as i32,
+                        "subsystems": params
+                            .subsystems
+                            .map(|subs| subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()),
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        if !params.inline_review.is_empty() || params.logs.is_some() {
+            self.insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: if params.inline_review.is_empty() {
+                        "analysis"
+                    } else {
+                        "report"
+                    }
+                    .to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: Some(params.inline_review.to_string()),
+                    data_json: Some(serde_json::json!({
+                        "format": "lkml_markdown",
+                    })),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(|s| s.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        // Success and every outcome record become visible together at commit.
+        self.set_bug_pipeline_state(id, BugPipelineState::Succeeded)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_bugs(&self, params: ListBugsParams<'_>) -> Result<(Vec<Bug>, usize)> {
+        let limit_val = params.limit.unwrap_or(50) as i64;
+        let page_val = params.page.unwrap_or(1) as i64;
+        let offset_val = limit_val * (page_val.saturating_sub(1));
+
+        let mut conditions: Vec<std::borrow::Cow<'static, str>> = Vec::new();
+        let mut query_params = Vec::new();
+
+        // The scope predicate goes in before the caller's own filters so that a
+        // subsystem filter can only narrow what the principal may already see.
+        // Filtering in Rust after the query would corrupt the pagination count.
+        if let BugVisibility::Sections(scope) = params.visibility {
+            let titles: Vec<&str> = scope
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if titles.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let placeholders = vec!["?"; titles.len()].join(", ");
+            conditions.push(
+                format!(
+                    "id IN (SELECT bug_id FROM bug_subsystems
+                            WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
+                    SubsystemSource::MaintainersSection.as_str(),
+                    placeholders
+                )
+                .into(),
+            );
+            for title in titles {
+                query_params.push(libsql::Value::Text(title.to_string()));
+            }
+        }
+
+        if let Some(subs) = params.subsystems {
+            let valid_subs: Vec<&str> = subs
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if valid_subs.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let placeholders = vec!["?"; valid_subs.len()].join(", ");
+            conditions.push(
+                format!(
+                    "id IN (SELECT bug_id FROM bug_subsystems WHERE subsystem IN ({}))",
+                    placeholders
+                )
+                .into(),
+            );
+            for s in valid_subs {
+                query_params.push(libsql::Value::Text(s.to_string()));
+            }
+        } else if let Some(sub) = params.subsystem.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if sub.contains(',') {
+                let parts: Vec<&str> = sub
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    return Ok((Vec::new(), 0));
+                }
+                let placeholders = vec!["?"; parts.len()].join(", ");
+                conditions.push(
+                    format!(
+                        "id IN (SELECT bug_id FROM bug_subsystems WHERE subsystem IN ({}))",
+                        placeholders
+                    )
+                    .into(),
+                );
+                for p in parts {
+                    query_params.push(libsql::Value::Text(p.to_string()));
+                }
+            } else {
+                conditions.push(
+                    "id IN (SELECT bug_id FROM bug_subsystems WHERE subsystem = ? OR subsystem LIKE ?)".into(),
+                );
+                query_params.push(libsql::Value::Text(sub.to_string()));
+                query_params.push(libsql::Value::Text(format!("{}/%", sub)));
+            }
+        }
+
+        if let Some(min_sev) = params.min_severity
+            && min_sev != Severity::Unknown
+        {
+            // severity_int is projected from the severity_calibration enrichment
+            // by trigger, so this is an indexed comparison rather than a
+            // correlated subquery over the enrichment log.
+            conditions.push("severity_int >= ?".into());
+            query_params.push(libsql::Value::Integer(min_sev as i64));
+        }
+
+        if let Some(status) = params.lifecycle_status {
+            conditions.push("lifecycle_status = ?".into());
+            query_params.push(libsql::Value::Text(status.as_str().to_string()));
+        }
+
+        if let Some(state) = params.pipeline_state {
+            conditions.push("pipeline_state = ?".into());
+            query_params.push(libsql::Value::Text(state.as_str().to_string()));
+        }
+
+        match params.assignee {
+            Some(AssigneeFilter::Unassigned) => conditions.push("assignee IS NULL".into()),
+            Some(AssigneeFilter::Is(who)) => {
+                conditions.push("assignee = ?".into());
+                query_params.push(libsql::Value::Text(who.trim().to_string()));
+            }
+            None => {}
+        }
+
+        if let Some(q) = params.search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            conditions.push("(title LIKE ? OR bugid LIKE ?)".into());
+            let pattern = format!("%{}%", q);
+            query_params.push(libsql::Value::Text(pattern.clone()));
+            query_params.push(libsql::Value::Text(pattern));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sort_dir = match params.sort_order.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+        let order_clause = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
+            // Sorts straight off the projected column, which idx_bugs_severity covers.
+            Some("severity") => format!("ORDER BY severity_int {}, id {}", sort_dir, sort_dir),
+            Some("title") | Some("problem") => {
+                format!("ORDER BY title {}, created_at DESC, id DESC", sort_dir)
+            }
+            Some("status") | Some("lifecycle_status") => format!(
+                "ORDER BY lifecycle_status {}, created_at DESC, id DESC",
+                sort_dir
+            ),
+            Some("pipeline_state") => format!(
+                "ORDER BY pipeline_state {}, created_at DESC, id DESC",
+                sort_dir
+            ),
+            Some("assignee") => format!(
+                "ORDER BY assignee IS NULL, assignee {}, created_at DESC, id DESC",
+                sort_dir
+            ),
+            Some("id") => format!("ORDER BY id {}", sort_dir),
+            Some("bugid") => format!("ORDER BY bugid {}, id {}", sort_dir, sort_dir),
+            Some("created_at") => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
+            Some("discoveries") | Some("findings") => {
+                format!(
+                    "ORDER BY COALESCE((
+                        WITH RECURSIVE ancestors(root, id, parent) AS (
+                            SELECT bugs.id, bugs.id, bugs.duplicate_of_id
+                            UNION SELECT a.root, b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
+                        ), family(root, id) AS (
+                            SELECT root, id FROM ancestors
+                            UNION SELECT f.root, b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
+                        )
+                        SELECT COUNT(*)
+                        FROM family f
+                        JOIN bugs b ON b.id = f.id
+                        LEFT JOIN bug_enrichments e ON e.bug_id = f.id AND e.kind IN ('candidate', 'discovery')
+                    ), 1) {}, id {}",
+                    sort_dir, sort_dir
+                )
+            }
+            _ => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM bugs {}", where_clause);
+        let mut count_rows = self.conn.query(&count_sql, query_params.clone()).await?;
+        let total: usize = if let Some(row) = count_rows.next().await? {
+            row.get::<i64>(0).unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        let select_sql = format!(
+            "SELECT {BUG_ROW_COLUMNS}
+             FROM bugs
+             {}
+             {}
+             LIMIT ? OFFSET ?",
+            where_clause, order_clause
+        );
+
+        query_params.push(libsql::Value::Integer(limit_val));
+        query_params.push(libsql::Value::Integer(offset_val));
+
+        let mut rows = self.conn.query(&select_sql, query_params).await?;
+        let mut bugs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            bugs.push(Self::parse_bug_row_core(&row)?);
+        }
+
+        if !bugs.is_empty() {
+            let bug_ids: Vec<i64> = bugs.iter().map(|b| b.id).collect();
+            let placeholders = vec!["?"; bug_ids.len()].join(", ");
+
+            // Batch fetch subsystems
+            let subs_sql = format!(
+                "SELECT bug_id, subsystem FROM bug_subsystems WHERE bug_id IN ({}) ORDER BY subsystem ASC",
+                placeholders
+            );
+            let subs_params: Vec<libsql::Value> = bug_ids
+                .iter()
+                .map(|&id| libsql::Value::Integer(id))
+                .collect();
+            let mut subs_rows = self.conn.query(&subs_sql, subs_params).await?;
+            let mut subs_map: std::collections::HashMap<i64, Vec<String>> =
+                std::collections::HashMap::new();
+            while let Some(row) = subs_rows.next().await? {
+                let bug_id: i64 = row.get(0)?;
+                let sub: String = row.get(1)?;
+                subs_map.entry(bug_id).or_default().push(sub);
+            }
+
+            // Batch fetch enrichments (NULL as logs)
+            let enrichments_sql = format!(
+                "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
+                        tokens_in, tokens_out, tokens_cached, NULL as logs
+                 FROM bug_enrichments
+                 WHERE bug_id IN ({})
+                 ORDER BY created_at ASC, id ASC",
+                placeholders
+            );
+            let enr_params: Vec<libsql::Value> = bug_ids
+                .iter()
+                .map(|&id| libsql::Value::Integer(id))
+                .collect();
+            let mut enr_rows = self.conn.query(&enrichments_sql, enr_params).await?;
+            let mut enrichments_map: std::collections::HashMap<i64, Vec<BugEnrichment>> =
+                std::collections::HashMap::new();
+            while let Some(row) = enr_rows.next().await? {
+                let enrichment = Self::parse_bug_enrichment_row(&row)?;
+                enrichments_map
+                    .entry(enrichment.bug_id)
+                    .or_default()
+                    .push(enrichment);
+            }
+
+            for bug in &mut bugs {
+                if let Some(subs) = subs_map.remove(&bug.id) {
+                    bug.subsystems = subs;
+                }
+                if let Some(enrs) = enrichments_map.remove(&bug.id) {
+                    bug.enrichments = enrs;
+                }
+            }
+        }
+
+        Ok((bugs, total))
+    }
+
+    /// Counts open bugs per subsystem, over only the bugs the principal may
+    /// read. Counting every bug would turn this endpoint into an oracle for the
+    /// existence of bugs in subsystems the caller has no authority over.
+    pub async fn get_subsystems_bug_counts(
+        &self,
+        lifecycle_status: Option<BugLifecycleStatus>,
+        visibility: BugVisibility<'_>,
+    ) -> Result<Vec<(String, usize)>> {
+        let st = lifecycle_status.unwrap_or(BugLifecycleStatus::Open);
+        let mut params: Vec<libsql::Value> = vec![libsql::Value::Text(st.as_str().to_string())];
+        let scope_clause = match visibility {
+            BugVisibility::Unrestricted => String::new(),
+            BugVisibility::Sections(scope) => {
+                let titles: Vec<&str> = scope
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if titles.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let placeholders = vec!["?"; titles.len()].join(", ");
+                for title in &titles {
+                    params.push(libsql::Value::Text((*title).to_string()));
+                }
+                format!(
+                    " AND b.id IN (SELECT bug_id FROM bug_subsystems
+                                   WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
+                    SubsystemSource::MaintainersSection.as_str(),
+                    placeholders
+                )
+            }
+        };
+        let sql = format!(
+            "SELECT bs.subsystem, COUNT(DISTINCT b.id) AS bug_count
+                   FROM bug_subsystems bs
+                   JOIN bugs b ON bs.bug_id = b.id
+                   WHERE b.lifecycle_status = ?{}
+                   GROUP BY bs.subsystem
+                   HAVING bug_count > 0
+                   ORDER BY bug_count DESC, bs.subsystem ASC",
+            scope_clause
+        );
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut results = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let name: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            if count > 0 {
+                results.push((name, count as usize));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Records that a review surfaced a bug.
+    ///
+    /// A review that already discovered this bug keeps that credit. Two
+    /// candidates raised by one review can be folded together, and the fold
+    /// links the surviving bug back to the very same review as a rediscovery.
+    /// Replacing the row outright would let that second link overwrite the
+    /// first and leave a genuinely new bug looking like nobody found it, so
+    /// the flag only ever moves from false to true.
+    pub async fn link_review_to_bug(
+        &self,
+        review_id: i64,
+        bug_id: i64,
+        is_newly_discovered: bool,
+    ) -> Result<()> {
+        let Some(claim) = &self.bug_claim else {
+            return self
+                .insert_bug_review(review_id, bug_id, is_newly_discovered)
+                .await;
+        };
+        let tx = self.begin_bug_write(claim.bug_id).await?;
+        self.with_connection((*tx).clone())
+            .insert_bug_review(review_id, bug_id, is_newly_discovered)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_bug_review(
+        &self,
+        review_id: i64,
+        bug_id: i64,
+        is_newly_discovered: bool,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(review_id, bug_id) DO UPDATE
+                    SET is_newly_discovered =
+                        MAX(is_newly_discovered, excluded.is_newly_discovered)",
+                libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// [Reliability Framework] Safely transitions a bug into a Duplicate state while
+    /// atomically migrating all associated review linkages to the pre-existing canonical bug.
+    /// This single Transaction boundary guarantees tearing cannot occur during deduplication.
+    /// Returns false when automatic deduplication preserves existing triage.
+    pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_bug_write(params.ephemeral_id).await?;
+
+        // Both probes are scoped so their cursors close before the writes
+        // below. libsql refuses to commit a transaction that still has a
+        // statement in progress, and these handles would otherwise stay alive
+        // until the end of the function.
+        let canonical_exists = {
+            let mut target = tx
+                .query(
+                    "SELECT id FROM bugs WHERE id = ? AND duplicate_of_id IS NULL",
+                    libsql::params![params.canonical_id],
+                )
+                .await?;
+            target.next().await?.is_some()
+        };
+        if params.ephemeral_id == params.canonical_id || !canonical_exists {
+            bail!("Choose an existing canonical bug, distinct from this bug");
+        }
+        let source_status = {
+            let mut source = tx
+                .query(
+                    "SELECT lifecycle_status FROM bugs WHERE id = ?",
+                    libsql::params![params.ephemeral_id],
+                )
+                .await?;
+            source
+                .next()
+                .await?
+                .map(|row| row.get::<String>(0))
+                .transpose()?
+        }
+        .ok_or_else(|| anyhow::anyhow!("Bug not found"))?;
+        if params.preserve_triage && source_status != BugLifecycleStatus::New.as_str() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        // Folding a bug into a canonical one ends its pipeline, so the
+        // analysis state is retired in the same statement as the triage state.
+        // Leaving it behind strands the row: the dedup stage returns before the
+        // workflow records an outcome, and the caller then drops the lease, so
+        // the bug would keep a 'running' state that no worker can reclaim
+        // because every recovery query matches on an expired lease.
+        //
+        // 'succeeded' rather than 'abandoned' because reaching a duplicate is a
+        // completed triage result, not a dead letter, and no analysis work is
+        // still owed once the finding lives on the canonical bug.
+        tx.execute(
+            "UPDATE bugs SET lifecycle_status = 'duplicate', duplicate_of_id = ?,
+                    pipeline_state = 'succeeded',
+                    locked_by = CASE WHEN ? THEN locked_by ELSE NULL END,
+                    lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE NULL END,
+                    updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ?
+              WHERE id = ?",
+            libsql::params![
+                params.canonical_id,
+                self.bug_claim.is_some() as i64,
+                self.bug_claim.is_some() as i64,
+                now,
+                self.bug_actor.as_str(),
+                self.bug_tool.as_str(),
+                self.bug_model.clone(),
+                params.ephemeral_id
+            ],
+        )
+        .await?;
+
+        let compressed_logs = params
+            .logs
+            .map(crate::compression::compress_string_if_needed)
+            .unwrap_or(libsql::Value::Null);
+
+        tx.execute(
+            "INSERT INTO bug_enrichments (
+                bug_id, kind, tool, author, model, created_at, content, tokens_in, tokens_out, tokens_cached, logs
+             ) VALUES (?, 'deduplication', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                params.ephemeral_id,
+                self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(),
+                now,
+                params.reasoning,
+                params.tokens_in.map(|t| t as i64),
+                params.tokens_out.map(|t| t as i64),
+                params.tokens_cached.map(|t| t as i64),
+                compressed_logs,
+            ],
+        )
+        .await?;
+
+        // is_newly_discovered is written explicitly. A migrated link records a
+        // review that rediscovered an existing bug, so omitting the column and
+        // taking the schema default of 1 would report every fold as a fresh
+        // discovery on the canonical bug.
+        tx.execute(
+            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+             SELECT review_id, ?1, 0 FROM bug_reviews WHERE bug_id = ?2",
+            libsql::params![params.canonical_id, params.ephemeral_id],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM bug_reviews WHERE bug_id = ?",
+            libsql::params![params.ephemeral_id],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+             SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ?",
+                libsql::params![to_bug_id, from_bug_id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM bug_reviews WHERE bug_id = ?",
+                libsql::params![from_bug_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_duplicates_for_bug(&self, canonical_id: i64) -> Result<Vec<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM bugs WHERE duplicate_of_id = ? ORDER BY id ASC",
+                libsql::params![canonical_id],
+            )
+            .await?;
+        let mut list = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            if let Some(bug) = self.get_bug(id).await? {
+                list.push(bug);
+            }
+        }
+        Ok(list)
+    }
+
+    pub async fn list_bugs_for_review(&self, review_id: i64) -> Result<Vec<(Bug, bool)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT pb.id, rpb.is_newly_discovered
+                 FROM bugs pb
+                 JOIN bug_reviews rpb ON pb.id = rpb.bug_id
+                 WHERE rpb.review_id = ?
+                 ORDER BY pb.id ASC",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let is_newly_discovered: i64 = row.get(1).unwrap_or(1);
+            if let Some(bug) = self.get_bug(bug_id).await? {
+                list.push((bug, is_newly_discovered != 0));
+            }
+        }
+
+        list.sort_by(|(a, _), (b, _)| {
+            b.severity()
+                .cmp(&a.severity())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        Ok(list)
+    }
+
+    pub async fn list_bugs_for_patchset(&self, patchset_id: i64) -> Result<Vec<(Bug, bool)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT pb.id, rpb.is_newly_discovered
+                 FROM bugs pb
+                 JOIN bug_reviews rpb ON pb.id = rpb.bug_id
+                 JOIN reviews r ON rpb.review_id = r.id
+                 WHERE r.patchset_id = ?
+                 ORDER BY pb.id ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        let mut list = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let is_newly_discovered: i64 = row.get(1).unwrap_or(1);
+            if let Some(bug) = self.get_bug(bug_id).await? {
+                list.push((bug, is_newly_discovered != 0));
+            }
+        }
+
+        list.sort_by(|(a, _), (b, _)| {
+            b.severity()
+                .cmp(&a.severity())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        Ok(list)
+    }
+
+    /// Loads the deduplication corpus: every bug that is still a candidate for
+    /// being matched against, together with its embedding.
+    ///
+    /// This is the only read path that pulls vectors, which is why they live in
+    /// a side table rather than on the core row.
+    pub async fn list_all_bugs_for_vector_search(&self) -> Result<Vec<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT b.id, v.vector_json
+                 FROM bugs b
+                 LEFT JOIN bug_vectors v ON v.bug_id = b.id
+                 WHERE b.lifecycle_status IN ('new', 'open', 'fixed')
+                 ORDER BY b.id ASC",
+                (),
+            )
+            .await?;
+
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let vector_json: Option<String> = row.get(1).ok().flatten();
+            ids.push((id, vector_json));
+        }
+
+        let mut list = Vec::new();
+        for (id, vector_json) in ids {
+            if let Some(mut bug) = self.get_bug(id).await? {
+                bug.vector_json = vector_json;
+                list.push(bug);
+            }
+        }
+
+        Ok(list)
+    }
+
+    /// Parses a row selected with [`BUG_ROW_COLUMNS`]. The column order here and
+    /// the order in that constant must be kept in step.
+    fn parse_bug_row_core(row: &libsql::Row) -> Result<Bug> {
+        let id: i64 = row.get(0)?;
+        let bugid: String = row.get(1)?;
+        let title: String = row.get(2)?;
+        let lifecycle_status: String = row.get(3)?;
+        let pipeline_state: String = row.get(4)?;
+        let reporter: String = row.get(5)?;
+        let reported_at: i64 = row.get(6)?;
+        let assignee: Option<String> = row.get(7).ok().flatten();
+        let assigned_at: Option<i64> = row.get(8).ok().flatten();
+        let discovered_in_patchset_id: Option<i64> = row.get(9).ok().flatten();
+        let discovered_in_patch_id: Option<i64> = row.get(10).ok().flatten();
+        let discovered_in_commit: Option<String> = row.get(11).ok().flatten();
+        let source_ref: Option<String> = row.get(12).ok().flatten();
+        let duplicate_of_id: Option<i64> = row.get(13).ok().flatten();
+        let created_at: i64 = row.get(14)?;
+        let updated_at: i64 = row.get(15)?;
+
+        Ok(Bug {
+            id,
+            bugid,
+            title,
+            lifecycle_status: lifecycle_status.parse()?,
+            pipeline_state: pipeline_state.parse()?,
+            reporter,
+            reported_at,
+            assignee,
+            assigned_at,
+            discovered_in_patchset_id,
+            discovered_in_patch_id,
+            discovered_in_commit,
+            source_ref,
+            vector_json: None,
+            duplicate_of_id,
+            created_at,
+            updated_at,
+            subsystems: Vec::new(),
+            enrichments: Vec::new(),
+        })
+    }
+
+    pub async fn parse_bug_row(&self, row: &libsql::Row) -> Result<Bug> {
+        let mut bug = Self::parse_bug_row_core(row)?;
+        bug.subsystems = self
+            .get_subsystems_for_bug(bug.id)
+            .await
+            .unwrap_or_default();
+        bug.enrichments = self.get_bug_enrichments(bug.id).await?;
+        Ok(bug)
     }
 
     pub async fn get_timeline_stats(&self, subsystem_id: Option<i64>) -> Result<serde_json::Value> {
@@ -1200,30 +4546,6 @@ impl Database {
 
     pub async fn commit_transaction(&self) -> Result<()> {
         self.conn.execute("COMMIT", ()).await?;
-        Ok(())
-    }
-
-    async fn try_create_index(&self, index_name: &str, table: &str, column: &str) -> Result<()> {
-        let sql = format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {}({})",
-            index_name, table, column
-        );
-        if let Err(e) = self.conn.execute(&sql, ()).await {
-            info!("Migration: Error creating index {}: {}", index_name, e);
-        } else {
-            info!("Migration: Ensured index {} exists", index_name);
-        }
-        Ok(())
-    }
-
-    async fn try_add_column(&self, table: &str, column: &str, type_def: &str) -> Result<()> {
-        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, type_def);
-        if let Err(_e) = self.conn.execute(&sql, ()).await {
-            // Ignore error if column likely exists (duplicate column name)
-            // info!("Migration: Column {} likely exists or error adding: {}", column, e);
-        } else {
-            info!("Migration: Added column {} to {}", column, table);
-        }
         Ok(())
     }
 
@@ -1592,7 +4914,7 @@ impl Database {
                 git_blob_hash=excluded.git_blob_hash,
                 mailing_list=excluded.mailing_list,
                 references_hdr=excluded.references_hdr",
-            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, body, to, cc, git_blob_hash, mailing_list, references_hdr],
+            libsql::params![message_id, thread_id, in_reply_to, author, subject, date, crate::compression::compress_string_if_needed(body), to, cc, git_blob_hash, mailing_list, references_hdr],
         ).await?;
         Ok(())
     }
@@ -1644,6 +4966,317 @@ impl Database {
         }
     }
 
+    /// Record `baseline_id` as the series base of `patchset_id` unless a
+    /// lower-numbered part already supplied one. A part re-ingested with
+    /// a corrected baseline replaces its own earlier answer.
+    ///
+    /// Only the first patch's parent is the series base; a later patch's
+    /// parent is just the patch before it. An unset baseline takes any
+    /// part's, since the cover letter wins the lowest index but usually
+    /// carries no base-commit trailer.
+    ///
+    /// `part_index` is None when the part that supplied `baseline_id` is
+    /// unknown, as for a row written before the column existed. Unknown
+    /// ranks below every part: any part displaces it, and it displaces
+    /// only an unset or equally unknown baseline.
+    async fn record_series_baseline(
+        &self,
+        patchset_id: i64,
+        baseline_id: i64,
+        part_index: Option<u32>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
+                 WHERE id = ?
+                   AND (baseline_id IS NULL
+                        OR baseline_part_index IS NULL
+                        OR ? <= baseline_part_index)",
+                libsql::params![baseline_id, part_index, patchset_id, part_index],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Report whether `candidate_msg_id` is the cover letter of a series of
+    /// `total_parts` parts at `version`, written by `author`.
+    ///
+    /// Every part of a series points at its cover letter through In-Reply-To,
+    /// but a series is just as often posted in reply to an unrelated thread or
+    /// to its own previous version, and then that message belongs to somebody
+    /// else. A cover letter announces part 0 of exactly as many parts, at the
+    /// same version, from the same author.
+    pub async fn message_is_cover_letter_for(
+        &self,
+        candidate_msg_id: &str,
+        author: &str,
+        total_parts: u32,
+        version: Option<u32>,
+    ) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subject, author FROM messages WHERE message_id = ?",
+                libsql::params![candidate_msg_id],
+            )
+            .await?;
+
+        let Ok(Some(row)) = rows.next().await else {
+            return Ok(false);
+        };
+
+        let subject: String = row.get(0).unwrap_or_default();
+        let candidate_author: String = row.get(1).unwrap_or_default();
+        let (index, total) = crate::patch::parse_subject_index(&subject);
+
+        Ok(index == 0
+            && total == total_parts
+            && crate::patch::parse_subject_version(&subject).unwrap_or(1) == version.unwrap_or(1)
+            && crate::patch::authors_match(&candidate_author, author))
+    }
+
+    /// Determine whether an incoming message's version tag is compatible with an
+    /// existing candidate patchset.
+    fn versions_are_compatible(
+        existing_version: Option<u32>,
+        existing_subject_index: u32,
+        existing_status: &str,
+        new_version: Option<u32>,
+        new_part_index: u32,
+        same_thread: bool,
+        same_batch_or_reply: bool,
+    ) -> bool {
+        let v_old = existing_version.unwrap_or(1);
+        let v_new = new_version.unwrap_or(1);
+        if v_old == v_new {
+            return true;
+        }
+
+        // Two explicit, different version tags (e.g. v1 vs v2, or v5 vs v6)
+        // never belong to the same patchset.
+        if existing_version.is_some() && new_version.is_some() {
+            return false;
+        }
+
+        // If the existing series has an explicit version (e.g. [PATCH v6 00/33])
+        // and an incoming patch (part_index > 0) in the same thread omitted the
+        // version tag ([PATCH 01/33]), allow it to merge into the series.
+        if existing_version.is_some() && new_version.is_none() {
+            return new_part_index > 0 && same_thread;
+        }
+
+        // Conversely, if unversioned patches arrived first (existing_version is None,
+        // existing_subject_index > 0) and an explicit versioned cover letter or patch
+        // arrives from the same git send-email batch (or direct reply to the cover letter),
+        // allow them to merge.
+        if existing_version.is_none() && new_version.is_some() {
+            return existing_subject_index > 0
+                && (existing_status == "Incomplete"
+                    || existing_status == "Fetching"
+                    || (new_part_index == 0 && existing_status == "Pending"))
+                && same_batch_or_reply;
+        }
+
+        false
+    }
+
+    /// Classify a series identity (`cover_letter_message_id`) on `patchset_id`.
+    /// Returns `Ok(None)` if `msg_id` is a cover letter (part 0), or `Ok(Some(part_index))`
+    /// if `msg_id` is a patch (part > 0).
+    async fn identity_part_index(&self, patchset_id: i64, msg_id: &str) -> Result<Option<u32>> {
+        if let Some(idx) = self.patch_part_index(patchset_id, msg_id).await? {
+            if idx == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(idx));
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subject FROM messages WHERE message_id = ?",
+                libsql::params![msg_id],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            let subj: String = row.get(0).unwrap_or_default();
+            let (idx, _total) = crate::patch::parse_subject_index(&subj);
+            if idx == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(idx));
+        }
+
+        let mut ps_rows = self
+            .conn
+            .query(
+                "SELECT subject_index FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if let Ok(Some(row)) = ps_rows.next().await {
+            let subj_idx: u32 = row.get(0).unwrap_or(9999);
+            if subj_idx == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(subj_idx));
+        }
+
+        Ok(Some(9999))
+    }
+
+    /// Name a patchset after one of its own messages.
+    ///
+    /// A series is named by its cover letter, and by its lowest-numbered part
+    /// when it has none. Parts arrive in any order, so a part may take the
+    /// name over only from a higher-numbered part of the same series: the name
+    /// then settles on part 1 and stops moving. An id that is not one of the
+    /// series' own parts is a cover letter or a placeholder minted for a
+    /// fetch, and either way the caller knows better than the parts do.
+    async fn adopt_series_identity(
+        &self,
+        patchset_id: i64,
+        identity: &str,
+        part_index: u32,
+        is_own_part_id: bool,
+    ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let current: Option<String> = match rows.next().await {
+            Ok(Some(row)) => row.get::<Option<String>>(0).ok().flatten(),
+            _ => None,
+        };
+
+        if current.as_deref() == Some(identity) {
+            return Ok(());
+        }
+
+        // Never adopt an identity that is already claimed as the cover letter
+        // of another patchset row.
+        let mut owner_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND id != ? LIMIT 1",
+                libsql::params![identity, patchset_id],
+            )
+            .await?;
+        if owner_rows.next().await?.is_some() {
+            return Ok(());
+        }
+
+        let replace = match current.as_deref() {
+            None => true,
+            // A placeholder id stands in until a real message shows up.
+            Some(curr) if curr.ends_with("@sashiko.local") => !identity.ends_with("@sashiko.local"),
+            Some(curr) => {
+                let curr_part_idx = self.identity_part_index(patchset_id, curr).await?;
+                match curr_part_idx {
+                    None => {
+                        // Once a series has its own 0/N cover letter (and it is not
+                        // a placeholder), no subsequent message may overwrite it.
+                        false
+                    }
+                    Some(curr_idx) => {
+                        if !is_own_part_id || part_index == 0 {
+                            // The incoming identity is a cover letter (either part_index == 0
+                            // or an unclaimed parent cover letter from In-Reply-To).
+                            true
+                        } else {
+                            // Both current and incoming are patch message IDs; the lower
+                            // part index wins.
+                            curr_idx > part_index
+                        }
+                    }
+                }
+            }
+        };
+
+        if replace {
+            self.set_series_identity(patchset_id, identity).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_series_identity(&self, patchset_id: i64, identity: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                libsql::params![identity, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The part number a message holds in a patchset, or None when the message
+    /// is not one of its patches.
+    async fn patch_part_index(&self, patchset_id: i64, message_id: &str) -> Result<Option<u32>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT part_index FROM patches WHERE patchset_id = ? AND message_id = ?",
+                libsql::params![patchset_id, message_id],
+            )
+            .await?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<Option<u32>>(0).ok().flatten()),
+            _ => Ok(None),
+        }
+    }
+
+    /// Report whether a patchset already holds `message_id`, as its cover
+    /// letter or as one of its patches.
+    ///
+    /// A message id is stored in the form it arrived in, so every form it
+    /// could be stored under is tried. A message that is already part of a
+    /// series has to be recognised as one: a series that has been reviewed
+    /// takes no further parts, and a re-delivery that reads as a new message
+    /// would be answered with a second series rather than the first one.
+    async fn patchset_holds_message(&self, patchset_id: i64, message_id: &str) -> Result<bool> {
+        for candidate in Self::get_msgid_candidates(message_id) {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets
+                      WHERE id = ? AND cover_letter_message_id = ?
+                     UNION ALL
+                     SELECT 1 FROM patches
+                      WHERE patchset_id = ? AND message_id = ?
+                     LIMIT 1",
+                    libsql::params![patchset_id, candidate.clone(), patchset_id, candidate],
+                )
+                .await?;
+            if rows.next().await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Report whether a patchset has reached a state that a message it does
+    /// not already hold must not change.
+    ///
+    /// Cancelled is a decision about the series as a whole, and a part that
+    /// turns up afterwards must not undo it. The remaining terminal states
+    /// describe the parts the series has: one that is still short of them is
+    /// waiting, and the part it is waiting for belongs to it.
+    ///
+    /// A status the review pipeline does not define, such as the Fetching a
+    /// fetch leaves behind, is not terminal.
+    fn is_closed_to_new_parts(status: &str, received_parts: u32, total_parts: u32) -> bool {
+        match ReviewStatus::from_str(status) {
+            Ok(ReviewStatus::Cancelled) => true,
+            Ok(ReviewStatus::Reviewed | ReviewStatus::Failed | ReviewStatus::FailedToApply) => {
+                received_parts >= total_parts
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_patchset(
         &self,
@@ -1664,37 +5297,144 @@ impl Database {
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
     ) -> Result<Option<i64>> {
+        let res = self
+            .create_patchset_inner(
+                thread_id,
+                cover_letter_message_id,
+                message_id,
+                subject,
+                author,
+                date,
+                total_parts,
+                parser_version,
+                to,
+                cc,
+                version,
+                part_index,
+                baseline_id,
+                strict_author,
+                skip_filters,
+                only_filters,
+            )
+            .await?;
+
+        if let Some(id) = res {
+            self.reconcile_superseded_series_patchsets(
+                id, author, subject, part_index, version, date,
+            )
+            .await?;
+        }
+
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_patchset_inner(
+        &self,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        parser_version: i32,
+        to: &str,
+        cc: &str,
+        version: Option<u32>,
+        part_index: u32,
+        baseline_id: Option<i64>,
+        strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+    ) -> Result<Option<i64>> {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
+
+        // A series with no cover letter names itself after a part, and this
+        // message is that part when the caller passed its own id. Such a name
+        // yields to a lower-numbered part; every other name is a cover letter
+        // or a placeholder and stands.
+        let is_own_part_id = cover_letter_message_id == Some(message_id) && part_index > 0;
+
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push(clid.to_string());
+            clid_candidates.push((clid.to_string(), false));
         }
-        // Fallback for single-patch git imports where placeholder is sha@sashiko.local
-        // but the actual cover letter becomes the sha itself.
-        clid_candidates.push(format!("{}@sashiko.local", message_id));
+        // Fallback for single-patch git imports where placeholder is
+        // sha@sashiko.local but the actual cover letter becomes the sha
+        // itself.  Only add the fallback when no explicit cover letter
+        // was provided AND the patch is a singleton (total == 1).
+        // Multi-part ranges always have an explicit cover letter ID,
+        // and the fallback would incorrectly match patchsets from
+        // unrelated submissions that happen to share a commit SHA.
+        if cover_letter_message_id.is_none() || total_parts == 1 {
+            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+        }
 
-        for clid in clid_candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
+        for (clid, scope_to_thread) in clid_candidates {
+            // When using the @sashiko.local fallback, scope the query
+            // to the same thread to avoid cross-patchset contamination.
+            let query = if scope_to_thread {
+                "SELECT id, date, author, subject, subject_index, total_parts, status, thread_id, received_parts FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
+            } else {
+                "SELECT id, date, author, subject, subject_index, total_parts, status, thread_id, received_parts FROM patchsets WHERE cover_letter_message_id = ?"
+            };
+            let mut rows = if scope_to_thread {
+                self.conn
+                    .query(query, libsql::params![clid.clone(), thread_id])
+                    .await?
+            } else {
+                self.conn
+                    .query(query, libsql::params![clid.clone()])
+                    .await?
+            };
             while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
+                let existing_author: String = row.get(2).unwrap_or_default();
                 let existing_subject: String = row.get(3)?;
+                let subject_index: u32 = row.get(4).unwrap_or(9999);
+                let existing_total: u32 = row.get(5).unwrap_or(1);
                 let existing_status: String = row.get(6).unwrap_or_else(|_| "Unknown".to_string());
+                let existing_thread_id: Option<i64> = row.get(7).ok();
+                let existing_received: u32 = row.get(8).unwrap_or(0);
+
+                let is_duplicate = self.patchset_holds_message(id, message_id).await?;
+                let is_synthetic_series = clid.ends_with("@sashiko.local");
+
+                if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total)
+                {
+                    if is_duplicate {
+                        return Ok(Some(id));
+                    }
+                    if !(is_synthetic_series
+                        && existing_status == ReviewStatus::Cancelled.as_str()
+                        && existing_received < existing_total)
+                    {
+                        continue;
+                    }
+                }
 
                 let is_placeholder =
                     existing_subject == "(placeholder)" || existing_status == "Fetching";
 
                 let existing_version = crate::patch::parse_subject_version(&existing_subject);
-                let v_new = version.unwrap_or(1);
-                let v_old = existing_version.unwrap_or(1);
-                let versions_compatible = v_new == v_old;
+                let same_thread = existing_thread_id == Some(thread_id);
+                // A forge series is one pull request: its parts are commits
+                // whose subjects carry no version tag of their own, so the
+                // mail rules below have nothing to compare and would split
+                // the series into a row per commit.
+                let versions_compatible = is_synthetic_series
+                    || Self::versions_are_compatible(
+                        existing_version,
+                        subject_index,
+                        &existing_status,
+                        version,
+                        part_index,
+                        same_thread,
+                        false,
+                    );
 
                 let index_collision = if part_index == 0 {
                     false
@@ -1706,16 +5446,12 @@ impl Database {
                             libsql::params![id, part_index, message_id],
                         )
                         .await?;
-                    p_rows.next().await.ok().flatten().is_some()
+                    p_rows.next().await?.is_some()
                 };
 
                 if index_collision || (!is_placeholder && !versions_compatible) {
                     continue;
                 }
-
-                // Found it! Use this ID. We'll update its fields below.
-                let subject_index: u32 = row.get(4).unwrap_or(9999);
-                let existing_total: u32 = row.get(5).unwrap_or(1);
 
                 // Prevent downgrading a series to a singleton if we already have multiple parts.
                 // This handles cases where a singleton root (1/1) overwrites a series (N/N) inferred from replies.
@@ -1725,32 +5461,53 @@ impl Database {
                     total_parts
                 };
 
-                // We proceed to update this record with the full metadata
-                self.conn.execute(
-                    "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                    libsql::params![thread_id, author, final_total, parser_version, to, cc, id],
-                ).await?;
+                let trimmed = subject.trim_start();
+                let is_reply_msg = part_index == 0
+                    && trimmed
+                        .get(..3)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
 
-                if let Some(real_clid) = cover_letter_message_id {
+                let final_author = if is_placeholder
+                    || part_index <= subject_index
+                    || existing_author.is_empty()
+                    || existing_author == "unknown"
+                {
+                    author
+                } else {
+                    existing_author.as_str()
+                };
+
+                // We proceed to update this record with the full metadata
+                if is_reply_msg {
                     self.conn
                         .execute(
-                            "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
-                            libsql::params![real_clid, id],
+                            "UPDATE patchsets SET thread_id = ?, parser_version = ? WHERE id = ?",
+                            libsql::params![thread_id, parser_version, id],
                         )
+                        .await?;
+                } else {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
+                            libsql::params![thread_id, final_author, final_total, parser_version, to, cc, id],
+                        )
+                        .await?;
+                }
+
+                if let Some(real_clid) = cover_letter_message_id
+                    && !is_reply_msg
+                {
+                    self.adopt_series_identity(id, real_clid, part_index, is_own_part_id)
                         .await?;
                 }
 
                 if let Some(bid) = baseline_id {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET baseline_id = ? WHERE id = ?",
-                            libsql::params![bid, id],
-                        )
+                    self.record_series_baseline(id, bid, Some(part_index))
                         .await?;
                 }
 
                 // Update subject if this is a better index (e.g. going from placeholder to real subject)
-                if part_index < subject_index {
+                if !is_reply_msg && part_index < subject_index {
                     self.conn
                         .execute(
                             "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
@@ -1780,13 +5537,23 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id FROM patchsets 
-                 WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)",
+                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index, status FROM patchsets
+                 WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)
+                 ORDER BY id ASC",
                 libsql::params![thread_id, author, window_start, window_end],
             )
             .await?;
 
-        let mut matches = Vec::new();
+        struct CandidateMatch {
+            id: i64,
+            subject: String,
+            subject_index: u32,
+            cover_id: Option<String>,
+            baseline_id: Option<i64>,
+            baseline_part: Option<u32>,
+        }
+
+        let mut matches: Vec<CandidateMatch> = Vec::new();
 
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
@@ -1798,33 +5565,13 @@ impl Database {
             let existing_received: u32 = row.get(6).unwrap_or(0);
             let existing_cover_id: Option<String> = row.get(7).ok();
             let existing_thread_id: Option<i64> = row.get(8).ok();
+            let existing_baseline_id: Option<i64> = row.get(9).ok();
+            let existing_baseline_part: Option<u32> = row.get(10).ok();
+            let existing_status: String = row.get(11).unwrap_or_else(|_| "Unknown".to_string());
 
-            // Check if this message is already part of this patchset (Duplicate processing)
-            // 1. Check if it is the cover letter.
-            let is_cover_duplicate = existing_cover_id.as_deref() == Some(message_id);
-
-            // 2. Check if it is an existing patch.
-            let is_patch_duplicate = if !is_cover_duplicate {
-                let mut p_rows = self
-                    .conn
-                    .query(
-                        "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ?",
-                        libsql::params![id, message_id],
-                    )
-                    .await?;
-                p_rows.next().await.ok().flatten().is_some()
-            } else {
-                false
-            };
-
-            let is_duplicate = is_cover_duplicate || is_patch_duplicate;
-
-            // If the patchset is already full, do not merge more patches into it,
-            // UNLESS it is a duplicate of a message already in the set.
-            // This prevents merging unrelated patchsets that happen to look similar (same author/size).
-            if existing_received >= existing_total && !is_duplicate && part_index != 0 {
-                continue;
-            }
+            // A message that this patchset already holds is being processed
+            // again, rather than arriving for the first time.
+            let is_duplicate = self.patchset_holds_message(id, message_id).await?;
 
             // Parse version from existing subject
             let existing_version = crate::patch::parse_subject_version(&existing_subject);
@@ -1848,7 +5595,7 @@ impl Database {
                         libsql::params![id, part_index, message_id],
                     )
                     .await?;
-                p_rows.next().await.ok().flatten().is_some()
+                p_rows.next().await?.is_some()
             };
 
             let mut existing_msgid_prefix = None;
@@ -1873,17 +5620,77 @@ impl Database {
             let msgid_prefix_match = existing_msgid_prefix.as_deref() == Some(new_msgid_prefix)
                 && new_msgid_prefix.len() > 10;
 
-            // Matching logic:
-            // 1. Author matches OR it's a multi-part series with matching total_parts (trusting thread context)
-            //    BUT strict_author enforces strict author matching (for Email/NNTP).
-            // 2. Time must be close (within 24 hours / 86400s)
-            // 3. Total parts must match
-            // 4. Versions must match (treating None as v1)
-            // 5. For singletons (total=1), Subject must match (fuzzy) to avoid merging unrelated patches
+            let patches_reply_to_new_cover = if part_index == 0 && existing_subject_index > 0 {
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT 1 FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND m.in_reply_to = ? LIMIT 1",
+                        libsql::params![id, message_id],
+                    )
+                    .await?;
+                p_rows.next().await?.is_some()
+            } else {
+                false
+            };
 
-            let v_new = version.unwrap_or(1);
-            let v_old = existing_version.unwrap_or(1);
-            let versions_compatible = v_new == v_old;
+            let same_thread = existing_thread_id == Some(thread_id);
+            let versions_compatible = Self::versions_are_compatible(
+                existing_version,
+                existing_subject_index,
+                &existing_status,
+                version,
+                part_index,
+                same_thread,
+                msgid_prefix_match || patches_reply_to_new_cover,
+            );
+
+            // Relaxed author check logic
+            let author_match = crate::patch::authors_match(&existing_author, author);
+            let series_match = (total_parts > 1 && total_parts == existing_total)
+                || existing_total == 1
+                || total_parts == 1;
+
+            let author_or_series_match = if strict_author {
+                author_match
+            } else {
+                author_match || series_match
+            };
+
+            if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total) {
+                if is_duplicate {
+                    return Ok(Some(id));
+                }
+                let is_late_own_cover = part_index == 0
+                    && existing_subject_index > 0
+                    && (patches_reply_to_new_cover || msgid_prefix_match)
+                    && versions_compatible
+                    && author_or_series_match
+                    && !index_collision;
+                if is_late_own_cover {
+                    if let Some(clid) = cover_letter_message_id {
+                        self.adopt_series_identity(id, clid, 0, false).await?;
+                    }
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET subject = ?, subject_index = 0 WHERE id = ? AND subject_index > 0",
+                            libsql::params![subject, id],
+                        )
+                        .await?;
+                    return Ok(Some(id));
+                }
+                continue;
+            }
+
+            // If the patchset is already full, do not merge more patches into it,
+            // UNLESS it is a duplicate of a message already in the set, or it is
+            // the 0/N cover letter arriving for an incomplete/pending series that
+            // has no cover letter yet (existing_subject_index > 0).
+            if existing_received >= existing_total
+                && !is_duplicate
+                && (part_index != 0 || existing_subject_index == 0)
+            {
+                continue;
+            }
 
             let is_singleton = total_parts == 1;
             // For singletons, we require the subject to be somewhat similar to avoid merging unrelated patches.
@@ -1912,20 +5719,7 @@ impl Database {
                 }
             };
 
-            // Relaxed author check logic
-            let author_match = crate::patch::authors_match(&existing_author, author);
-            let series_match = (total_parts > 1 && total_parts == existing_total)
-                || existing_total == 1
-                || total_parts == 1;
-
-            let author_or_series_match = if strict_author {
-                author_match
-            } else {
-                author_match || series_match
-            };
-
             // Prefix matching (to separate different series from same author)
-            let same_thread = existing_thread_id == Some(thread_id);
             let prefix_match = if same_thread {
                 true // Trust thread
             } else {
@@ -1941,80 +5735,206 @@ impl Database {
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
-                && (versions_compatible || same_thread)
+                && versions_compatible
                 && (total_parts == existing_total || existing_total == 1 || total_parts == 1)
                 && subject_match
                 && prefix_match
                 && thread_compatible
                 && !index_collision
             {
-                matches.push((id, existing_subject_index));
+                matches.push(CandidateMatch {
+                    id,
+                    subject: existing_subject,
+                    subject_index: existing_subject_index,
+                    cover_id: existing_cover_id,
+                    baseline_id: existing_baseline_id,
+                    baseline_part: existing_baseline_part,
+                });
             }
         }
 
         if !matches.is_empty() {
-            // Sort matches to pick the "best" one to keep (e.g. oldest ID or one with lowest subject index)
-            // Let's keep the one with the lowest ID (created first)
-            matches.sort_by_key(|k| k.0);
+            // Keep the row with the lowest ID (created first) as the primary target
+            matches.sort_by_key(|k| k.id);
 
-            let target_id = matches[0].0;
-            let mut current_subject_index = matches[0].1;
+            let target_id = matches[0].id;
+            let mut current_subject_index = matches[0].subject_index;
+            let mut best_merged_subject: Option<(u32, String)> = None;
+            let mut merged_cover_ids: Vec<String> = Vec::new();
 
             // If we have multiple matches, merge others into target_id
-            for (merge_from_id, merge_subject_index) in matches.iter().skip(1) {
-                let merge_from_id = *merge_from_id;
-                info!("Merging patchset {} into {}", merge_from_id, target_id);
+            if matches.len() > 1 {
+                let tx = self.conn.transaction().await?;
+                for merge_from in matches.iter().skip(1) {
+                    let merge_from_id = merge_from.id;
+                    info!("Merging patchset {} into {}", merge_from_id, target_id);
 
-                // Reassign patches
-                self.conn
-                    .execute(
+                    // Re-point any bugs referencing duplicate patches before deleting them
+                    tx.execute(
+                        "UPDATE bugs
+                            SET discovered_in_patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = bugs.discovered_in_patch_id
+                                )
+                          WHERE discovered_in_patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    tx.execute(
+                        "UPDATE reviews
+                            SET patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = reviews.patch_id
+                                )
+                          WHERE patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Reassign patches: first remove duplicates that already exist on target_id
+                    // to prevent unique constraint conflicts and lingering foreign key references.
+                    tx.execute(
+                        "DELETE FROM patches WHERE patchset_id = ? AND message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Reassign remaining patches
+                    tx.execute(
                         "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
 
-                // Reassign reviews
-                self.conn
-                    .execute(
+                    // Reassign bugs discovered in merge_from_id
+                    tx.execute(
+                        "UPDATE bugs SET discovered_in_patchset_id = ? WHERE discovered_in_patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+
+                    // Reassign reviews
+                    tx.execute(
                         "UPDATE reviews SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
 
-                // Merge subsystems
-                self.conn
-                    .execute(
+                    // Merge subsystems
+                    tx.execute(
                         "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id)
                          SELECT ?, subsystem_id FROM patchsets_subsystems WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
-                self.conn
-                    .execute(
+                    tx.execute(
                         "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
 
-                // If the merged patchset had a better subject index, track it
-                if *merge_subject_index < current_subject_index {
-                    current_subject_index = *merge_subject_index;
-                }
+                    // Track the best subject across merged rows
+                    if merge_from.subject_index < current_subject_index {
+                        current_subject_index = merge_from.subject_index;
+                        best_merged_subject =
+                            Some((merge_from.subject_index, merge_from.subject.clone()));
+                    }
 
-                // Delete the merged patchset
-                self.conn
-                    .execute(
+                    if let Some(ref m_clid) = merge_from.cover_id {
+                        merged_cover_ids.push(m_clid.clone());
+                    }
+
+                    // A baseline from a lower-numbered part than the target's
+                    // is lost when the row is deleted below, with no part left
+                    // to supply it again.
+                    if let Some(bid) = merge_from.baseline_id {
+                        tx.execute(
+                            "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
+                             WHERE id = ?
+                               AND (baseline_id IS NULL
+                                    OR baseline_part_index IS NULL
+                                    OR ? <= baseline_part_index)",
+                            libsql::params![
+                                bid,
+                                merge_from.baseline_part,
+                                target_id,
+                                merge_from.baseline_part
+                            ],
+                        )
+                        .await?;
+                    }
+
+                    // Delete the merged patchset
+                    tx.execute(
                         "DELETE FROM patchsets WHERE id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
+                }
+
+                if let Some((merged_idx, ref merged_subj)) = best_merged_subject {
+                    tx.execute(
+                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                        libsql::params![merged_subj.as_str(), merged_idx, target_id],
+                    )
+                    .await?;
+                }
+
+                tx.commit().await?;
+
+                // Adopt the best series identity across all merged rows now that
+                // redundant rows have been deleted and all patches are attached to target_id.
+                for m_clid in merged_cover_ids {
+                    let m_part_idx = self.identity_part_index(target_id, &m_clid).await?;
+                    self.adopt_series_identity(
+                        target_id,
+                        &m_clid,
+                        m_part_idx.unwrap_or(0),
+                        m_part_idx.is_some(),
+                    )
+                    .await?;
+                }
             }
 
+            let trimmed = subject.trim_start();
+            let is_reply_msg = part_index == 0
+                && trimmed
+                    .get(..3)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+
             // Update the target patchset
-            self.conn.execute(
-                "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                libsql::params![author, total_parts, parser_version, to, cc, target_id],
-            ).await?;
+            if is_reply_msg {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET parser_version = ? WHERE id = ?",
+                        libsql::params![parser_version, target_id],
+                    )
+                    .await?;
+            } else {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
+                        libsql::params![author, total_parts, parser_version, to, cc, target_id],
+                    )
+                    .await?;
+            }
 
             if skip_filters_json.is_some() || only_filters_json.is_some() {
                 self.conn.execute(
@@ -2024,41 +5944,25 @@ impl Database {
             }
 
             if let Some(bid) = baseline_id {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET baseline_id = ? WHERE id = ?",
-                        libsql::params![bid, target_id],
-                    )
+                self.record_series_baseline(target_id, bid, Some(part_index))
                     .await?;
             }
 
-            // Conditionally update subject
-            // Note: We check against the best index found among all merged sets OR the new part_index
-            if part_index < current_subject_index {
+            // Adopt identity before updating subject_index so adopt_series_identity
+            // sees whether target_id already had a 0/N cover letter prior to this message.
+            if let Some(clid) = cover_letter_message_id
+                && !is_reply_msg
+            {
+                self.adopt_series_identity(target_id, clid, part_index, is_own_part_id)
+                    .await?;
+            }
+
+            // Conditionally update subject if the newly arrived message has an even better index
+            if !is_reply_msg && part_index < current_subject_index {
                 self.conn
                     .execute(
                         "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
                         libsql::params![subject, part_index, target_id],
-                    )
-                    .await?;
-            } else if matches.len() > 1 {
-                // If we merged, we might need to update the subject index of the target to the best one we found.
-                // But we don't have the subject string from the merged one easily available here.
-                // However, the existing target subject is likely fine unless part_index is better.
-                // Update subject_index to be correct if a better one was merged.
-                // Actually, if matches[i].1 was better, we should have used its subject.
-                // But that's complicated. Assuming the target (oldest) usually has the cover letter or we eventually find it.
-                // Simplification: We only update if CURRENT patch is better.
-                // If we merged a patchset that HAD the cover letter, we ideally want that subject.
-                // But we lost it.
-                // TODO: Optimize merge subject selection. For now, this is better than duplicates.
-            }
-
-            if let Some(clid) = cover_letter_message_id {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
-                        libsql::params![clid, target_id],
                     )
                     .await?;
             }
@@ -2084,12 +5988,55 @@ impl Database {
             return Ok(Some(target_id));
         }
 
-        // No match found, create new patchset
+        // No match found, create new patchset.
+        // Never insert a new patchset claiming a cover_letter_message_id that is
+        // already owned by another patchset row; fall back to this message's own ID.
+        let mut final_cover_id = cover_letter_message_id.map(|s| s.to_string());
+        if let Some(ref clid) = final_cover_id {
+            let mut owner_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? LIMIT 1",
+                    libsql::params![clid.as_str()],
+                )
+                .await?;
+            if owner_rows.next().await?.is_some() {
+                if clid != message_id {
+                    let mut self_owner = self
+                        .conn
+                        .query(
+                            "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? LIMIT 1",
+                            libsql::params![message_id],
+                        )
+                        .await?;
+                    if self_owner.next().await?.is_none() {
+                        info!(
+                            "Message {} belongs to a series named {}, which another patchset holds; naming the new series after itself",
+                            message_id, clid
+                        );
+                        final_cover_id = Some(message_id.to_string());
+                    } else {
+                        warn!(
+                            "Both {} and this message's own id are held by other patchsets; the new series is left without a name and is reachable only through its patches",
+                            clid
+                        );
+                        final_cover_id = None;
+                    }
+                } else {
+                    warn!(
+                        "Message id {} is held by another patchset; the new series is left without a name and is reachable only through its patches",
+                        clid
+                    );
+                    final_cover_id = None;
+                }
+            }
+        }
+
         let mut rows = self.conn
             .query(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, skip_filters, only_filters) 
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && subject.trim_start().get(..3).is_some_and(|p| p.eq_ignore_ascii_case("re:")) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
@@ -2103,6 +6050,11 @@ impl Database {
         }
     }
 
+    /// Inserts or updates a patch when no stable Git patch ID is available.
+    ///
+    /// Re-ingesting the same message with an unchanged diff preserves any
+    /// existing Git patch ID. If the diff changed, the old ID is cleared so
+    /// it cannot refer to different patch content.
     pub async fn create_patch(
         &self,
         patchset_id: i64,
@@ -2110,93 +6062,110 @@ impl Database {
         part_index: u32,
         diff: &str,
     ) -> Result<i64> {
-        // Check if index collision occurs for this patchset
-        let collision_exists: bool = {
-            let mut rows = self
+        self.create_patch_with_git_patch_id(patchset_id, message_id, part_index, diff, None)
+            .await
+    }
+
+    /// Inserts or updates a patch and associates its stable Git patch ID.
+    pub async fn create_patch_with_git_patch_id(
+        &self,
+        patchset_id: i64,
+        message_id: &str,
+        part_index: u32,
+        diff: &str,
+        git_patch_id: Option<&str>,
+    ) -> Result<i64> {
+        let diff: Arc<str> = Arc::from(diff);
+        let diff_to_compress = Arc::clone(&diff);
+        let compressed_diff = tokio::task::spawn_blocking(move || {
+            crate::compression::compress_string_if_needed(diff_to_compress.as_ref())
+        })
+        .await
+        .context("patch compression task failed")?;
+
+        for _ in 0..PATCH_WRITE_MAX_ATTEMPTS {
+            let old_patch = get_stored_patch_state(&self.conn, patchset_id, message_id).await?;
+            let selected_patch_id =
+                select_git_patch_id(old_patch.as_ref(), Arc::clone(&diff), git_patch_id).await?;
+            // Clone the prepared value before taking the write lock. A large
+            // compressed diff should not add memory-copy time to the lock.
+            let diff_to_write = compressed_diff.clone();
+            let tx = self
                 .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            match Self::write_patch_transaction(
+                tx,
+                old_patch,
+                patchset_id,
+                message_id,
+                part_index,
+                diff_to_write,
+                selected_patch_id,
+            )
+            .await?
+            {
+                PatchWriteOutcome::Written(patch_id) => return Ok(patch_id),
+                PatchWriteOutcome::SnapshotChanged => continue,
+            }
+        }
+
+        bail!("patch {message_id} changed during {PATCH_WRITE_MAX_ATTEMPTS} write attempts")
+    }
+
+    async fn write_patch_transaction(
+        tx: libsql::Transaction,
+        old_patch: Option<StoredPatchState>,
+        patchset_id: i64,
+        message_id: &str,
+        part_index: u32,
+        diff: libsql::Value,
+        git_patch_id: Option<String>,
+    ) -> Result<PatchWriteOutcome> {
+        let collision_exists = {
+            let mut rows = tx
                 .query(
                     "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
                     libsql::params![patchset_id, part_index, message_id],
                 )
                 .await?;
-            rows.next().await.ok().flatten().is_some()
+            rows.next().await?.is_some()
         };
-
         if collision_exists {
-            return Err(anyhow::anyhow!(
-                "Index collision: index {} already exists in patchset {}",
-                part_index,
-                patchset_id
-            ));
+            bail!("Index collision: index {part_index} already exists in patchset {patchset_id}");
         }
 
-        // Check if patch exists and get old patchset_id to fix counts if we steal it
-        let old_patchset_id: Option<i64> = {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT patchset_id FROM patches WHERE message_id = ?",
-                    libsql::params![message_id],
-                )
-                .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                Some(row.get(0)?)
-            } else {
-                None
-            }
+        let Some((patch_id, existing_in_patchset)) = write_patch_if_unchanged(
+            &tx,
+            old_patch,
+            patchset_id,
+            message_id,
+            part_index,
+            diff,
+            git_patch_id,
+        )
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(PatchWriteOutcome::SnapshotChanged);
         };
 
-        // Insert or Update (Move patch to new patchset if duplicate)
-        self.conn.execute(
-            "INSERT INTO patches (patchset_id, message_id, part_index, diff) VALUES (?, ?, ?, ?)
-             ON CONFLICT(message_id) DO UPDATE SET
-                patchset_id=excluded.patchset_id,
-                part_index=excluded.part_index,
-                diff=excluded.diff",
-            libsql::params![patchset_id, message_id, part_index, diff]
-        ).await?;
-
-        // Update received_parts for the NEW patchset
-        self.conn
-            .execute(
+        if !existing_in_patchset {
+            tx.execute(
                 "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
                 libsql::params![patchset_id, patchset_id],
             )
             .await?;
-
-        // Update received_parts for the OLD patchset (if we moved it)
-        if let Some(old_id) = old_patchset_id
-            && old_id != patchset_id
-        {
-            self.conn
-                        .execute(
-                            "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
-                            libsql::params![old_id, old_id],
-                        )
-                        .await?;
         }
 
-        // Check if complete and update status
-        // We transition from 'Incomplete' OR 'Fetching' to 'Pending' (ready for review)
-        self.conn.execute(
+        tx.execute(
             "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
             libsql::params![patchset_id],
-        ).await?;
+        )
+        .await?;
 
-        // Get the patch ID
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patches WHERE message_id = ?",
-                libsql::params![message_id],
-            )
-            .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
-        } else {
-            Err(anyhow::anyhow!("Failed to get patch ID"))
-        }
+        tx.commit().await?;
+        Ok(PatchWriteOutcome::Written(patch_id))
     }
 
     fn build_search(
@@ -2287,10 +6256,151 @@ impl Database {
         Ok(())
     }
 
+    /// Embargo a patchset, unless it is one a message can no longer change.
+    ///
+    /// A series that has been reviewed has had its embargo decided already,
+    /// and an embargo placed on it afterwards would hold back nothing while
+    /// showing the series as Embargoed.
+    pub async fn set_patchset_embargo_until_if_non_terminal(
+        &self,
+        id: i64,
+        embargo_until: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE patchsets SET embargo_until = ?
+                     WHERE id = ? AND NOT {CLOSED_TO_NEW_PARTS_SQL}"
+                ),
+                libsql::params![embargo_until, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_mr_version_for_commit_range(
+        &self,
+        mr_number: i64,
+        root_msg_id: &str,
+    ) -> Result<u32> {
+        let candidates = Self::get_msgid_candidates(root_msg_id);
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, subject FROM patchsets WHERE cover_letter_message_id = ?",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let existing_id: i64 = row.get(0)?;
+                let existing_subject: String = row.get(1).unwrap_or_default();
+                if let Some(v) = crate::patch::parse_subject_version(&existing_subject)
+                    && v > 0
+                {
+                    return Ok(v);
+                }
+                let mut count_rows = self
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM patchsets WHERE mr_number = ? AND id < ?",
+                        libsql::params![mr_number, existing_id],
+                    )
+                    .await?;
+                let older_count: i64 = if let Ok(Some(crow)) = count_rows.next().await {
+                    crow.get(0).unwrap_or(0)
+                } else {
+                    0
+                };
+                return Ok((older_count + 1) as u32);
+            }
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE mr_number = ?",
+                libsql::params![mr_number],
+            )
+            .await?;
+        let count: i64 = if let Ok(Some(row)) = rows.next().await {
+            row.get(0).unwrap_or(0)
+        } else {
+            0
+        };
+        Ok((count + 1) as u32)
+    }
+
+    async fn rotate_mr_slug(&self, slug: &str, exclude_id: Option<i64>) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject FROM patchsets WHERE slug = ?",
+                libsql::params![slug],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            let old_id: i64 = row.get(0)?;
+            if Some(old_id) == exclude_id {
+                return Ok(());
+            }
+            let old_subject: String = row.get(1).unwrap_or_default();
+            let old_ver = crate::patch::parse_subject_version(&old_subject).unwrap_or(1);
+            let candidate_slug = format!("{}-v{}", slug, old_ver);
+            let res = self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET slug = ? WHERE id = ?",
+                    libsql::params![candidate_slug, old_id],
+                )
+                .await;
+            if res.is_err() {
+                let fallback_slug = format!("{}-v{}-{}", slug, old_ver, old_id);
+                let _ = self
+                    .conn
+                    .execute(
+                        "UPDATE patchsets SET slug = ? WHERE id = ?",
+                        libsql::params![fallback_slug, old_id],
+                    )
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn update_patchset_mr_metadata(
+        &self,
+        id: i64,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        slug: Option<&str>,
+    ) -> Result<()> {
+        if let Some(s) = slug {
+            self.rotate_mr_slug(s, Some(id)).await?;
+        }
+        self.conn
+            .execute(
+                "UPDATE patchsets SET
+                    mr_url = COALESCE(mr_url, ?),
+                    mr_title = COALESCE(mr_title, ?),
+                    mr_number = COALESCE(mr_number, ?),
+                    slug = COALESCE(?, slug)
+                 WHERE id = ?",
+                libsql::params![mr_url, mr_title, mr_number, slug, id],
+            )
+            .await?;
+        self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+            .await?;
+        Ok(())
+    }
+
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE patchsets SET embargo_until = NULL WHERE id = ?",
+                "UPDATE patchsets
+                 SET embargo_until = NULL, embargo_release_started_at = NULL
+                 WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -2397,6 +6507,7 @@ impl Database {
                         message_id: row.get(6).ok(),
                         total_parts: row.get(7).ok(),
                         received_parts: row.get(8).ok(),
+                        mailing_lists: subsystems.clone(),
                         subsystems,
                         findings_low: Some(low),
                         findings_medium: Some(medium),
@@ -2437,7 +6548,7 @@ impl Database {
     ) -> Result<Vec<MessageRow>> {
         let (where_clause, params) = self.build_search(query, mailing_list, "message");
         let sql = format!(
-            "SELECT id, message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr FROM messages {} ORDER BY date DESC LIMIT ? OFFSET ?",
+            "SELECT id, message_id, thread_id, in_reply_to, author, subject, date, NULL as body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr FROM messages {} ORDER BY date DESC LIMIT ? OFFSET ?",
             where_clause
         );
 
@@ -2459,7 +6570,7 @@ impl Database {
                 author: row.get(4).ok(),
                 subject: row.get(5).ok(),
                 date: row.get(6).ok(),
-                body: row.get(7).ok(),
+                body: None,
                 to: row.get(8).ok(),
                 cc: row.get(9).ok(),
                 git_blob_hash: row.get(10).ok(),
@@ -2580,7 +6691,8 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 14).unwrap_or(None);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2714,11 +6826,11 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(3).ok(),
+                    "output": crate::compression::get_compressed_string_opt(&r, 3).unwrap_or(None),
                     "result": r.get::<Option<String>>(4).ok(),
                     "status": r.get::<Option<String>>(5).ok(),
-                    "inline_review": r.get::<Option<String>>(6).ok(),
-                    "logs": r.get::<Option<String>>(7).ok(),
+                    "inline_review": crate::compression::get_compressed_string_opt(&r, 6).unwrap_or(None),
+                    "logs": crate::compression::get_compressed_string_opt(&r, 7).unwrap_or(None),
                     "tokens_in": r.get::<Option<u32>>(8).ok(),
                     "tokens_out": r.get::<Option<u32>>(9).ok(),
                     "patch_id": r.get::<Option<i64>>(10).ok(),
@@ -2757,6 +6869,12 @@ impl Database {
 
             let reviews = if is_embargoed { Vec::new() } else { reviews };
 
+            let bugs = self.list_bugs_for_patchset(pid).await.unwrap_or_default();
+            let bugs_json = bugs
+                .into_iter()
+                .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
+                .collect::<Vec<_>>();
+
             Ok(Some(serde_json::json!({
                 "id": pid,
                 "message_id": mid,
@@ -2773,8 +6891,10 @@ impl Database {
                 "limit": limit_val,
                 "received_parts": received_parts,
                 "reviews": reviews,
+                "bugs": bugs_json,
                 "patches": patches,
                 "thread": messages,
+                "mailing_lists": subsystems.clone(),
                 "subsystems": subsystems,
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
@@ -2825,7 +6945,8 @@ impl Database {
             let failed_reason: Option<String> = row.get(11).ok();
             let model_name: Option<String> = row.get(12).ok();
             let prompts_git_hash: Option<String> = row.get(13).ok();
-            let baseline_logs: Option<String> = row.get(14).ok();
+            let baseline_logs: Option<String> =
+                crate::compression::get_compressed_string_opt(&row, 14).unwrap_or(None);
             let baseline_id: Option<i64> = row.get(15).ok();
             let provider: Option<String> = row.get(16).ok();
             let embargo_until: Option<i64> = row.get(17).ok();
@@ -2955,10 +7076,10 @@ impl Database {
                 reviews.push(serde_json::json!({
                     "summary": r.get::<Option<String>>(0).ok(),
                     "created_at": r.get::<Option<i64>>(1).ok(),
-                    "output": r.get::<Option<String>>(2).ok(),
+                    "output": crate::compression::get_compressed_string_opt(&r, 2).unwrap_or(None),
                     "result": r.get::<Option<String>>(3).ok(),
                     "status": r.get::<Option<String>>(4).ok(),
-                    "inline_review": r.get::<Option<String>>(5).ok(),
+                    "inline_review": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
                     "tokens_in": r.get::<Option<u32>>(6).ok(),
                     "tokens_out": r.get::<Option<u32>>(7).ok(),
                     "patch_id": r.get::<Option<i64>>(8).ok(),
@@ -3014,6 +7135,7 @@ impl Database {
                 "reviews": reviews,
                 "patches": patches,
                 "thread": messages,
+                "mailing_lists": subsystems.clone(),
                 "subsystems": subsystems,
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
@@ -3035,31 +7157,10 @@ impl Database {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        match self.find_patchset_id_by_msgid(msg_id).await? {
+            Some(id) => self.get_patchset_summary(id, page, limit).await,
+            None => Ok(None),
         }
-
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
-                libsql::params![msg_id],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
-        }
-
-        Ok(None)
     }
 
     pub async fn get_patchset_details_by_slug(
@@ -3110,7 +7211,7 @@ impl Database {
             .query(
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
-                        r.provider, r.prompts_git_hash, r.result_description,
+                        r.provider, r.prompts_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
@@ -3121,13 +7222,19 @@ impl Database {
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
+            let bugs = self.list_bugs_for_review(id).await.unwrap_or_default();
+            let bugs_json = bugs
+                .into_iter()
+                .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
+                .collect::<Vec<_>>();
+
             Ok(Some(serde_json::json!({
                 "id": r.get::<i64>(0)?,
                 "model": r.get::<Option<String>>(1).ok(),
                 "summary": r.get::<Option<String>>(2).ok(),
                 "created_at": r.get::<Option<i64>>(3).ok(),
-                "input": r.get::<Option<String>>(4).ok(),
-                "output": r.get::<Option<String>>(5).ok(),
+                "input": crate::compression::get_compressed_string_opt(&r, 4).unwrap_or(None),
+                "output": crate::compression::get_compressed_string_opt(&r, 5).unwrap_or(None),
                 "baseline": {
                     "repo_url": r.get::<Option<String>>(6).ok(),
                     "branch": r.get::<Option<String>>(7).ok(),
@@ -3137,12 +7244,13 @@ impl Database {
                 "prompts_hash": r.get::<Option<String>>(10).ok(),
                 "result": r.get::<Option<String>>(11).ok(),
                 "status": r.get::<Option<String>>(12).ok(),
-                "inline_review": r.get::<Option<String>>(13).ok(),
-                "logs": r.get::<Option<String>>(14).ok(),
+                "inline_review": crate::compression::get_compressed_string_opt(&r, 13).unwrap_or(None),
+                "logs": crate::compression::get_compressed_string_opt(&r, 14).unwrap_or(None),
                 "tokens_in": r.get::<Option<u32>>(15).ok(),
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                "bugs": bugs_json,
             })))
         } else {
             Ok(None)
@@ -3169,6 +7277,92 @@ impl Database {
         }
     }
 
+    /// Patchsets that have no MAINTAINERS attribution at all, in id order and
+    /// starting after `after_id`.
+    ///
+    /// Paged by id rather than by offset because the backfill writes as it
+    /// walks. An offset would shift underneath it as rows stop matching, and
+    /// the walk would skip patchsets. Resuming from the highest id already
+    /// seen cannot skip anything, and the worst it can do is revisit a
+    /// patchset, which the upsert makes harmless.
+    ///
+    /// A patchset that legitimately matches no section keeps coming back here,
+    /// which is why the caller pages by id and stamps completion rather than
+    /// looping until this returns nothing.
+    pub async fn patchsets_missing_maintainer_sections(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id FROM patchsets p
+                 WHERE p.id > ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patchset_maintainer_sections s
+                        WHERE s.patchset_id = p.id
+                   )
+                 ORDER BY p.id ASC
+                 LIMIT ?",
+                libsql::params![after_id, limit as i64],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
+    }
+
+    /// Just the diffs of a patchset's parts.
+    ///
+    /// Deliberately not [`Database::get_patch_diffs`], which also collects
+    /// display metadata and stops at the first row it fails to read, returning
+    /// a prefix of the series with no error. A part dropped that way would
+    /// silently narrow the attribution of the series it belongs to, so this
+    /// reads the diffs alone and propagates failures instead.
+    pub async fn patch_diffs_only(&self, patchset_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT diff FROM patches WHERE patchset_id = ? ORDER BY part_index ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut diffs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(diff) = crate::compression::get_compressed_string_opt(&row, 0)? {
+                diffs.push(diff);
+            }
+        }
+        Ok(diffs)
+    }
+
+    /// Reads an instance-wide marker.
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = ?", libsql::params![key])
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes an instance-wide marker, replacing any previous value.
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                libsql::params![key, value],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_patch_diffs(
         &self,
         patchset_id: i64,
@@ -3189,7 +7383,7 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let index: i64 = row.get(1).unwrap_or(0);
-            let diff: String = row.get(2)?;
+            let diff: String = crate::compression::get_compressed_string(&row, 2)?;
             let subject: String = row.get(3).unwrap_or_default();
             let author: String = row.get(4).unwrap_or_default();
             let date: i64 = row.get(5).unwrap_or(0);
@@ -3199,9 +7393,39 @@ impl Database {
         Ok(diffs)
     }
 
+    pub async fn get_patch_by_git_patch_id(
+        &self,
+        git_patch_id: &str,
+    ) -> Result<Option<(String, String, String, String, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.message_id, p.diff, m.subject, m.author, m.date
+                 FROM patches p
+                 JOIN messages m ON p.message_id = m.message_id
+                 WHERE p.git_patch_id = ?
+                 ORDER BY m.date DESC
+                 LIMIT 1",
+                libsql::params![git_patch_id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Some((
+                get_required_text(&row, 0)?,
+                crate::compression::get_compressed_string(&row, 1)?,
+                get_optional_text(&row, 2)?.unwrap_or_default(),
+                get_optional_text(&row, 3)?.unwrap_or_default(),
+                get_optional_integer(&row, 4)?.unwrap_or(0),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug
+            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, mr_url, mr_title, mr_number
              FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
@@ -3218,6 +7442,7 @@ impl Database {
                 message_id: row.get(6).ok(),
                 total_parts: row.get(7).ok(),
                 received_parts: row.get(8).ok(),
+                mailing_lists: Vec::new(),
                 subsystems: Vec::new(),
                 findings_low: None,
                 findings_medium: None,
@@ -3233,32 +7458,35 @@ impl Database {
                 baseline_logs: None,
                 provider: None,
                 embargo_until: row.get(14).ok(),
-                mr_url: None,
-                mr_title: None,
-                mr_number: None,
                 slug: row.get(15).ok(),
+                mr_url: row.get(16).ok(),
+                mr_title: row.get(17).ok(),
+                mr_number: row.get(18).ok(),
             });
         }
         Ok(patchsets)
     }
 
-    pub async fn get_expired_embargoed_patchsets(
+    pub async fn get_releasable_embargoed_patchsets(
         &self,
         now: i64,
         limit: usize,
     ) -> Result<Vec<PatchsetRow>> {
-        let mut rows = self.conn.query(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until
+        let sql = format!(
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL AND p.embargo_until <= ? 
-             AND NOT EXISTS (
-                 SELECT 1 FROM email_outbox eo 
-                 JOIN patches pa ON eo.patch_id = pa.id 
-                 WHERE pa.patchset_id = p.id
-             ) 
-             ORDER BY p.date ASC LIMIT ?",
-            libsql::params![now, limit as i64],
-        ).await?;
+             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+             AND (
+                 p.embargo_until <= ?
+                 OR ({CLEAN_PATCHSET_PREDICATE})
+             )
+             ORDER BY CASE WHEN p.embargo_until <= ? THEN 0 ELSE 1 END, p.date ASC LIMIT ?"
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, libsql::params![now - 600, now, now, limit as i64])
+            .await?;
 
         let mut patchsets = Vec::new();
         loop {
@@ -3274,6 +7502,7 @@ impl Database {
                         message_id: row.get(6).ok(),
                         total_parts: row.get(7).ok(),
                         received_parts: row.get(8).ok(),
+                        mailing_lists: Vec::new(),
                         subsystems: Vec::new(),
                         findings_low: None,
                         findings_medium: None,
@@ -3289,10 +7518,10 @@ impl Database {
                         baseline_logs: None,
                         provider: None,
                         embargo_until: row.get(14).ok(),
-                        mr_url: None,
-                        mr_title: None,
-                        mr_number: None,
-                        slug: None,
+                        slug: row.get(15).ok(),
+                        mr_url: row.get(16).ok(),
+                        mr_title: row.get(17).ok(),
+                        mr_number: row.get(18).ok(),
                     });
                 }
                 Ok(None) => break,
@@ -3303,6 +7532,117 @@ impl Database {
             }
         }
         Ok(patchsets)
+    }
+
+    pub async fn get_patchset_review_outcome(
+        &self,
+        patchset_id: i64,
+    ) -> Result<PatchsetReviewOutcome> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        };
+        let status: String = row.get(0).unwrap_or_default();
+        let target_review_count: i64 = row.get(1).unwrap_or(1);
+        if status != ReviewStatus::Reviewed.as_str() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut no_ai_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews
+                 WHERE patchset_id = ? AND status = 'Skipped'
+                   AND result_description = 'Skipped AI review via --no-ai'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if no_ai_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut incomplete_rows = self
+            .conn
+            .query(
+                "SELECT 1
+                 FROM patches p
+                 WHERE p.patchset_id = ?
+                   AND COALESCE(p.status, '') != 'Skipped'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews skipped
+                       WHERE skipped.patch_id = p.id
+                         AND skipped.status = 'Skipped'
+                         AND skipped.result_description = 'Skipped: touches only ignored files'
+                   )
+                   AND (
+                       SELECT COUNT(*) FROM reviews r
+                       WHERE r.patch_id = p.id AND r.status = 'Reviewed'
+                   ) < ?
+                 LIMIT 1",
+                libsql::params![patchset_id, target_review_count],
+            )
+            .await?;
+        if incomplete_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut reviewed_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE patchset_id = ? AND status = 'Reviewed' LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if reviewed_rows.next().await?.is_none() {
+            return Ok(PatchsetReviewOutcome::Incomplete);
+        }
+
+        let mut finding_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM findings f
+                 JOIN reviews r ON r.id = f.review_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if finding_rows.next().await?.is_some() {
+            Ok(PatchsetReviewOutcome::HasFindings)
+        } else {
+            Ok(PatchsetReviewOutcome::Clean)
+        }
+    }
+
+    pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
+        let sql = format!(
+            "UPDATE patchsets AS p SET embargo_release_started_at = ?
+             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+               AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
+               AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
+        );
+        let updated = self
+            .conn
+            .execute(&sql, libsql::params![now, id, now - 600, now])
+            .await?;
+        Ok(updated == 1)
+    }
+
+    pub async fn clear_patchset_embargo_release_claim(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET embargo_release_started_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn get_completed_reviews_for_release(
@@ -3325,8 +7665,12 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let review_id: i64 = row.get(0)?;
             let patch_id: i64 = row.get(1)?;
-            let inline_review: String = row.get(2).unwrap_or_default();
-            let summary: String = row.get(3).unwrap_or_default();
+            let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let summary: String = crate::compression::get_compressed_string_opt(&row, 3)
+                .unwrap_or(None)
+                .unwrap_or_default();
             let patch_message_id: String = row.get(4).unwrap_or_default();
             let index: i64 = row.get(5).unwrap_or_default();
             temp_reviews.push((
@@ -3359,8 +7703,8 @@ impl Database {
                 .to_string();
                 let problem: String = f_row.get(1).unwrap_or_default();
                 let severity_explanation: Option<String> = f_row.get(2).ok();
-                let preexisting_int: Option<i64> = f_row.get(3).ok();
-                let preexisting = preexisting_int.map(|val| val != 0);
+                let int: Option<i64> = f_row.get(3).ok();
+                let preexisting = int.map(|val| val != 0);
                 let locations_str: Option<String> = f_row.get(4).ok();
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
@@ -3375,6 +7719,7 @@ impl Database {
             }
 
             reviews.push(ReleaseReview {
+                id: review_id,
                 patch_id,
                 patch_message_id,
                 index,
@@ -3387,13 +7732,33 @@ impl Database {
     }
 
     pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
-        self.conn
+        if status == ReviewStatus::Cancelled.as_str() {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ?",
+                    libsql::params![status, id],
+                )
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
+                    libsql::params![status, id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
+        let count = self
+            .conn
             .execute(
-                "UPDATE patchsets SET status = ? WHERE id = ?",
-                libsql::params![status, id],
+                "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND status = 'Pending'",
+                libsql::params![id],
             )
             .await?;
-        Ok(())
+        Ok(count > 0)
     }
 
     pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
@@ -3421,14 +7786,284 @@ impl Database {
         }
     }
 
+    pub async fn cancel_outbox_for_patchset(&self, id: i64, reason: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE patchset_id = ? AND status IN ('Pending', 'Embargoed')",
+                libsql::params![reason.to_string(), id],
+            )
+            .await?;
+
+        self.conn
+            .execute(
+                "UPDATE email_outbox
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE status IN ('Pending', 'Embargoed')
+                   AND patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)",
+                libsql::params![reason.to_string(), id],
+            )
+            .await?;
+
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE status = 'Pending'
+                   AND patch_msg_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)",
+                libsql::params![reason.to_string(), id],
+            )
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
-        let query = if force {
-            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review')"
+        let allowed_statuses = if force {
+            "('Fetching', 'Pending', 'Incomplete', 'In Review')"
         } else {
-            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete')"
+            "('Fetching', 'Pending', 'Incomplete')"
         };
-        let count = self.conn.execute(query, libsql::params![id]).await?;
-        Ok(count > 0)
+        // Atomically transition patchsets.status to 'Cancelled' first so any
+        // concurrent worker calling update_patchset_status (which guards with
+        // status != 'Cancelled') is immediately blocked from marking the
+        // patchset as 'Reviewed'.
+        let count = self
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN {}",
+                    allowed_statuses
+                ),
+                libsql::params![id],
+            )
+            .await?;
+        if count == 0 {
+            return Ok(false);
+        }
+
+        self.conn
+            .execute(
+                "UPDATE reviews SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
+                libsql::params![id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE patches SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review', 'Reviewing')",
+                libsql::params![id],
+            )
+            .await?;
+        self.cancel_outbox_for_patchset(id, "Cancelled because patchset was cancelled")
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn reconcile_superseded_pr_patchsets(
+        &self,
+        _current_id: i64,
+        mr_url: Option<&str>,
+        mr_number: Option<i64>,
+    ) -> Result<usize> {
+        let Some(num) = mr_number else {
+            return Ok(0);
+        };
+
+        let target_repo = mr_url.and_then(crate::forge::extract_owner_repo_from_mr_url);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject, mr_url FROM patchsets WHERE mr_number = ? ORDER BY id ASC LIMIT 200",
+                libsql::params![num],
+            )
+            .await?;
+
+        let mut matching: Vec<(i64, u32)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let row_id: i64 = row.get(0)?;
+            let row_subj: String = row.get(1).unwrap_or_default();
+            let row_mr_url: Option<String> = row.get(2).ok();
+
+            let same_repo = match (target_repo.as_deref(), row_mr_url.as_deref()) {
+                (Some(target), Some(r_url)) => {
+                    crate::forge::extract_owner_repo_from_mr_url(r_url).as_deref() == Some(target)
+                }
+                (None, Some(r_url)) => mr_url == Some(r_url),
+                (None, None) => mr_url.is_none(),
+                (Some(_), None) => false,
+            };
+            if !same_repo {
+                continue;
+            }
+
+            let ver = crate::forge::extract_mr_version_from_subject(Some(&row_subj), num)
+                .or_else(|| crate::patch::parse_subject_version(&row_subj))
+                .unwrap_or(1);
+            matching.push((row_id, ver));
+        }
+        drop(rows);
+
+        if matching.len() <= 1 {
+            return Ok(0);
+        }
+
+        let latest_id = matching
+            .iter()
+            .max_by_key(|(id, ver)| (*ver, *id))
+            .map(|(id, _)| *id)
+            .unwrap();
+
+        let mut cancelled_count = 0;
+        for (old_id, old_ver) in matching {
+            if old_id == latest_id {
+                continue;
+            }
+            if self.cancel_patchset(old_id, true).await? {
+                cancelled_count += 1;
+                info!(
+                    "Cancelled superseded PR #{} v{} patchset {} (superseded by patchset {})",
+                    num, old_ver, old_id, latest_id
+                );
+            }
+            self.cancel_outbox_for_patchset(old_id, "Cancelled: superseded by newer PR version")
+                .await?;
+        }
+
+        Ok(cancelled_count)
+    }
+
+    pub async fn reconcile_superseded_series_patchsets(
+        &self,
+        current_id: i64,
+        author: &str,
+        subject: &str,
+        part_index: u32,
+        version: Option<u32>,
+        date: i64,
+    ) -> Result<usize> {
+        let trimmed = subject.trim_start();
+        if part_index == 0
+            && trimmed
+                .get(..3)
+                .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
+        {
+            return Ok(0);
+        }
+
+        let clean_curr = crate::patch::clean_subject(subject);
+        if clean_curr.is_empty() {
+            return Ok(0);
+        }
+
+        let curr_ver = version
+            .or_else(|| crate::patch::parse_subject_version(subject))
+            .unwrap_or(1);
+        let curr_prefixes = crate::patch::get_subject_prefixes(subject);
+
+        let window_start = date.saturating_sub(86400 * 30);
+        let window_end = date.saturating_add(86400 * 30);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, author, subject, subject_index, total_parts
+                 FROM patchsets
+                 WHERE id != ?
+                   AND status IN ('Fetching', 'Incomplete', 'Pending', 'In Review')
+                   AND date BETWEEN ? AND ?
+                 ORDER BY date DESC, id DESC
+                 LIMIT 100",
+                libsql::params![current_id, window_start, window_end],
+            )
+            .await?;
+
+        let mut candidates: Vec<(i64, String, String, u32, u32)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let cand_id: i64 = row.get(0)?;
+            let cand_author: String = row.get(1).unwrap_or_default();
+            let cand_subject: String = row.get(2).unwrap_or_default();
+            let cand_subject_index: u32 = row.get(3).unwrap_or(9999);
+            let cand_total_parts: u32 = row.get(4).unwrap_or(1);
+            candidates.push((
+                cand_id,
+                cand_author,
+                cand_subject,
+                cand_subject_index,
+                cand_total_parts,
+            ));
+        }
+        drop(rows);
+
+        let mut cancelled_count = 0;
+        for (cand_id, cand_author, cand_subject, cand_subject_index, cand_total_parts) in candidates
+        {
+            let cand_ver = crate::patch::parse_subject_version(&cand_subject).unwrap_or(1);
+            if cand_ver == curr_ver {
+                continue;
+            }
+
+            if !crate::patch::authors_match(&cand_author, author) {
+                continue;
+            }
+
+            if crate::patch::get_subject_prefixes(&cand_subject) != curr_prefixes {
+                continue;
+            }
+
+            let mut series_matches = (cand_subject_index == part_index || cand_total_parts == 1)
+                && crate::patch::clean_subject(&cand_subject) == clean_curr;
+
+            if !series_matches {
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT m.subject FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND p.part_index = ? LIMIT 1",
+                        libsql::params![cand_id, part_index],
+                    )
+                    .await?;
+                if let Some(p_row) = p_rows.next().await? {
+                    let p_subj: String = p_row.get(0).unwrap_or_default();
+                    if crate::patch::clean_subject(&p_subj) == clean_curr {
+                        series_matches = true;
+                    }
+                }
+                drop(p_rows);
+            }
+
+            if !series_matches {
+                continue;
+            }
+
+            if cand_ver < curr_ver {
+                if self.cancel_patchset(cand_id, true).await? {
+                    cancelled_count += 1;
+                    info!(
+                        "Cancelled superseded patchset {} (v{}) after ingesting patchset {} (v{})",
+                        cand_id, cand_ver, current_id, curr_ver
+                    );
+                }
+                self.cancel_outbox_for_patchset(
+                    cand_id,
+                    "Cancelled: superseded by newer patchset version",
+                )
+                .await?;
+            } else if cand_ver > curr_ver {
+                if self.cancel_patchset(current_id, true).await? {
+                    cancelled_count += 1;
+                    info!(
+                        "Cancelled older patchset {} (v{}) because newer patchset {} (v{}) already exists",
+                        current_id, curr_ver, cand_id, cand_ver
+                    );
+                }
+                self.cancel_outbox_for_patchset(
+                    current_id,
+                    "Cancelled: superseded by newer patchset version",
+                )
+                .await?;
+            }
+        }
+
+        Ok(cancelled_count)
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
@@ -3504,10 +8139,38 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
+        let candidates = Self::get_msgid_candidates(msgid);
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if rows.next().await.ok().flatten().is_some() {
+                return Ok(true);
+            }
+
+            let mut p_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if p_rows.next().await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_fetching_patchset(
         &self,
-        article_id: &str,
+        root_msg_id: &str,
         subject: &str,
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
@@ -3520,16 +8183,27 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        let root_msg_id = if article_id.contains('@') {
-            article_id.to_string()
-        } else {
-            format!("{}@sashiko.local", article_id)
-        };
-
-        let clid_candidates = vec![article_id.to_string(), root_msg_id.clone()];
+        let clid_candidates = Self::get_msgid_candidates(root_msg_id);
 
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
+
+        let mr_ver = if let Some(num) = mr_number {
+            Some(
+                self.get_mr_version_for_commit_range(num, root_msg_id)
+                    .await
+                    .unwrap_or(1),
+            )
+        } else {
+            None
+        };
+
+        let effective_subject =
+            if let (Some(num), Some(title), Some(ver)) = (mr_number, mr_title, mr_ver) {
+                crate::forge::format_mr_subject(mr_url, num, ver, title)
+            } else {
+                subject.to_string()
+            };
 
         // 1. Check if it already exists
         for clid in clid_candidates {
@@ -3544,49 +8218,70 @@ impl Database {
             if let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
                 let status: String = row.get(1).unwrap_or_default();
+                drop(rows);
 
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                if status == "Failed" || status == "Fetching" {
+                if status == "Failed"
+                    || status == "Fetching"
+                    || status == "Cancelled"
+                    || status == "Failed To Apply"
+                    || status == "FailedToApply"
+                {
+                    if let Some(s) = slug {
+                        self.rotate_mr_slug(s, Some(id)).await?;
+                    }
                     self.conn.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                        libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
+                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
+                        libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
                     ).await?;
                 }
+                self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+                    .await?;
                 return Ok(id);
             }
         }
 
         // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
-        let thread_id = self.ensure_thread_for_message(&root_msg_id, now).await?;
+        let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
+
+        if let Some(s) = slug {
+            self.rotate_mr_slug(s, None).await?;
+        }
 
         // 3. Create the fetching patchset
         let mut rows = self.conn
             .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
                      VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
             )
             .await?;
 
         if let Ok(Some(row)) = rows.next().await {
-            Ok(row.get(0)?)
+            let id: i64 = row.get(0)?;
+            drop(rows);
+            self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+                .await?;
+            Ok(id)
         } else {
             Err(anyhow::anyhow!("Failed to get patchset ID"))
         }
     }
-    pub async fn update_patchset_error(&self, article_id: &str, error: &str) -> Result<()> {
-        let root_msg_id = if article_id.contains('@') {
-            article_id.to_string()
-        } else {
-            format!("{}@sashiko.local", article_id)
-        };
-        self.conn
-            .execute(
-                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
-                libsql::params![error, root_msg_id],
-            )
-            .await?;
+    pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
+        let candidates = Self::get_msgid_candidates(root_msg_id);
+        for clid in candidates {
+            let res = self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
+                    libsql::params![error, clid],
+                )
+                .await?;
+            if res > 0 {
+                return Ok(());
+            }
+        }
         Ok(())
     }
 
@@ -3602,7 +8297,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
-                libsql::params![baseline_id, model_name, prompts_hash, logs, provider, id],
+                libsql::params![baseline_id, model_name, prompts_hash, logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), provider, id],
             )
             .await?;
         Ok(())
@@ -3722,32 +8417,50 @@ impl Database {
     }
 
     pub async fn lock_pending_email(&self) -> Result<Option<EmailOutboxRow>> {
+        self.conn
+            .execute(
+                "UPDATE email_outbox
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled because patchset was cancelled',
+                     locked_at = NULL
+                 WHERE status IN ('Pending', 'Embargoed')
+                   AND EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+                   )",
+                (),
+            )
+            .await?;
+
         let now = chrono::Utc::now().timestamp();
         let mut rows = self.conn.query(
             "UPDATE email_outbox 
              SET status = 'Sending', locked_at = ? 
              WHERE id = (SELECT id FROM email_outbox WHERE status = 'Pending' LIMIT 1)
-             RETURNING id, patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
+             RETURNING id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
             libsql::params![now]
         ).await?;
 
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let patch_id: Option<i64> = row.get::<i64>(1).ok();
-            let status: String = row.get(2)?;
-            let to_addresses: String = row.get(3)?;
-            let cc_addresses: String = row.get(4)?;
-            let subject: String = row.get(5)?;
-            let in_reply_to: String = row.get(6)?;
-            let references_hdr: String = row.get(7)?;
-            let body: String = row.get(8)?;
-            let locked_at: Option<i64> = row.get(9).ok();
-            let error_log: Option<String> = row.get(10).ok();
-            let created_at: i64 = row.get(11)?;
+            let kind = EmailKind::from_stored(&row.get::<String>(2)?);
+            let status: String = row.get(3)?;
+            let to_addresses: String = row.get(4)?;
+            let cc_addresses: String = row.get(5)?;
+            let subject: String = row.get(6)?;
+            let in_reply_to: String = row.get(7)?;
+            let references_hdr: String = row.get(8)?;
+            let body: String = row.get(9)?;
+            let locked_at: Option<i64> = row.get(10).ok();
+            let error_log: Option<String> = row.get(11).ok();
+            let created_at: i64 = row.get(12)?;
 
             Ok(Some(EmailOutboxRow {
                 id,
                 patch_id,
+                kind,
                 status,
                 to_addresses,
                 cc_addresses,
@@ -3799,6 +8512,18 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchwork_outbox
+                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
+                libsql::params![patch_msg_id, api_url, context],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -3819,6 +8544,22 @@ impl Database {
     }
 
     pub async fn lock_pending_patchwork(&self) -> Result<Option<PatchworkOutboxRow>> {
+        self.conn
+            .execute(
+                "UPDATE patchwork_outbox
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled because patchset was cancelled',
+                     locked_at = NULL
+                 WHERE status = 'Pending'
+                   AND EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.message_id = patchwork_outbox.patch_msg_id AND ps.status = 'Cancelled'
+                   )",
+                (),
+            )
+            .await?;
+
         let now = chrono::Utc::now().timestamp();
         let mut rows = self
             .conn
@@ -3915,6 +8656,218 @@ impl Database {
         Ok(count)
     }
 
+    // -- Forge outbox operations --
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_forge_outbox(
+        &self,
+        patchset_id: i64,
+        provider: &str,
+        repo: &str,
+        pr_number: i64,
+        head_sha: Option<&str>,
+        body: &str,
+        target_url: &str,
+        status: &str,
+    ) -> Result<()> {
+        if self.get_patchset_status(patchset_id).await?.as_deref()
+            == Some(ReviewStatus::Cancelled.as_str())
+        {
+            info!(
+                "Skipping forge outbox insertion for cancelled patchset {}",
+                patchset_id
+            );
+            return Ok(());
+        }
+
+        let mut newer_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchsets
+                 WHERE mr_number = ?
+                   AND id > ?
+                   AND mr_url IS NOT NULL
+                   AND (
+                       mr_url LIKE '%/' || ? || '/pull/%'
+                       OR mr_url LIKE '%/' || ? || '/-/merge_requests/%'
+                       OR mr_url LIKE '%/' || ? || '/merge_requests/%'
+                   )
+                 LIMIT 1",
+                libsql::params![pr_number, patchset_id, repo, repo, repo],
+            )
+            .await?;
+        if newer_rows.next().await?.is_some() {
+            info!(
+                "Skipping forge outbox insertion for patchset {} (PR #{} has a newer revision)",
+                patchset_id, pr_number
+            );
+            return Ok(());
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            info!(
+                "Forge outbox entry already exists for patchset_id {}, skipping duplicate.",
+                patchset_id
+            );
+            return Ok(());
+        }
+
+        let created_at = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    patchset_id,
+                    provider,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    body,
+                    target_url,
+                    status,
+                    created_at,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lock_pending_forge_outbox(&self) -> Result<Option<ForgeOutboxRow>> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: patchset was cancelled or superseded by a newer PR version',
+                     locked_at = NULL
+                 WHERE status IN ('Pending', 'Embargoed')
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM patchsets ps
+                           WHERE ps.id = forge_outbox.patchset_id AND ps.status = 'Cancelled'
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM patchsets ps2
+                           WHERE ps2.mr_number = forge_outbox.pr_number
+                             AND ps2.id > forge_outbox.patchset_id
+                             AND ps2.mr_url IS NOT NULL
+                             AND (
+                                 ps2.mr_url LIKE '%/' || forge_outbox.repo || '/pull/%'
+                                 OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/-/merge_requests/%'
+                                 OR ps2.mr_url LIKE '%/' || forge_outbox.repo || '/merge_requests/%'
+                             )
+                       )
+                   )",
+                (),
+            )
+            .await?;
+
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE forge_outbox
+                 SET status = 'Sending', locked_at = ?
+                 WHERE id = (
+                     SELECT id FROM forge_outbox
+                     WHERE status = 'Pending'
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                     LIMIT 1
+                 )
+                 RETURNING id, patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, retry_count, next_retry_at, locked_at, error_log, created_at",
+                libsql::params![now, now],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(Some(ForgeOutboxRow {
+                id: row.get(0)?,
+                patchset_id: row.get(1)?,
+                provider: row.get(2)?,
+                repo: row.get(3)?,
+                pr_number: row.get(4)?,
+                head_sha: row.get::<String>(5).ok(),
+                body: row.get(6)?,
+                target_url: row.get(7)?,
+                status: row.get(8)?,
+                retry_count: row.get(9)?,
+                next_retry_at: row.get::<i64>(10).ok(),
+                locked_at: row.get::<i64>(11).ok(),
+                error_log: row.get::<String>(12).ok(),
+                created_at: row.get(13)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn mark_forge_outbox_sent(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_forge_outbox_failed(&self, id: i64, error_log: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?",
+                libsql::params![error_log.to_string(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_forge_outbox_retry_at(
+        &self,
+        id: i64,
+        next_retry_at: i64,
+        error_log: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox
+                 SET status = 'Pending', retry_count = retry_count + 1, next_retry_at = ?, error_log = ?, locked_at = NULL
+                 WHERE id = ?",
+                libsql::params![next_retry_at, error_log.to_string(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn sweep_ghost_forge_outbox(&self) -> Result<u64> {
+        let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
+                libsql::params![ten_mins_ago],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    pub async fn release_embargoed_forge_outbox(&self, patchset_id: i64) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Pending' WHERE patchset_id = ? AND status = 'Embargoed'",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        Ok(count)
+    }
+
     /// Insert a patchwork notification email into the email outbox.
     ///
     /// Uses patch_id = NULL to avoid colliding with the per-patch dedup
@@ -3929,6 +8882,23 @@ impl Database {
         references_hdr: &str,
         body: &str,
     ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM email_outbox
+                 WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?",
+                libsql::params![
+                    serde_json::to_string(&[to_address])
+                        .map_err(|e| libsql::Error::Misuse(e.to_string()))?,
+                    subject,
+                    in_reply_to
+                ],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(());
+        }
+
         let created_at = chrono::Utc::now().timestamp();
         let to_json = serde_json::to_string(&[to_address])
             .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
@@ -3949,10 +8919,932 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// Queue a message addressed to a person rather than to a patch.
+    ///
+    /// There is deliberately no dedup guard. Two sign-in requests are two
+    /// distinct messages, and suppressing the second would look to the
+    /// recipient exactly like the feature being broken. Volume is bounded at
+    /// the request endpoint instead.
+    ///
+    /// The caller supplies the status so that a dry-run deployment can park
+    /// the row where the poller will not pick it up, which is how review mail
+    /// already behaves; inheriting only the worker's dry-run check would leave
+    /// rows sitting Pending forever.
+    pub async fn insert_transactional_email(
+        &self,
+        kind: EmailKind,
+        status: &str,
+        to_address: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<()> {
+        let created_at = chrono::Utc::now().timestamp();
+        let to_json = serde_json::to_string(&[to_address])
+            .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO email_outbox (patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES (NULL, ?, ?, ?, '[]', ?, '', '', ?, ?)",
+                libsql::params![
+                    kind.as_str(),
+                    status,
+                    to_json,
+                    subject,
+                    body,
+                    created_at,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The message id lookup behind /api/patchset must seek an index.
+    ///
+    /// UNIQUE(patchset_id, message_id) looks like it covers this query but
+    /// cannot serve it: the query constrains only message_id, and SQLite will
+    /// not seek an index whose leading column is unconstrained. Without a
+    /// dedicated index the planner reports SCAN patches and reads the diff of
+    /// every patch in the database on every lookup, which is invisible in a
+    /// functional test because the answer stays correct either way.
+    #[tokio::test]
+    async fn test_patch_msgid_lookup_uses_an_index() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+
+        let plan: String = db
+            .conn
+            .query(
+                "EXPLAIN QUERY PLAN \
+                 SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                libsql::params!["<probe@example.org>"],
+            )
+            .await?
+            .next()
+            .await?
+            .expect("EXPLAIN QUERY PLAN returns a row")
+            .get::<String>(3)?;
+
+        assert!(
+            plan.contains("USING INDEX") && !plan.contains("SCAN patches"),
+            "message id lookups must seek an index, got: {plan}"
+        );
+
+        Ok(())
+    }
+
+    /// The bug schema ships as a single migration, so a fresh database reaches
+    /// the final layout in one step. This pins that migrate is idempotent, that
+    /// it leaves shared infrastructure tables alone, and that the resulting
+    /// schema is immediately usable.
+    #[tokio::test]
+    async fn test_bug_schema_migrates_and_is_usable() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+
+        db.migrate().await?;
+        // Re-running must be a no-op rather than recreating anything.
+        db.migrate().await?;
+
+        db.conn
+            .execute_batch(
+                "INSERT INTO people (name, email) VALUES ('Shared Row', 'shared@example.org');",
+            )
+            .await?;
+        assert_eq!(
+            db.conn
+                .query("SELECT COUNT(*) FROM people", ())
+                .await?
+                .next()
+                .await?
+                .unwrap()
+                .get::<i64>(0)?,
+            1,
+            "the bug migration must not touch shared infrastructure tables"
+        );
+
+        // The schema starts bugs in the untriaged, unanalysed state
+        // and still records attributed audit history.
+        let id = db
+            .create_bug(&NewBug {
+                bugid: "linux-v2".to_string(),
+                title: "Fresh report".to_string(),
+                lifecycle_status: BugLifecycleStatus::New,
+                pipeline_state: BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![],
+            })
+            .await?;
+        let scoped = db.with_bug_actor("new author", "web", None);
+        scoped
+            .change_bug_status_with_reason(id, BugLifecycleStatus::Closed, Some("Now fixed"))
+            .await?;
+        let bug = db.get_bug(id).await?.unwrap();
+        assert_eq!(bug.lifecycle_status, BugLifecycleStatus::Closed);
+        assert!(
+            bug.enrichments
+                .iter()
+                .any(|e| e.kind == "audit" && e.author.as_deref() == Some("new author"))
+        );
+        Ok(())
+    }
+
+    /// Sign-in mail is addressed to a person rather than a patch, so it must
+    /// escape the per-patch dedup guard: a second request is a second message,
+    /// and swallowing it would look exactly like the feature being broken.
+    #[tokio::test]
+    async fn test_transactional_email_escapes_patch_dedup() -> Result<()> {
+        let db = setup_db().await;
+
+        for _ in 0..2 {
+            db.insert_transactional_email(
+                EmailKind::SignInLink,
+                "Pending",
+                "maintainer@example.org",
+                "[sashiko] Your sign-in link",
+                "body",
+            )
+            .await?;
+        }
+
+        let first = db
+            .lock_pending_email()
+            .await?
+            .expect("first message queued");
+        assert_eq!(first.kind, EmailKind::SignInLink);
+        assert_eq!(first.patch_id, None);
+        assert_eq!(first.to_addresses, r#"["maintainer@example.org"]"#);
+        db.mark_email_sent(first.id).await?;
+
+        let second = db
+            .lock_pending_email()
+            .await?
+            .expect("second message queued");
+        assert_eq!(second.kind, EmailKind::SignInLink);
+        db.mark_email_sent(second.id).await?;
+
+        // A dry-run deployment parks the row in a status the poller never
+        // selects, rather than relying on the worker to drop it on the floor.
+        db.insert_transactional_email(
+            EmailKind::SignInLink,
+            "Dry-Run",
+            "maintainer@example.org",
+            "[sashiko] Your sign-in link",
+            "body",
+        )
+        .await?;
+        assert!(db.lock_pending_email().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_discovery_family_and_attributed_audit() -> Result<()> {
+        let db = setup_db().await;
+        let mut ids = Vec::new();
+        for (slug, tool, model) in [
+            ("canonical", "reviewer-a", "model-a"),
+            ("rediscovered", "reviewer-b", "model-b"),
+            ("again", "reviewer-a", "model-a"),
+        ] {
+            let scoped = db.with_bug_actor("automation", tool, Some(model.into()));
+            let id = scoped
+                .create_bug(&serde_json::from_value(
+                    json!({ "bugid": slug, "title": "net: missing check" }),
+                )?)
+                .await?;
+            scoped
+                .add_bug_enrichment(
+                    id,
+                    &NewBugEnrichment {
+                        kind: "candidate".into(),
+                        data_json: Some(json!({"raw": "original payload"})),
+                        logs: Some("unstructured original log".into()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            ids.push(id);
+        }
+        let worker = db.with_bug_actor("automation", "bug-worker", Some("analysis-model".into()));
+        worker
+            .update_bug_outcome(
+                ids[0],
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Dismissed,
+                    verified_on_sha: Some("abcdef"),
+                    logs: Some("[{\"role\":\"model\",\"parts\":[{\"text\":\"refuted\"}]}]"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(db.get_bug_logs(ids[0]).await?.unwrap().contains("refuted"));
+        // Multiple enrichment stages must not inflate the number of discoveries.
+        assert_eq!(
+            db.bug_evidence(&db.bug_family(ids[0], false).await?)
+                .await?["count"],
+            1
+        );
+        let human = db.with_bug_actor("maintainer@example.org", "web", None);
+        human
+            .change_bug_status_with_reason(
+                ids[0],
+                BugLifecycleStatus::Closed,
+                Some("Confirmed fixed upstream"),
+            )
+            .await?;
+        // Merge a child into another discovery, then merge that parent.
+        human
+            .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                ephemeral_id: ids[2],
+                canonical_id: ids[1],
+                reasoning: "Same cause",
+                ..Default::default()
+            })
+            .await?;
+        human
+            .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                ephemeral_id: ids[1],
+                canonical_id: ids[0],
+                reasoning: "Same cause",
+                ..Default::default()
+            })
+            .await?;
+        let evidence = db
+            .bug_evidence(&db.bug_family(ids[1], false).await?)
+            .await?;
+        assert_eq!(evidence["count"], 3);
+        assert_eq!(evidence["models"], json!(["model-a", "model-b"]));
+        assert_eq!(evidence["tools"], json!(["reviewer-a", "reviewer-b"]));
+        let summaries = db.bug_discovery_summaries(&ids).await?;
+        for id in &ids {
+            assert_eq!(summaries[id]["count"], evidence["count"]);
+            assert_eq!(summaries[id]["models"], evidence["models"]);
+            assert_eq!(summaries[id]["tools"], evidence["tools"]);
+        }
+        let events = evidence["activity"].as_array().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.get("data_json").is_none() && e.get("logs").is_none())
+        );
+        let comment = events
+            .iter()
+            .find(|e| e["content"] == "Confirmed fixed upstream")
+            .unwrap();
+        assert_eq!(comment["author"], "maintainer@example.org");
+        assert_eq!(comment["tool"], "web");
+        assert!(comment["model"].is_null());
+        let bug = db.get_bug(ids[0]).await?.unwrap();
+        let closed = bug
+            .enrichments
+            .iter()
+            .find(|e| {
+                e.data_json
+                    .as_ref()
+                    .is_some_and(|d| d["field"] == "lifecycle_status" && d["new"] == "closed")
+            })
+            .unwrap();
+        assert_eq!(closed.author.as_deref(), Some("maintainer@example.org"));
+        assert_eq!(closed.tool, "web");
+        assert_eq!(closed.model, None);
+        let raw = db.bug_family(ids[0], true).await?;
+        assert_eq!(raw.len(), 3);
+        assert!(raw.iter().all(|b| {
+            b.enrichments
+                .iter()
+                .any(|e| e.logs.as_deref() == Some("unstructured original log"))
+        }));
+        assert!(
+            human
+                .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                    ephemeral_id: ids[0],
+                    canonical_id: ids[1],
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            human
+                .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                    ephemeral_id: ids[0],
+                    canonical_id: 99999,
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_bug(ids[0]).await?.unwrap().lifecycle_status,
+            BugLifecycleStatus::Closed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_attribution_scopes_and_subsystems() -> Result<()> {
+        let db = setup_db().await;
+        let alice = db.with_bug_actor("alice", "web", None);
+        let bot = db.with_bug_actor("bot", "external-tool", Some("external-model".into()));
+        let id = alice
+            .create_bug(&serde_json::from_value(
+                json!({"bugid": "scoped", "title": "test"}),
+            )?)
+            .await?;
+        bot.update_bug_subsystems(id, &[AttributedSubsystem::from_maintainers("net")])
+            .await?;
+        alice.update_bug_title(id, "Changed by Alice").await?;
+        bot.update_bug_vector(id, "{}").await?;
+        let bug = db.get_bug(id).await?.unwrap();
+        let title = bug
+            .enrichments
+            .iter()
+            .find(|e| e.data_json.as_ref().is_some_and(|d| d["field"] == "title"))
+            .unwrap();
+        assert_eq!(title.author.as_deref(), Some("alice"));
+        assert_eq!(title.model, None);
+        let subsystem = bug
+            .enrichments
+            .iter()
+            .find(|e| {
+                e.data_json
+                    .as_ref()
+                    .is_some_and(|d| d["action"] == "subsystem_added")
+            })
+            .unwrap();
+        assert_eq!(subsystem.author.as_deref(), Some("bot"));
+        assert_eq!(subsystem.model.as_deref(), Some("external-model"));
+        let count = bug.enrichments.len();
+        bot.update_bug_subsystems(id, &[AttributedSubsystem::from_maintainers("net")])
+            .await?;
+        assert_eq!(db.get_bug(id).await?.unwrap().enrichments.len(), count);
+        // A legacy report has no invented model attribution.
+        let evidence = db.bug_evidence(&db.bug_family(id, false).await?).await?;
+        assert_eq!(evidence["count"], 1);
+        assert_eq!(evidence["unknown_models"], 1);
+        assert_eq!(evidence["models"], json!([]));
+        Ok(())
+    }
+
+    /// Reads the stored provenance for every subsystem attached to a bug.
+    async fn stored_subsystem_sources(db: &Database, bug_id: i64) -> Result<Vec<(String, String)>> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT subsystem, source FROM bug_subsystems WHERE bug_id = ? ORDER BY subsystem",
+                libsql::params![bug_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn test_bug_subsystem_provenance_is_recorded_and_refreshed() -> Result<()> {
+        let db = setup_db().await;
+        let mut bug: NewBug =
+            serde_json::from_value(json!({"bugid": "provenance", "title": "test"}))?;
+        bug.subsystems = vec![
+            AttributedSubsystem::from_maintainers("NETWORKING [IPv4/IPv6]"),
+            AttributedSubsystem::from_path_prefix("net/ipv4"),
+            AttributedSubsystem::new("whatever the caller said", SubsystemSource::default()),
+        ];
+        let id = db.create_bug(&bug).await?;
+
+        assert_eq!(
+            stored_subsystem_sources(&db, id).await?,
+            vec![
+                (
+                    "NETWORKING [IPv4/IPv6]".to_string(),
+                    "maintainers_section".to_string()
+                ),
+                ("net/ipv4".to_string(), "path_prefix".to_string()),
+                (
+                    "whatever the caller said".to_string(),
+                    "caller_supplied".to_string()
+                ),
+            ]
+        );
+
+        // A later run that matches the same name out of MAINTAINERS has to
+        // upgrade the provenance rather than leave the stale value behind.
+        db.update_bug_subsystems(id, &[AttributedSubsystem::from_maintainers("net/ipv4")])
+            .await?;
+        assert_eq!(
+            stored_subsystem_sources(&db, id).await?,
+            vec![("net/ipv4".to_string(), "maintainers_section".to_string())]
+        );
+
+        let reattributed = db
+            .get_bug(id)
+            .await?
+            .unwrap()
+            .enrichments
+            .iter()
+            .filter(|e| {
+                e.data_json
+                    .as_ref()
+                    .is_some_and(|d| d["action"] == "subsystem_reattributed")
+            })
+            .count();
+        assert_eq!(reattributed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_visibility_scopes_listings_to_maintained_sections() -> Result<()> {
+        let db = setup_db().await;
+        let mut btrfs: NewBug = serde_json::from_value(json!({"bugid": "b1", "title": "t"}))?;
+        btrfs.subsystems = vec![AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM")];
+        let btrfs = db.create_bug(&btrfs).await?;
+
+        let mut net: NewBug = serde_json::from_value(json!({"bugid": "b2", "title": "t"}))?;
+        net.subsystems = vec![AttributedSubsystem::from_maintainers("NETWORKING DRIVERS")];
+        let net = db.create_bug(&net).await?;
+
+        // Attributed by path and by the reporter, so it names no maintainer.
+        let mut unclaimed: NewBug = serde_json::from_value(json!({"bugid": "b3", "title": "t"}))?;
+        unclaimed.subsystems = vec![
+            AttributedSubsystem::from_path_prefix("drivers/misc"),
+            AttributedSubsystem::new("btrfs file system", SubsystemSource::CallerSupplied),
+        ];
+        let unclaimed = db.create_bug(&unclaimed).await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_bug(btrfs).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert!(db.authorizing_sections_for_bug(unclaimed).await?.is_empty());
+
+        let batch = db
+            .authorizing_sections_for_bugs(&[btrfs, net, unclaimed])
+            .await?;
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.contains_key(&unclaimed));
+
+        // The scope matches the stored title regardless of case, and a name the
+        // reporter invented never brings a bug into scope.
+        let scope = vec!["btrfs file system".to_string()];
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, btrfs);
+
+        // The default is the empty scope, so a caller who says nothing sees
+        // nothing.
+        let (items, total) = db.list_bugs(ListBugsParams::default()).await?;
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
+
+        let (_, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, 3);
+
+        // Facet counts follow the same scope, so they cannot be used to infer
+        // that a bug exists in someone else's subsystem.
+        let counts = db
+            .get_subsystems_bug_counts(
+                Some(BugLifecycleStatus::New),
+                BugVisibility::Sections(&scope),
+            )
+            .await?;
+        assert_eq!(counts, vec![("BTRFS FILE SYSTEM".to_string(), 1)]);
+
+        let counts = db
+            .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::default())
+            .await?;
+        assert!(counts.is_empty());
+
+        let counts = db
+            .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::Unrestricted)
+            .await?;
+        assert_eq!(counts.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_bare_subsystem_name_deserializes_as_caller_supplied() {
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": "b",
+            "title": "t",
+            "subsystems": ["net", {"name": "fs", "source": "maintainers_section"}, {"name": "mm"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            bug.subsystems,
+            vec![
+                AttributedSubsystem::new("net", SubsystemSource::CallerSupplied),
+                AttributedSubsystem::from_maintainers("fs"),
+                AttributedSubsystem::new("mm", SubsystemSource::CallerSupplied),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bug_model_resolution_from_review() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("t1", "subj", 100).await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj", "auth", 100, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .unwrap();
+        let rev_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await?;
+
+        let bug = NewBug {
+            bugid: "linux-model-test".to_string(),
+            title: "Model test bug".to_string(),
+            lifecycle_status: BugLifecycleStatus::Open,
+            pipeline_state: BugPipelineState::Succeeded,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 1000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
+        };
+        let bug_id = db
+            .create_bug_with_enrichment(
+                &bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: None,
+                    created_at: 1000,
+                    content: Some("test".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, bug_id, true).await?;
+
+        // 1. bug_discovery_summaries and bug_evidence resolve model from linked review
+        let summaries = db.bug_discovery_summaries(&[bug_id]).await?;
+        let summary = &summaries[&bug_id];
+        assert_eq!(summary["count"], 1);
+        assert_eq!(summary["models"], json!(["test-model"]));
+        assert_eq!(summary["tools"], json!(["sashiko:linux_patch_review"]));
+        assert_eq!(summary["unknown_models"], 0);
+
+        let evidence = db
+            .bug_evidence(&db.bug_family(bug_id, false).await?)
+            .await?;
+        assert_eq!(evidence["count"], 1);
+        assert_eq!(evidence["models"], json!(["test-model"]));
+        assert_eq!(evidence["unknown_models"], 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_discoveries_record_patch_and_patchset_and_multiple_occurrences() -> Result<()>
+    {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("t1", "subj", 100).await?;
+        db.create_message(
+            "m1", thread_id, None, "auth", "subj 1", 100, "", "", "", None, None,
+        )
+        .await?;
+        db.create_message(
+            "patch1_m1",
+            thread_id,
+            Some("m1"),
+            "auth",
+            "patch 1",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_message(
+            "patch1_m2",
+            thread_id,
+            Some("m1"),
+            "auth",
+            "patch 2",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+        // Patchset 1 with 2 patches
+        let ps1_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj 1", "auth", 100, 2, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .unwrap();
+        let p1_id = db.create_patch(ps1_id, "patch1_m1", 1, "diff1").await?;
+        let p2_id = db.create_patch(ps1_id, "patch1_m2", 2, "diff2").await?;
+
+        db.create_message(
+            "m2", thread_id, None, "auth", "subj 2", 200, "", "", "", None, None,
+        )
+        .await?;
+        db.create_message(
+            "patch2_m1",
+            thread_id,
+            Some("m2"),
+            "auth",
+            "patch 1",
+            200,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+        // Patchset 2 with 1 patch
+        let ps2_id = db
+            .create_patchset(
+                thread_id, None, "m2", "subj 2", "auth", 200, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .unwrap();
+        let p3_id = db.create_patch(ps2_id, "patch2_m1", 1, "diff3").await?;
+
+        // 1. Initial bug discovered while reviewing patch 1 of patchset 1
+        let bug1 = NewBug {
+            bugid: "linux-bug-multi-1".to_string(),
+            title: "Preexisting bug".to_string(),
+            lifecycle_status: BugLifecycleStatus::Open,
+            pipeline_state: BugPipelineState::Succeeded,
+            assignee: None,
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 1000,
+            discovered_in_patchset_id: Some(ps1_id),
+            discovered_in_patch_id: Some(p1_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
+        };
+        let bug1_id = db
+            .create_bug_with_enrichment(
+                &bug1,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("gemini-1.5-pro".to_string()),
+                    author: Some("sashiko.dev".to_string()),
+                    created_at: 1000,
+                    content: Some("First discovery".to_string()),
+                    data_json: Some(json!({
+                        "patchset_id": ps1_id,
+                        "patch_id": p1_id,
+                    })),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // 2. Same bug discovered while reviewing patch 2 of patchset 1 -> duplicate of bug 1
+        let bug2 = NewBug {
+            bugid: "linux-bug-multi-2".to_string(),
+            title: "Preexisting bug copy 2".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 2000,
+            discovered_in_patchset_id: Some(ps1_id),
+            discovered_in_patch_id: Some(p2_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
+        };
+        let bug2_id = db
+            .create_bug_with_enrichment(
+                &bug2,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("gemini-1.5-pro".to_string()),
+                    author: Some("sashiko.dev".to_string()),
+                    created_at: 2000,
+                    content: Some("Second discovery".to_string()),
+                    data_json: Some(json!({
+                        "patchset_id": ps1_id,
+                        "patch_id": p2_id,
+                    })),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: bug2_id,
+            canonical_id: bug1_id,
+            reasoning: "Duplicate of bug 1",
+            ..Default::default()
+        })
+        .await?;
+
+        // 3. Same bug discovered while reviewing patch 1 of patchset 2 -> duplicate of bug 1
+        let bug3 = NewBug {
+            bugid: "linux-bug-multi-3".to_string(),
+            title: "Preexisting bug copy 3".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 3000,
+            discovered_in_patchset_id: Some(ps2_id),
+            discovered_in_patch_id: Some(p3_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
+        };
+        let bug3_id = db
+            .create_bug_with_enrichment(
+                &bug3,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("gemini-2.0-flash".to_string()),
+                    author: Some("sashiko.dev".to_string()),
+                    created_at: 3000,
+                    content: Some("Third discovery".to_string()),
+                    data_json: Some(json!({
+                        "patchset_id": ps2_id,
+                        "patch_id": p3_id,
+                    })),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: bug3_id,
+            canonical_id: bug1_id,
+            reasoning: "Duplicate of bug 1",
+            ..Default::default()
+        })
+        .await?;
+
+        // 4. Same bug discovered with patchset and patch set on bug
+        let bug4 = NewBug {
+            bugid: "linux-bug-multi-4".to_string(),
+            title: "Preexisting bug copy 4".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 4000,
+            discovered_in_patchset_id: Some(ps1_id),
+            discovered_in_patch_id: Some(p2_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
+        };
+        let bug4_id = db.create_bug(&bug4).await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: bug4_id,
+            canonical_id: bug1_id,
+            reasoning: "Duplicate of bug 1",
+            ..Default::default()
+        })
+        .await?;
+
+        // Query bug_evidence for canonical bug 1
+        let evidence = db
+            .bug_evidence(&db.bug_family(bug1_id, false).await?)
+            .await?;
+        assert_eq!(evidence["count"], 4);
+
+        let discoveries = evidence["discoveries"].as_array().unwrap();
+        assert_eq!(discoveries.len(), 4);
+
+        // First discovery
+        assert_eq!(discoveries[0]["bug_id"], bug1_id);
+        assert_eq!(discoveries[0]["author"], "sashiko.dev");
+        assert_eq!(discoveries[0]["tool"], "sashiko:linux_patch_review");
+        assert_eq!(discoveries[0]["patchset_id"], ps1_id);
+        assert_eq!(discoveries[0]["patch_id"], p1_id);
+        assert_eq!(discoveries[0]["patch_part"], 1);
+
+        // Second discovery
+        assert_eq!(discoveries[1]["bug_id"], bug2_id);
+        assert_eq!(discoveries[1]["author"], "sashiko.dev");
+        assert_eq!(discoveries[1]["tool"], "sashiko:linux_patch_review");
+        assert_eq!(discoveries[1]["patchset_id"], ps1_id);
+        assert_eq!(discoveries[1]["patch_id"], p2_id);
+        assert_eq!(discoveries[1]["patch_part"], 2);
+
+        // Third discovery
+        assert_eq!(discoveries[2]["bug_id"], bug3_id);
+        assert_eq!(discoveries[2]["author"], "sashiko.dev");
+        assert_eq!(discoveries[2]["tool"], "sashiko:linux_patch_review");
+        assert_eq!(discoveries[2]["patchset_id"], ps2_id);
+        assert_eq!(discoveries[2]["patch_id"], p3_id);
+        assert_eq!(discoveries[2]["patch_part"], 1);
+
+        // Fourth discovery (resolved via review link)
+        assert_eq!(discoveries[3]["bug_id"], bug4_id);
+        assert_eq!(discoveries[3]["patchset_id"], ps1_id);
+        assert_eq!(discoveries[3]["patch_id"], p2_id);
+        assert_eq!(discoveries[3]["patch_part"], 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_audit_log_triggers() -> Result<()> {
+        let db = setup_db().await;
+
+        let bug = crate::db::NewBug {
+            bugid: "AUDIT-123".to_string(),
+            title: "Initial problem".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "test@example.com".to_string(),
+            reported_at: chrono::Utc::now().timestamp(),
+            source_ref: None,
+            duplicate_of_id: None,
+            discovered_in_commit: None,
+            discovered_in_patch_id: None,
+            discovered_in_patchset_id: None,
+            vector_json: None,
+            subsystems: vec![],
+        };
+        let bug_id = db.create_bug(&bug).await?;
+
+        // 1. Update the triage status.
+        db.set_bug_lifecycle_status(bug_id, BugLifecycleStatus::Open)
+            .await?;
+
+        // Fetch enrichments
+        let bug = db.get_bug(bug_id).await?.unwrap();
+        assert_eq!(bug.lifecycle_status, BugLifecycleStatus::Open);
+
+        let enrichments = bug.enrichments;
+        assert_eq!(enrichments.len(), 2); // creation and status
+
+        assert!(enrichments.iter().any(|e| {
+            e.kind == "audit"
+                && e.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(r#"Status changed from "new" to "open""#)
+        }));
+
+        Ok(())
+    }
     use super::*;
     use crate::settings::DatabaseSettings;
     use std::sync::Arc;
@@ -3965,6 +9857,185 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    /// A bare patchset row, for tests that only care about what is attributed
+    /// to it.
+    async fn patchset_for_sections(db: &Database, id: i64) -> Result<i64> {
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status)
+                 VALUES (?, '[PATCH] subject', 'An Author <a@b.com>', 1000, 'Pending')",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(id)
+    }
+
+    #[tokio::test]
+    async fn test_patchset_sections_union_across_parts() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        // Each part of a series contributes the sections its own files touch.
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+        )
+        .await?;
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                // A section a previous part already contributed.
+                AttributedSubsystem::from_maintainers("NETWORKING [GENERAL]"),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec![
+                "BTRFS FILE SYSTEM".to_string(),
+                "NETWORKING [GENERAL]".to_string()
+            ],
+            "a later part adds to the attribution rather than replacing it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_sections_only_maintainers_rows_confer_authority() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_path_prefix("drivers/misc"),
+                AttributedSubsystem::new("whatever was supplied", SubsystemSource::CallerSupplied),
+            ],
+        )
+        .await?;
+
+        // A directory prefix and an invented name are shown but grant nothing.
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert_eq!(
+            db.patchset_maintainer_sections(ps)
+                .await?
+                .into_iter()
+                .map(|s| (s.name, s.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "BTRFS FILE SYSTEM".to_string(),
+                    SubsystemSource::MaintainersSection
+                ),
+                ("drivers/misc".to_string(), SubsystemSource::PathPrefix),
+                (
+                    "whatever was supplied".to_string(),
+                    SubsystemSource::CallerSupplied
+                ),
+            ],
+            "provenance survives the round trip"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_with_no_sections_authorizes_nobody() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        assert!(db.authorizing_sections_for_patchset(ps).await?.is_empty());
+
+        // Writing nothing must not invent an attribution either.
+        db.add_patchset_maintainer_sections(ps, &[]).await?;
+        db.add_patchset_maintainer_sections(ps, &[AttributedSubsystem::from_maintainers("  ")])
+            .await?;
+        assert!(db.authorizing_sections_for_patchset(ps).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replacing_patchset_sections_prunes_and_reattributes() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_maintainers("NETWORKING [GENERAL]"),
+            ],
+        )
+        .await?;
+
+        // A section that no longer matches has to stop conferring authority,
+        // and one that has been rematched has to start.
+        db.replace_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_path_prefix("net"),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()],
+            "the dropped section is gone and the path prefix grants nothing"
+        );
+
+        db.replace_patchset_maintainer_sections(
+            ps,
+            &[AttributedSubsystem::from_maintainers("net")],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["net".to_string()],
+            "a name rematched out of MAINTAINERS starts conferring authority"
+        );
+        Ok(())
+    }
+
+    /// A patchset's attribution must not be reachable from another patchset.
+    #[tokio::test]
+    async fn test_patchset_sections_do_not_leak_between_patchsets() -> Result<()> {
+        let db = setup_db().await;
+        let btrfs = patchset_for_sections(&db, 1).await?;
+        let net = patchset_for_sections(&db, 2).await?;
+
+        db.add_patchset_maintainer_sections(
+            btrfs,
+            &[AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM")],
+        )
+        .await?;
+        db.add_patchset_maintainer_sections(
+            net,
+            &[AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+        )
+        .await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(btrfs).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert_eq!(
+            db.authorizing_sections_for_patchset(net).await?,
+            vec!["NETWORKING [GENERAL]".to_string()]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -4506,6 +10577,205 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_clean_patchset_is_releasable_before_embargo_expiry() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_clean_embargo", "Clean Embargo", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_clean_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Clean Embargo",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_clean_embargo",
+                "Clean Embargo",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_clean_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed successfully.",
+            Some("clean"),
+            None,
+            Some("No issues found."),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(releasable.iter().any(|patchset| patchset.id == ps_id));
+
+        assert!(db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(!db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        assert!(
+            db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.clear_patchset_embargo_release_claim(ps_id)
+            .await
+            .unwrap();
+
+        db.update_patchset_status(ps_id, "Pending").await.unwrap();
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, now + 601)
+                .await
+                .unwrap()
+        );
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "Pre-existing issue".to_string(),
+            preexisting: Some(true),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::HasFindings
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    #[tokio::test]
+    async fn test_no_ai_review_is_not_clean() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_no_ai_embargo", "No AI Embargo", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_no_ai_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "No AI Embargo",
+            71000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_no_ai_embargo",
+                "No AI Embargo",
+                "Author <author@example.com>",
+                71000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_no_ai_embargo", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Skipped",
+            "Skipped AI review via --no-ai",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        let releasable = db.get_releasable_embargoed_patchsets(now, 1).await.unwrap();
+        assert!(releasable.iter().all(|patchset| patchset.id != ps_id));
     }
 
     #[tokio::test]
@@ -5247,6 +11517,27 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let count: i64 = row.get(0).unwrap();
         assert_eq!(count, 1);
+
+        let summary = db
+            .get_patchset_summary(ps1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["mailing_lists"], serde_json::json!(["test_sub"]));
+        assert_eq!(summary["subsystems"], serde_json::json!(["test_sub"]));
+
+        let details = db
+            .get_patchset_details(ps1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["mailing_lists"], serde_json::json!(["test_sub"]));
+        assert_eq!(details["subsystems"], serde_json::json!(["test_sub"]));
+
+        let list_items = db.get_patchsets(50, 0, None, None).await.unwrap();
+        let found = list_items.iter().find(|p| p.id == ps1).unwrap();
+        assert_eq!(found.mailing_lists, vec!["test_sub".to_string()]);
+        assert_eq!(found.subsystems, vec!["test_sub".to_string()]);
     }
 
     #[tokio::test]
@@ -5383,6 +11674,113 @@ mod tests {
         .unwrap();
 
         assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_review_details() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "msg1", thread_id, None, "Author", "Subject", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg1"),
+                "msg1",
+                "Subject",
+                "Author",
+                100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, "msg1", 1, "diff").await.unwrap();
+
+        let baseline_id = db
+            .create_baseline(
+                Some("https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"),
+                Some("master"),
+                Some("commit_hash"),
+            )
+            .await
+            .unwrap();
+
+        db.create_ai_interaction(AiInteractionParams {
+            id: "interaction_1",
+            parent_id: None,
+            workflow_id: None,
+            provider: "gemini",
+            model: "gemini-2.5",
+            input: "prompt input",
+            output: "prompt output",
+            tokens_in: 120,
+            tokens_out: 45,
+            tokens_cached: 10,
+        })
+        .await
+        .unwrap();
+
+        let review_id = db
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "gemini",
+                "gemini-2.5",
+                Some(baseline_id),
+                Some("hash123"),
+            )
+            .await
+            .unwrap();
+
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "LGTM",
+            Some("Summary of patch"),
+            Some("interaction_1"),
+            Some("Inline comment"),
+            Some("{\"step\": \"done\"}"),
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_review_details(review_id)
+            .await
+            .unwrap()
+            .expect("review details should exist");
+        assert_eq!(details["id"], review_id);
+        assert_eq!(details["model"], "gemini-2.5");
+        assert_eq!(details["provider"], "gemini");
+        assert_eq!(details["prompts_hash"], "hash123");
+        assert_eq!(details["summary"], "Summary of patch");
+        assert_eq!(details["result"], "LGTM");
+        assert_eq!(details["status"], "Reviewed");
+        assert_eq!(details["inline_review"], "Inline comment");
+        assert_eq!(details["logs"], "{\"step\": \"done\"}");
+        assert_eq!(details["tokens_in"], 120);
+        assert_eq!(details["tokens_out"], 45);
+        assert_eq!(details["tokens_cached"], 10);
+        assert_eq!(details["baseline"]["branch"], "master");
+        assert_eq!(details["baseline"]["commit"], "commit_hash");
+
+        // Non-existent review
+        let none_details = db.get_review_details(99999).await.unwrap();
+        assert!(none_details.is_none());
     }
 
     #[tokio::test]
@@ -6229,6 +12627,6262 @@ mod tests {
         assert_eq!(
             ps1, ps2,
             "Patchset from B4 Relay devnull alias and real author email MUST merge"
+        );
+    }
+
+    /// Add one part of a series to the patchset identified by cover
+    /// letter "cover".
+    async fn add_part(db: &Database, thread_id: i64, part: u32, baseline: Option<i64>) -> i64 {
+        let msg = format!("msg_{}", part);
+        db.create_message(
+            &msg,
+            thread_id,
+            Some("cover"),
+            "author@example.com",
+            "Patch",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.create_patchset(
+            thread_id,
+            Some("cover"),
+            &msg,
+            &format!("[PATCH {}/3] Subject", part),
+            "author@example.com",
+            100,
+            3,
+            1,
+            "",
+            "",
+            None,
+            part,
+            baseline,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn patchset_baseline(db: &Database, id: i64) -> Option<i64> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT baseline_id FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).ok()
+    }
+
+    #[tokio::test]
+    async fn test_baseline_comes_from_lowest_part() {
+        // A later part must not overwrite the first patch's parent,
+        // whatever order the parts arrive in.
+        for order in [[1u32, 2, 3], [3, 2, 1], [2, 3, 1]] {
+            let db = setup_db().await;
+            let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+            db.create_message(
+                "cover",
+                thread_id,
+                None,
+                "author@example.com",
+                "Cover",
+                100,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let base = db
+                .create_baseline(None, None, Some("series_base"))
+                .await
+                .unwrap();
+            let after1 = db
+                .create_baseline(None, None, Some("patch1"))
+                .await
+                .unwrap();
+            let after2 = db
+                .create_baseline(None, None, Some("patch2"))
+                .await
+                .unwrap();
+
+            let mut ps_id = 0;
+            for part in order {
+                // Part N's parent is patch N-1; part 1's parent is the base.
+                let baseline = match part {
+                    1 => base,
+                    2 => after1,
+                    _ => after2,
+                };
+                ps_id = add_part(&db, thread_id, part, Some(baseline)).await;
+            }
+
+            assert_eq!(
+                patchset_baseline(&db, ps_id).await,
+                Some(base),
+                "arrival order {:?} must leave the first patch's parent as the baseline",
+                order
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_baseline_recorded_when_lowest_part_has_none() {
+        // A cover letter with no base-commit trailer wins the lowest part
+        // index while supplying no baseline.
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+
+        let ps_id = add_part(&db, thread_id, 0, None).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, None);
+
+        let ps_id = add_part(&db, thread_id, 1, Some(base)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(base));
+    }
+
+    #[tokio::test]
+    async fn test_baseline_from_lowest_part_behind_a_cover_letter() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+        let after1 = db
+            .create_baseline(None, None, Some("patch1"))
+            .await
+            .unwrap();
+
+        add_part(&db, thread_id, 0, None).await;
+        let ps_id = add_part(&db, thread_id, 2, Some(after1)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(after1));
+
+        let ps_id = add_part(&db, thread_id, 1, Some(base)).await;
+        assert_eq!(
+            patchset_baseline(&db, ps_id).await,
+            Some(base),
+            "patch 1 must replace the baseline a later part filled in"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_baseline_corrected_by_resubmitted_lowest_part() {
+        // Resubmitting a series is how a patchset that recorded the
+        // wrong baseline gets repaired.
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let wrong = db.create_baseline(None, None, Some("wrong")).await.unwrap();
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+
+        let ps_id = add_part(&db, thread_id, 1, Some(wrong)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(wrong));
+
+        let ps_id = add_part(&db, thread_id, 1, Some(base)).await;
+        assert_eq!(patchset_baseline(&db, ps_id).await, Some(base));
+    }
+
+    /// Add one part of a series as its own patchset, reached through the
+    /// author and time matching path rather than the cover letter lookup.
+    /// The parts share a git send-email message-id prefix, which is what
+    /// lets a later part match across threads and merge the two rows.
+    async fn add_unthreaded_part(
+        db: &Database,
+        thread_id: i64,
+        part: u32,
+        date: i64,
+        baseline: Option<i64>,
+    ) -> i64 {
+        let author = "Merge Author <merge@example.com>";
+        let msg = format!("20260731120000.4242-{}-merge@example.com", part);
+        let subject = format!("[PATCH {}/3] Subject", part);
+        db.create_message(
+            &msg, thread_id, None, author, &subject, date, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+
+        let id = db
+            .create_patchset(
+                thread_id, None, &msg, &subject, author, date, 3, 1, "", "", None, part, baseline,
+                true, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(id, &msg, part, "").await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_baseline_survives_patchset_merge() {
+        // Two patchsets form because the parts land in separate threads
+        // more than a day apart. A part between them matches both, and the
+        // merge keeps the row created first -- the one holding the higher
+        // part's baseline.
+        let db = setup_db().await;
+        let thread_hi = db
+            .create_thread("root_hi", "Subject", 100_000)
+            .await
+            .unwrap();
+        let thread_lo = db
+            .create_thread("root_lo", "Subject", 250_000)
+            .await
+            .unwrap();
+        let thread_mid = db
+            .create_thread("root_mid", "Subject", 175_000)
+            .await
+            .unwrap();
+
+        let base = db
+            .create_baseline(None, None, Some("series_base"))
+            .await
+            .unwrap();
+        let after1 = db
+            .create_baseline(None, None, Some("patch1"))
+            .await
+            .unwrap();
+        let after2 = db
+            .create_baseline(None, None, Some("patch2"))
+            .await
+            .unwrap();
+
+        let ps_hi = add_unthreaded_part(&db, thread_hi, 2, 100_000, Some(after1)).await;
+        let ps_lo = add_unthreaded_part(&db, thread_lo, 1, 250_000, Some(base)).await;
+        assert_ne!(ps_hi, ps_lo, "the two parts must form separate patchsets");
+
+        let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, Some(after2)).await;
+        assert_eq!(ps_id, ps_hi, "the merge keeps the patchset created first");
+        assert_eq!(
+            patchset_baseline(&db, ps_id).await,
+            Some(base),
+            "the merged-away patchset's baseline must survive the merge"
+        );
+    }
+
+    /// Verify that a commit SHA submitted as a singleton does NOT steal
+    /// a patch from a range patchset in a different thread.
+    ///
+    /// Regression test for the clid_candidates fallback that matched
+    /// across unrelated patchsets via the @sashiko.local suffix.
+    #[tokio::test]
+    async fn test_range_patch_not_stolen_by_singleton() {
+        let db = setup_db().await;
+        let author = "Akhil R <akhilrajeev@nvidia.com>";
+
+        // Thread 1: single commit submission (sha_D).
+        // For singletons, cover_letter_message_id = message_id.
+        let t1 = db
+            .create_thread("sha_D", "Single commit", 90000)
+            .await
+            .unwrap();
+        db.create_message(
+            "sha_D",
+            t1,
+            None,
+            author,
+            "i2c: tegra: Update timing",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some("sha_D"),
+                "sha_D",
+                "i2c: tegra: Update timing",
+                author,
+                90000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, "sha_D", 1, "diff-single")
+            .await
+            .unwrap();
+
+        // Verify single patchset is full (1/1)
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1);
+        assert_eq!(det["total_parts"], 1);
+
+        // Thread 2: range submission (A..D) with 4 commits.
+        // The root message_id is the range itself.
+        let t2 = db
+            .create_thread("range_root", "Range submission", 90010)
+            .await
+            .unwrap();
+
+        // Create the root/cover message for the range
+        db.create_message(
+            "range_root",
+            t2,
+            None,
+            author,
+            "Range A..D",
+            90010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // First patch establishes the range patchset
+        db.create_message(
+            "sha_A",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 1/4] Patch sha_A",
+            90011,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_A",
+                "[PATCH 1/4] Patch sha_A",
+                author,
+                90011,
+                4,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "sha_A", 1, "diff-sha_A")
+            .await
+            .unwrap();
+
+        // Patches 2-3 merge into the range patchset
+        for (i, sha) in ["sha_B", "sha_C"].iter().enumerate() {
+            let idx = (i + 2) as u32;
+            db.create_message(
+                sha,
+                t2,
+                Some("range_root"),
+                author,
+                &format!("[PATCH {}/4] Patch {}", idx, sha),
+                90010 + idx as i64,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let ps = db
+                .create_patchset(
+                    t2,
+                    Some("range_root"),
+                    sha,
+                    &format!("[PATCH {}/4] Patch {}", idx, sha),
+                    author,
+                    90010 + idx as i64,
+                    4,
+                    0,
+                    "",
+                    "",
+                    None,
+                    idx,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(ps, ps_range, "Patch {}/4 should merge into range", idx);
+            db.create_patch(ps, sha, idx, &format!("diff-{}", sha))
+                .await
+                .unwrap();
+        }
+
+        // Now patch 4/4: its message_id "sha_D_range" differs from
+        // the singleton's "sha_D", but the @sashiko.local fallback
+        // used to construct "sha_D_range@sashiko.local" which is
+        // different enough. The real issue was when message_id was
+        // literally the same SHA. Simulate that: message_id = "sha_D"
+        // but in thread t2.
+        db.create_message(
+            "sha_D_in_range",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 4/4] i2c: tegra: Update timing",
+            90014,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_4 = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_D_in_range",
+                "[PATCH 4/4] i2c: tegra: Update timing",
+                author,
+                90014,
+                4,
+                0,
+                "",
+                "",
+                None,
+                4,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("Patch 4/4 should merge into range, not be dropped");
+
+        assert_eq!(
+            ps_4, ps_range,
+            "Patch 4/4 must merge into the range patchset, not the singleton"
+        );
+
+        db.create_patch(ps_4, "sha_D_in_range", 4, "diff-sha_D")
+            .await
+            .unwrap();
+
+        // Range patchset should have all 4 patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 4,
+            "Range patchset should have all 4 patches"
+        );
+
+        // Singleton should still be untouched (1/1)
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton patchset should still have exactly 1 patch"
+        );
+    }
+
+    /// Count the actual patch rows owned by a patchset.
+    async fn count_patches(db: &Database, patchset_id: i64) -> i64 {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await
+            .unwrap();
+        if let Ok(Some(row)) = rows.next().await {
+            row.get(0).unwrap()
+        } else {
+            0
+        }
+    }
+
+    /// Verify that create_patch does not steal a patch from one patchset
+    /// to give it to another when both share the same message_id (SHA).
+    ///
+    /// Reproduces the bug where submitting a single commit then a range
+    /// containing the same commit causes the singleton to drop to 0/1.
+    #[tokio::test]
+    async fn test_create_patch_no_cross_patchset_steal() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "abcdef1234567890abcdef1234567890abcdef12";
+
+        // Thread 1: singleton submission
+        let t1 = db
+            .create_thread("single_root", "Single", 80000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Fix something",
+            80000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Fix something",
+                author,
+                80000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-singleton")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1, "Singleton should have 1 patch");
+
+        // Thread 2: range submission that includes the same SHA
+        let t2 = db
+            .create_thread("range_root", "Range", 80010)
+            .await
+            .unwrap();
+        db.create_message(
+            "range_root",
+            t2,
+            None,
+            author,
+            "Range cover",
+            80010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "sha_other",
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 1/2] Other fix",
+            80011,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("range_root"),
+                "sha_other",
+                "[PATCH 1/2] Other fix",
+                author,
+                80011,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "sha_other", 1, "diff-other")
+            .await
+            .unwrap();
+
+        // Patch 2/2 uses the SAME message_id as the singleton.
+        db.create_message(
+            shared_sha,
+            t2,
+            Some("range_root"),
+            author,
+            "[PATCH 2/2] Fix something",
+            80012,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // This should NOT steal the patch from ps_single.
+        db.create_patch(ps_range, shared_sha, 2, "diff-range-copy")
+            .await
+            .unwrap();
+
+        // Singleton must keep its patch
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton must keep its patch (was stolen by range)"
+        );
+        // Verify the actual patch row still belongs to the singleton
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+
+        // Range should have both patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range should have both patches"
+        );
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own both patch rows"
+        );
+
+        // Resubmit the same range patch again (idempotent guard)
+        db.create_patch(ps_range, shared_sha, 2, "diff-range-copy")
+            .await
+            .unwrap();
+
+        // received_parts must not exceed total_parts
+        let range_det2 = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det2["received_parts"], 2,
+            "Resubmission must not over-count received_parts"
+        );
+    }
+
+    /// Same singleton submitted twice: create_patch should be idempotent
+    /// via ON CONFLICT within the same patchset.
+    #[tokio::test]
+    async fn test_create_patch_same_singleton_twice() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+
+        let t1 = db.create_thread("root_dup", "Dup", 70000).await.unwrap();
+        db.create_message(
+            "sha_dup",
+            t1,
+            None,
+            author,
+            "Fix duplicate",
+            70000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                t1,
+                Some("sha_dup"),
+                "sha_dup",
+                "Fix duplicate",
+                author,
+                70000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First insert
+        db.create_patch(ps, "sha_dup", 1, "diff-v1").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1);
+
+        // Second insert (same patchset, same message_id) -- idempotent
+        db.create_patch(ps, "sha_dup", 1, "diff-v2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 1,
+            "Duplicate insert in same patchset must stay at 1"
+        );
+    }
+
+    /// Same range submitted twice: each patch in the range should be
+    /// idempotent via ON CONFLICT within the same patchset.
+    #[tokio::test]
+    async fn test_create_patch_same_range_twice() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+
+        let t1 = db
+            .create_thread("range_dup_root", "Range dup", 71000)
+            .await
+            .unwrap();
+        db.create_message(
+            "range_dup_root",
+            t1,
+            None,
+            author,
+            "Range cover",
+            71000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for sha in ["sha_r1", "sha_r2"] {
+            db.create_message(
+                sha,
+                t1,
+                Some("range_dup_root"),
+                author,
+                &format!("[PATCH] {}", sha),
+                71001,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps = db
+            .create_patchset(
+                t1,
+                Some("range_dup_root"),
+                "sha_r1",
+                "[PATCH 1/2] sha_r1",
+                author,
+                71001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // First round
+        db.create_patch(ps, "sha_r1", 1, "diff-r1").await.unwrap();
+        db.create_patch(ps, "sha_r2", 2, "diff-r2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 2);
+
+        // Second round (duplicate range submission)
+        db.create_patch(ps, "sha_r1", 1, "diff-r1").await.unwrap();
+        db.create_patch(ps, "sha_r2", 2, "diff-r2").await.unwrap();
+        let det = db
+            .get_patchset_details(ps, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 2,
+            "Duplicate range in same patchset must stay at 2"
+        );
+    }
+
+    /// Range submitted first, then singleton with shared SHA: neither
+    /// should lose its patch.
+    #[tokio::test]
+    async fn test_create_patch_range_then_singleton() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "shared_range_then_single";
+
+        // Thread 1: range first
+        let t1 = db
+            .create_thread("rts_range_root", "Range first", 72000)
+            .await
+            .unwrap();
+        db.create_message(
+            "rts_range_root",
+            t1,
+            None,
+            author,
+            "Range cover",
+            72000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "rts_other",
+            t1,
+            Some("rts_range_root"),
+            author,
+            "[PATCH 1/2] Other",
+            72001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            Some("rts_range_root"),
+            author,
+            "[PATCH 2/2] Shared",
+            72002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t1,
+                Some("rts_range_root"),
+                "rts_other",
+                "[PATCH 1/2] Other",
+                author,
+                72001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, "rts_other", 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared")
+            .await
+            .unwrap();
+
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range should have 2 patches"
+        );
+
+        // Thread 2: singleton with the shared SHA
+        let t2 = db
+            .create_thread("rts_single", "Single after", 72010)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            None,
+            author,
+            "Shared commit alone",
+            72010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t2,
+                Some(shared_sha),
+                shared_sha,
+                "Shared commit alone",
+                author,
+                72010,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // This should NOT steal from the range
+        db.create_patch(ps_single, shared_sha, 1, "diff-single")
+            .await
+            .unwrap();
+
+        // Range must still have 2 patches
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["received_parts"], 2,
+            "Range must keep both patches after singleton submission"
+        );
+        // Verify the range physically owns both patch rows
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own both patch rows"
+        );
+
+        // Singleton should have 1
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton should have 1 patch"
+        );
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+    }
+
+    /// 4-patch range where a shared commit is in the middle (not last):
+    /// ensures that all 4 patches are inserted physically and received_parts is 4.
+    #[tokio::test]
+    async fn test_create_patch_range_shared_mid_sequence() {
+        let db = setup_db().await;
+        let author = "Test <test@example.com>";
+        let shared_sha = "sha_mid_shared";
+
+        // Thread 1: singleton with the shared SHA
+        let t1 = db
+            .create_thread("mid_single_root", "Single", 90000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Shared commit",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Shared commit",
+                author,
+                90000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-single")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["received_parts"], 1, "Singleton should have 1 patch");
+
+        // Thread 2: 4-patch range where shared_sha is patch 2 of 4
+        let t2 = db
+            .create_thread("mid_range_root", "Range", 90010)
+            .await
+            .unwrap();
+        db.create_message(
+            "mid_range_root",
+            t2,
+            None,
+            author,
+            "Range cover",
+            90010,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for sha in ["sha_p1", shared_sha, "sha_p3", "sha_p4"] {
+            db.create_message(
+                sha,
+                t2,
+                Some("mid_range_root"),
+                author,
+                &format!("[PATCH] {}", sha),
+                90011,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .ok(); // shared_sha message already exists, ignore dup
+        }
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("mid_range_root"),
+                "sha_p1",
+                "[PATCH 1/4] sha_p1",
+                author,
+                90011,
+                4,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Insert patches in order: p1, shared (cross-patchset), p3, p4
+        db.create_patch(ps_range, "sha_p1", 1, "diff-p1")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 1,
+            "After p1: received_parts should be 1"
+        );
+
+        // Patch 2: shared SHA — cross-patchset, bumps received_parts
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 2,
+            "After shared: received_parts should be 2"
+        );
+
+        // Patch 3: normal insert — must NOT overwrite the bump
+        db.create_patch(ps_range, "sha_p3", 3, "diff-p3")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 3,
+            "After p3: received_parts should be 3 (COUNT bug would give 2)"
+        );
+
+        // Patch 4: normal insert — completes the range
+        db.create_patch(ps_range, "sha_p4", 4, "diff-p4")
+            .await
+            .unwrap();
+        let det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            det["received_parts"], 4,
+            "After p4: range must be complete with 4/4"
+        );
+
+        // Verify physical patch ownership: range has all 4 physical patches
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            4,
+            "Range should physically own all 4 patches"
+        );
+
+        // Singleton must still have its patch
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["received_parts"], 1,
+            "Singleton must keep its patch"
+        );
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own its patch row"
+        );
+
+        // Status check: range should be Pending (complete)
+        assert!(
+            det["status"] == "Pending" || det["status"] == "In Review",
+            "Range status should transition to Pending/In Review, got: {}",
+            det["status"]
+        );
+    }
+
+    /// Verify that when a commit SHA is shared across multiple patchsets
+    /// (e.g. submitted as a singleton and then in a range resubmission),
+    /// both patchsets physically own their patch rows in the database,
+    /// so that get_patch_diffs and get_patchset_details return all patches
+    /// for both patchsets.
+    #[tokio::test]
+    async fn test_cross_patchset_shared_commit_physical_rows_and_diffs() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let shared_sha = "shared_commit_sha_1234567890";
+        let other_sha = "other_commit_sha_0987654321";
+
+        // 1. Thread 1: Singleton patchset with shared_sha
+        let t1 = db
+            .create_thread("t1_singleton", "Singleton Subject", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            None,
+            author,
+            "Singleton commit",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t1,
+                Some(shared_sha),
+                shared_sha,
+                "Singleton commit",
+                author,
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-shared-v1")
+            .await
+            .unwrap();
+
+        // 2. Thread 2: 2-patch range containing other_sha (part 1) and shared_sha (part 2)
+        let t2 = db
+            .create_thread("t2_range_cover", "Range Subject", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "t2_range_cover",
+            t2,
+            None,
+            author,
+            "Range Cover Letter",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            other_sha,
+            t2,
+            Some("t2_range_cover"),
+            author,
+            "[PATCH 1/2] Other commit",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            Some("t2_range_cover"),
+            author,
+            "[PATCH 2/2] Shared commit",
+            2002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t2,
+                Some("t2_range_cover"),
+                other_sha,
+                "[PATCH 1/2] Other commit",
+                author,
+                2001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, other_sha, 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared-v2")
+            .await
+            .unwrap();
+
+        // Check singleton: must have 1 physical patch row and 1 diff
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own 1 patch row"
+        );
+        let single_diffs = db.get_patch_diffs(ps_single).await.unwrap();
+        assert_eq!(
+            single_diffs.len(),
+            1,
+            "Singleton must have 1 patch diff returned by get_patch_diffs"
+        );
+        assert_eq!(single_diffs[0].6, shared_sha);
+
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["patches"].as_array().unwrap().len(),
+            1,
+            "Singleton details must contain 1 patch"
+        );
+
+        // Check range: must have 2 physical patch rows and 2 diffs
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own 2 patch rows"
+        );
+        let range_diffs = db.get_patch_diffs(ps_range).await.unwrap();
+        assert_eq!(
+            range_diffs.len(),
+            2,
+            "Range must have 2 patch diffs returned by get_patch_diffs (including shared SHA)"
+        );
+        assert_eq!(range_diffs[0].6, other_sha);
+        assert_eq!(range_diffs[1].6, shared_sha);
+
+        let range_det = db
+            .get_patchset_details(ps_range, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            range_det["patches"].as_array().unwrap().len(),
+            2,
+            "Range details must contain 2 patches"
+        );
+    }
+
+    /// Verify the reverse ingestion order: range first, then singleton with
+    /// the shared commit. The singleton must physically own its patch row
+    /// and return its diff.
+    #[tokio::test]
+    async fn test_cross_patchset_shared_commit_range_then_singleton() {
+        let db = setup_db().await;
+        let author = "Author <author@example.com>";
+        let shared_sha = "shared_commit_rev_1234567890";
+        let other_sha = "other_commit_rev_0987654321";
+
+        // 1. Thread 1: 2-patch range containing other_sha (part 1) and shared_sha (part 2)
+        let t1 = db
+            .create_thread("t1_range_cover", "Range Subject", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "t1_range_cover",
+            t1,
+            None,
+            author,
+            "Range Cover Letter",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            other_sha,
+            t1,
+            Some("t1_range_cover"),
+            author,
+            "[PATCH 1/2] Other commit",
+            1001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            shared_sha,
+            t1,
+            Some("t1_range_cover"),
+            author,
+            "[PATCH 2/2] Shared commit",
+            1002,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_range = db
+            .create_patchset(
+                t1,
+                Some("t1_range_cover"),
+                other_sha,
+                "[PATCH 1/2] Other commit",
+                author,
+                1001,
+                2,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_range, other_sha, 1, "diff-other")
+            .await
+            .unwrap();
+        db.create_patch(ps_range, shared_sha, 2, "diff-shared-v1")
+            .await
+            .unwrap();
+
+        // 2. Thread 2: Singleton patchset with shared_sha
+        let t2 = db
+            .create_thread("t2_singleton", "Singleton Subject", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            shared_sha,
+            t2,
+            None,
+            author,
+            "Singleton commit",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_single = db
+            .create_patchset(
+                t2,
+                Some(shared_sha),
+                shared_sha,
+                "Singleton commit",
+                author,
+                2000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(ps_single, shared_sha, 1, "diff-shared-v2")
+            .await
+            .unwrap();
+
+        // Check range: must have 2 physical patch rows and 2 diffs
+        assert_eq!(
+            count_patches(&db, ps_range).await,
+            2,
+            "Range must physically own 2 patch rows"
+        );
+        let range_diffs = db.get_patch_diffs(ps_range).await.unwrap();
+        assert_eq!(
+            range_diffs.len(),
+            2,
+            "Range must have 2 patch diffs returned by get_patch_diffs"
+        );
+
+        // Check singleton: must have 1 physical patch row and 1 diff
+        assert_eq!(
+            count_patches(&db, ps_single).await,
+            1,
+            "Singleton must physically own 1 patch row"
+        );
+        let single_diffs = db.get_patch_diffs(ps_single).await.unwrap();
+        assert_eq!(
+            single_diffs.len(),
+            1,
+            "Singleton must have 1 patch diff returned by get_patch_diffs"
+        );
+        assert_eq!(single_diffs[0].6, shared_sha);
+
+        let single_det = db
+            .get_patchset_details(ps_single, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single_det["patches"].as_array().unwrap().len(),
+            1,
+            "Singleton details must contain 1 patch"
+        );
+    }
+
+    /// Verify that get_patchset_details_by_msgid and get_patchset_summary_by_msgid
+    /// resolve synthetic IDs when queried by bare SHA.
+    #[tokio::test]
+    async fn test_get_patchset_details_by_synthetic_msgid() {
+        let db = setup_db().await;
+        let sha = "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4";
+        let synthetic_id = format!("{}@sashiko.local", sha);
+
+        // Create a fetching patchset with the synthetic cover_letter_message_id
+        let ps_id = db
+            .create_fetching_patchset(
+                &synthetic_id,
+                "Fetching patchset subject",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. Querying with the bare SHA must find the patchset details
+        let details = db
+            .get_patchset_details_by_msgid(sha, None, None)
+            .await
+            .unwrap();
+        assert!(
+            details.is_some(),
+            "get_patchset_details_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
+        );
+        assert_eq!(details.unwrap()["id"], ps_id);
+
+        // 2. Querying with bracketed SHA must also find the patchset details
+        let details_bracketed = db
+            .get_patchset_details_by_msgid(&format!("<{}>", sha), None, None)
+            .await
+            .unwrap();
+        assert_eq!(details_bracketed.unwrap()["id"], ps_id);
+
+        // 3. Querying with full synthetic ID must also find the patchset details
+        let details_full = db
+            .get_patchset_details_by_msgid(&synthetic_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(details_full.unwrap()["id"], ps_id);
+
+        // 4. Querying with the bare SHA must also find the patchset summary
+        let summary = db
+            .get_patchset_summary_by_msgid(sha, None, None)
+            .await
+            .unwrap();
+        assert!(
+            summary.is_some(),
+            "get_patchset_summary_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
+        );
+        assert_eq!(summary.unwrap()["id"], ps_id);
+
+        // 5. update_patchset_error with bare SHA updates the synthetic patchset
+        db.update_patchset_error(sha, "Fetch failed: timeout")
+            .await
+            .unwrap();
+        let updated = db
+            .get_patchset_details_by_msgid(sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["status"], "Failed");
+        assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
+    }
+
+    /// Until the repair migration has run, a cover letter message id can name
+    /// two patchsets, because a series posted as a reply used to adopt the
+    /// thread root as its own cover letter. The id resolves to the series that
+    /// claimed it first, not to whichever row was written last.
+    #[tokio::test]
+    async fn test_patchset_by_msgid_resolves_to_the_first_claimant() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            "Author A",
+            cover_subject,
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The series that sent the cover letter took its subject from part 0.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, '[PATCH v4 00/16] Remove PG_private', 0, 'Author A', 1000,
+                         'Reviewed', 16, 16)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+
+        // An unrelated series replied into the same thread and took the same
+        // id with it, later.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (2, ?, ?, '[PATCH 1/3] md: Use folio_alloc_buffers()', 1, 'Author B', 2000,
+                         'Reviewed', 3, 3)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.find_patchset_id_by_msgid(cover).await.unwrap(),
+            Some(1),
+            "the first claimant of a message id must win the lookup"
+        );
+
+        let details = db
+            .get_patchset_details_by_msgid(cover, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["subject"], "[PATCH v4 00/16] Remove PG_private");
+
+        let summary = db
+            .get_patchset_summary_by_msgid(cover, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["id"], 1);
+
+        // A patch can sit in two patchsets while the database is in this
+        // state, so the patch lookup answers the same way as the cover letter
+        // lookup: the row that recorded it first.
+        let part = "20260914041830.2072626-1-willy@infradead.org";
+        db.create_message(
+            part,
+            thread_id,
+            Some(cover),
+            "Author B",
+            "[PATCH 1/3] md: Use folio_alloc_buffers()",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(1, part, 1, "diff").await.unwrap();
+        db.create_patch(2, part, 1, "diff").await.unwrap();
+
+        assert_eq!(
+            db.find_patchset_id_by_msgid(part).await.unwrap(),
+            Some(1),
+            "a patch held by two patchsets resolves to the one that recorded it first"
+        );
+    }
+
+    /// A message only counts as a series' cover letter when it announces part
+    /// 0 of exactly that many parts, at that version, from that author.
+    #[tokio::test]
+    async fn test_message_is_cover_letter_for_rejects_a_foreign_thread_root() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+        let sender = "Zi Yan <ziy@nvidia.com>";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            sender,
+            cover_subject,
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.message_is_cover_letter_for(cover, sender, 16, Some(4))
+                .await
+                .unwrap(),
+            "the series it announces owns it"
+        );
+        assert!(
+            !db.message_is_cover_letter_for(cover, "Matthew Wilcox <willy@infradead.org>", 3, None)
+                .await
+                .unwrap(),
+            "a three part series from another author must not claim it"
+        );
+        assert!(
+            !db.message_is_cover_letter_for(cover, sender, 16, Some(5))
+                .await
+                .unwrap(),
+            "the next version of a series must not claim the previous cover letter"
+        );
+        assert!(
+            !db.message_is_cover_letter_for("never-seen@example.com", sender, 16, Some(4))
+                .await
+                .unwrap(),
+            "a message that was never ingested announces nothing"
+        );
+    }
+
+    /// A series posted into somebody else's thread is named after its own
+    /// first patch, and the thread root keeps naming the series that sent it.
+    #[tokio::test]
+    async fn test_reply_series_is_named_after_its_own_first_patch() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+        let host_author = "Zi Yan <ziy@nvidia.com>";
+        let reply_author = "Matthew Wilcox <willy@infradead.org>";
+        let reply_1 = "20260914041830.2072626-1-willy@infradead.org";
+        let reply_2 = "20260914041830.2072626-2-willy@infradead.org";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            host_author,
+            cover_subject,
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let host_id = db
+            .create_patchset(
+                thread_id,
+                Some(cover),
+                cover,
+                cover_subject,
+                host_author,
+                1000,
+                16,
+                1,
+                "to",
+                "cc",
+                Some(4),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Both parts of the reply series carry In-Reply-To of the host's
+        // cover letter, so ingestion names the series after each part itself.
+        let reply_id = ingest_reply_part(&db, thread_id, cover, reply_author, reply_1, 1).await;
+        let same_id = ingest_reply_part(&db, thread_id, cover, reply_author, reply_2, 2).await;
+
+        assert_eq!(same_id, reply_id, "the reply series' parts belong together");
+        assert_ne!(
+            reply_id, host_id,
+            "a reply series is not the series it replies to"
+        );
+        assert_eq!(
+            series_identity(&db, reply_id).await,
+            reply_1,
+            "a later part must not rename the series"
+        );
+        assert_eq!(
+            db.find_patchset_id_by_msgid(cover).await.unwrap(),
+            Some(host_id),
+            "the cover letter still names the series that sent it"
+        );
+        assert_eq!(
+            db.find_patchset_id_by_msgid(reply_1).await.unwrap(),
+            Some(reply_id),
+            "the reply series answers to its own first patch"
+        );
+    }
+
+    /// Parts arrive in any order, so a name taken by a later part moves to the
+    /// first patch once that shows up, and then stops moving.
+    #[tokio::test]
+    async fn test_series_name_settles_on_the_lowest_numbered_part() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let author = "Matthew Wilcox <willy@infradead.org>";
+        let reply_1 = "20260914041830.2072626-1-willy@infradead.org";
+        let reply_2 = "20260914041830.2072626-2-willy@infradead.org";
+        let reply_3 = "20260914041830.2072626-3-willy@infradead.org";
+
+        let thread_id = db
+            .create_thread(cover, "[PATCH v4 00/16] Remove PG_private", 1000)
+            .await
+            .unwrap();
+
+        let ps_id = ingest_reply_part(&db, thread_id, cover, author, reply_2, 2).await;
+        assert_eq!(series_identity(&db, ps_id).await, reply_2);
+
+        ingest_reply_part(&db, thread_id, cover, author, reply_1, 1).await;
+        assert_eq!(
+            series_identity(&db, ps_id).await,
+            reply_1,
+            "the first patch takes the name from a later part"
+        );
+
+        ingest_reply_part(&db, thread_id, cover, author, reply_3, 3).await;
+        assert_eq!(
+            series_identity(&db, ps_id).await,
+            reply_1,
+            "a later part leaves the name alone"
+        );
+    }
+
+    /// Ingest one part of a three part series that was posted in reply to
+    /// `in_reply_to`, the way process_parsed_article does once it finds that
+    /// message is not this series' cover letter.
+    async fn ingest_reply_part(
+        db: &Database,
+        thread_id: i64,
+        in_reply_to: &str,
+        author: &str,
+        message_id: &str,
+        part_index: u32,
+    ) -> i64 {
+        let subject = format!("[PATCH {}/3] md: part {}", part_index, part_index);
+        let date = 2000 + i64::from(part_index);
+
+        db.create_message(
+            message_id,
+            thread_id,
+            Some(in_reply_to),
+            author,
+            &subject,
+            date,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                Some(message_id),
+                message_id,
+                &subject,
+                author,
+                date,
+                3,
+                1,
+                "to",
+                "cc",
+                None,
+                part_index,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(patchset_id, message_id, part_index, "diff")
+            .await
+            .unwrap();
+
+        patchset_id
+    }
+
+    /// The message id a patchset answers to.
+    async fn series_identity(db: &Database, patchset_id: i64) -> String {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    /// Runs the repair exactly as migration 6 does, until it settles.
+    async fn run_borrowed_name_repair(db: &Database) {
+        let tx = db.conn.transaction().await.unwrap();
+        Database::repair_borrowed_series_names(&tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Records a message, which both patchsets and patches point at.
+    ///
+    /// Two series can record the same part, so an id already present is left
+    /// as it stands.
+    async fn ensure_message(db: &Database, thread_id: i64, message_id: &str) {
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO messages (message_id, thread_id, author, subject, date)
+                 VALUES (?, ?, 'An Author', 'A subject', 1000)",
+                libsql::params![message_id, thread_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a patchset under a name, with the parts it is made of.
+    ///
+    /// A subject_index above 0 is what marks a series that never saw a cover
+    /// letter of its own, which is the state the repair looks for.
+    async fn insert_series(
+        db: &Database,
+        id: i64,
+        thread_id: i64,
+        name: &str,
+        subject_index: i64,
+        parts: &[(&str, u32)],
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (?, ?, ?, 'A subject', ?, 'An Author', 1000, 'Reviewed', 3, ?)",
+                libsql::params![id, thread_id, name, subject_index, parts.len() as i64],
+            )
+            .await
+            .unwrap();
+        for (message_id, part_index) in parts {
+            ensure_message(db, thread_id, message_id).await;
+            db.create_patch(id, message_id, *part_index, "diff")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The repair renames the patchset that borrowed a message id after its
+    /// own first patch, and leaves the series that sent it alone.
+    #[tokio::test]
+    async fn test_migration_repairs_borrowed_series_names() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+        let borrower_1 = "20260914041830.2072626-1-willy@infradead.org";
+        let borrower_2 = "20260914041830.2072626-2-willy@infradead.org";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        for (message_id, subject, date) in [
+            (cover, cover_subject, 1000),
+            (borrower_1, "[PATCH 1/3] md: part 1", 2001),
+            (borrower_2, "[PATCH 2/3] md: part 2", 2002),
+        ] {
+            db.create_message(
+                message_id,
+                thread_id,
+                None,
+                "An Author",
+                subject,
+                date,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The series that sent the cover letter, and the series that replied
+        // into its thread and took the same name.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, ?, 0, 'An Author', 1000, 'Reviewed', 16, 16)",
+                libsql::params![thread_id, cover, cover_subject],
+            )
+            .await
+            .unwrap();
+        insert_series(
+            &db,
+            2,
+            thread_id,
+            cover,
+            1,
+            &[(borrower_2, 2), (borrower_1, 1)],
+        )
+        .await;
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 2).await,
+            borrower_1,
+            "the borrowing series must be renamed after its own first patch"
+        );
+        assert_eq!(
+            series_identity(&db, 1).await,
+            cover,
+            "the series that sent the cover letter keeps its name"
+        );
+        assert_eq!(db.find_patchset_id_by_msgid(cover).await.unwrap(), Some(1));
+        assert_eq!(
+            db.find_patchset_id_by_msgid(borrower_1).await.unwrap(),
+            Some(2)
+        );
+
+        // With the collision gone, a second run has nothing left to rename.
+        run_borrowed_name_repair(&db).await;
+        assert_eq!(series_identity(&db, 2).await, borrower_1);
+        assert_eq!(series_identity(&db, 1).await, cover);
+    }
+
+    /// A series whose honest name is held by another borrower is repaired
+    /// too, on the pass after the one that moves that borrower away.
+    #[tokio::test]
+    async fn test_migration_repairs_a_chain_of_borrowed_names() {
+        let db = setup_db().await;
+        let cover = "cover-of-the-first-thread@example.com";
+        let held_by_first = "series-one-part-1@example.com";
+        let held_by_second = "series-two-part-1@example.com";
+
+        let thread_id = db
+            .create_thread(cover, "A cover letter", 1000)
+            .await
+            .unwrap();
+        ensure_message(&db, thread_id, cover).await;
+        // The series that sent the cover letter owns that name.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, 'A cover letter', 0, 'An Author', 1000, 'Reviewed', 2, 2)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+        // Borrows the cover letter's name, and its honest name is in turn
+        // held by the series below.
+        insert_series(&db, 2, thread_id, cover, 1, &[(held_by_first, 1)]).await;
+        // Borrows the name of the patch that series 2 is waiting for.
+        insert_series(&db, 3, thread_id, held_by_first, 1, &[(held_by_second, 1)]).await;
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 3).await,
+            held_by_second,
+            "the series at the end of the chain takes its own first patch"
+        );
+        assert_eq!(
+            series_identity(&db, 2).await,
+            held_by_first,
+            "the series behind it takes the name freed by that rename"
+        );
+        assert_eq!(
+            series_identity(&db, 1).await,
+            cover,
+            "the series that sent the cover letter keeps its name"
+        );
+        assert_eq!(db.find_patchset_id_by_msgid(cover).await.unwrap(), Some(1));
+    }
+
+    /// Two series that record the same patch are left alone, because moving
+    /// both onto it would replace one collision with another.
+    #[tokio::test]
+    async fn test_migration_leaves_series_that_share_a_first_patch() {
+        let db = setup_db().await;
+        let cover = "cover-of-the-thread@example.com";
+        let shared_patch = "the-same-patch@example.com";
+
+        let thread_id = db
+            .create_thread(cover, "A cover letter", 1000)
+            .await
+            .unwrap();
+        ensure_message(&db, thread_id, cover).await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, 'A cover letter', 0, 'An Author', 1000, 'Reviewed', 2, 2)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+        insert_series(&db, 2, thread_id, cover, 1, &[(shared_patch, 1)]).await;
+        insert_series(&db, 3, thread_id, cover, 1, &[(shared_patch, 1)]).await;
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 2).await,
+            cover,
+            "neither series may take a name the other would take as well"
+        );
+        assert_eq!(series_identity(&db, 3).await, cover);
+        assert_eq!(
+            db.find_patchset_id_by_msgid(shared_patch).await.unwrap(),
+            Some(2),
+            "the shared patch still resolves through the patches table, to the
+             series that recorded it first"
+        );
+    }
+
+    /// A fetch of a thread names its row after the message id it was asked
+    /// for, and comes back to that name on the next attempt. A row in a state
+    /// the fetch restarts from therefore keeps its name, borrowed or not.
+    #[tokio::test]
+    async fn test_migration_leaves_a_name_a_fetch_would_reuse() {
+        let db = setup_db().await;
+        let fetched = "the-message-that-was-fetched@example.com";
+        let own_patch = "the-fetched-series-part-1@example.com";
+
+        let thread_id = db
+            .create_thread(fetched, "A cover letter", 1000)
+            .await
+            .unwrap();
+        ensure_message(&db, thread_id, fetched).await;
+        // The series that sent the fetched message owns that name.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, 'A cover letter', 0, 'An Author', 1000, 'Reviewed', 2, 2)",
+                libsql::params![thread_id, fetched],
+            )
+            .await
+            .unwrap();
+        // The row the fetch created, which borrowed that name and has not
+        // finished fetching.
+        insert_series(&db, 2, thread_id, fetched, 1, &[(own_patch, 1)]).await;
+        db.conn
+            .execute("UPDATE patchsets SET status = 'Fetching' WHERE id = 2", ())
+            .await
+            .unwrap();
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 2).await,
+            fetched,
+            "a row the fetch would come back to keeps the name it is tracked by"
+        );
+
+        // Once the fetch is done the row is renamed like any other borrower.
+        db.conn
+            .execute("UPDATE patchsets SET status = 'Reviewed' WHERE id = 2", ())
+            .await
+            .unwrap();
+        run_borrowed_name_repair(&db).await;
+        assert_eq!(series_identity(&db, 2).await, own_patch);
+    }
+
+    /// Migration 7 folds an empty Incomplete cover-letter row into its
+    /// Reviewed sibling series when every patch of that series has an
+    /// email_outbox row, and leaves rows without an outbox entry untouched.
+    #[tokio::test]
+    async fn test_migration_folds_shadow_cover_rows() {
+        let db = setup_db().await;
+        let cover = "cover-0-of-1@example.com";
+        let patch = "patch-1-of-1@example.com";
+        let subj = "[PATCH v2 0/1] mm: memcg: fix";
+
+        let thread_id = db.create_thread(cover, subj, 1000).await.unwrap();
+        ensure_message(&db, thread_id, cover).await;
+        ensure_message(&db, thread_id, patch).await;
+
+        // Real row: Reviewed, has the patch, named after patch 1/1.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts, embargo_until)
+                 VALUES (10, ?, ?, ?, 0, 'An Author', 1000, 'Reviewed', 1, 1, NULL)",
+                libsql::params![thread_id, patch, subj],
+            )
+            .await
+            .unwrap();
+        let patch_id = db.create_patch(10, patch, 1, "diff").await.unwrap();
+
+        // Empty shadow row: Incomplete, 0 patches, holds the cover letter id.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (11, ?, ?, ?, 0, 'An Author', 1005, 'Incomplete', 1, 0)",
+                libsql::params![thread_id, cover, subj],
+            )
+            .await
+            .unwrap();
+
+        let fold = include_str!("migrations/007_fold_shadow_cover_rows.sql");
+
+        // Without an email_outbox row, migration 7 must refuse to touch it.
+        db.conn.execute_batch(fold).await.unwrap();
+        assert_eq!(series_identity(&db, 10).await, patch);
+
+        // Once the patch has an email_outbox entry, migration 7 folds row 11 into row 10.
+        db.insert_email_outbox(patch_id, "Sent", "[]", "[]", subj, patch, patch, "body")
+            .await
+            .unwrap();
+        db.conn.execute_batch(fold).await.unwrap();
+
+        assert_eq!(
+            series_identity(&db, 10).await,
+            cover,
+            "the Reviewed series takes the cover letter's message id"
+        );
+        assert_eq!(
+            db.find_patchset_id_by_msgid(cover).await.unwrap(),
+            Some(10),
+            "the cover letter URL now resolves to the Reviewed series"
+        );
+
+        // If another empty Incomplete row exists in the same thread with the same subject,
+        // migration 7 must not overwrite row 10 now that row 10 holds a cover letter id
+        // rather than one of its own patch ids.
+        let stray_cover = "stray-cover-0-of-1@example.com";
+        ensure_message(&db, thread_id, stray_cover).await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (12, ?, ?, ?, 0, 'An Author', 1010, 'Incomplete', 1, 0)",
+                libsql::params![thread_id, stray_cover, subj],
+            )
+            .await
+            .unwrap();
+        db.conn.execute_batch(fold).await.unwrap();
+        assert_eq!(
+            series_identity(&db, 10).await,
+            cover,
+            "migration 7 must not overwrite a series that already has its own cover letter"
+        );
+    }
+
+    /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
+    /// for synthetic @sashiko.local cover letters and for patches in the patches table.
+    #[tokio::test]
+    async fn test_has_patchset_by_msgid_synthetic_and_patch_sha() {
+        let db = setup_db().await;
+        let sha_fetching = "deadbeef1234567890abcdef1234567890abcdef";
+        let synthetic_id = format!("{}@sashiko.local", sha_fetching);
+
+        // 1. Placeholder patchset in Fetching state with @sashiko.local cover letter
+        db.create_fetching_patchset(
+            &synthetic_id,
+            "Fetching placeholder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Must return true when queried by bare SHA
+        assert!(
+            db.has_patchset_by_msgid(sha_fetching).await.unwrap(),
+            "has_patchset_by_msgid should return true for bare SHA matching @sashiko.local cover letter"
+        );
+
+        // 2. Patchset with physical patch row
+        let sha_patch = "c0ffee1234567890abcdef1234567890abcdef";
+        let t = db
+            .create_thread("t_thread", "Test Thread", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_letter@example.com",
+            t,
+            None,
+            "Author <a@example.com>",
+            "Cover Subject",
+            999,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_patch,
+            t,
+            Some("cover_letter@example.com"),
+            "Author <a@example.com>",
+            "Patch Subject",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                t,
+                Some("cover_letter@example.com"),
+                sha_patch,
+                "Patch Subject",
+                "Author <a@example.com>",
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps, sha_patch, 1, "diff-patch")
+            .await
+            .unwrap();
+
+        // Must return true when queried by the patch's SHA even if cover letter is different
+        assert!(
+            db.has_patchset_by_msgid(sha_patch).await.unwrap(),
+            "has_patchset_by_msgid should return true for SHA existing in patches table"
+        );
+    }
+
+    /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
+    /// patchsets so that retry submissions can be re-fetched.
+    #[tokio::test]
+    async fn test_has_patchset_by_msgid_excludes_failed_and_cancelled() {
+        let db = setup_db().await;
+        let sha_failed = "f00f00f001234567890abcdef1234567890abcdef";
+        let synthetic_failed = format!("{}@sashiko.local", sha_failed);
+
+        // 1. Create a patchset and mark it Failed
+        let _ps_failed = db
+            .create_fetching_patchset(
+                &synthetic_failed,
+                "Fetching failed placeholder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_error(sha_failed, "Remote host unreachable")
+            .await
+            .unwrap();
+
+        // Must return false for Failed patchset to allow retry
+        assert!(
+            !db.has_patchset_by_msgid(sha_failed).await.unwrap(),
+            "has_patchset_by_msgid should return false for Failed patchset to allow retry"
+        );
+
+        // 2. Create a patchset and mark it Cancelled
+        let sha_cancelled = "c00c00c001234567890abcdef1234567890abcdef";
+        let synthetic_cancelled = format!("{}@sashiko.local", sha_cancelled);
+        let ps_cancelled = db
+            .create_fetching_patchset(
+                &synthetic_cancelled,
+                "Fetching cancelled placeholder",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_cancelled, "Cancelled")
+            .await
+            .unwrap();
+
+        // Must return false for Cancelled patchset to allow retry
+        assert!(
+            !db.has_patchset_by_msgid(sha_cancelled).await.unwrap(),
+            "has_patchset_by_msgid should return false for Cancelled patchset to allow retry"
+        );
+
+        // 3. Create a patchset with a physical patch row, then mark patchset Failed
+        let sha_failed_patch = "a11a11a111234567890abcdef1234567890abcdef";
+        let t_failed = db
+            .create_thread("t_f", "Failed thread", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_failed@example.com",
+            t_failed,
+            None,
+            "Author <a@example.com>",
+            "Failed Subject",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_failed_patch,
+            t_failed,
+            Some("cover_failed@example.com"),
+            "Author <a@example.com>",
+            "Failed Patch Subject",
+            2001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_f = db
+            .create_patchset(
+                t_failed,
+                Some("cover_failed@example.com"),
+                sha_failed_patch,
+                "Failed Patch Subject",
+                "Author <a@example.com>",
+                2001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_f, sha_failed_patch, 1, "diff-fail")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_f, "Failed").await.unwrap();
+
+        // Must return false when queried by the patch's SHA because its patchset is Failed
+        assert!(
+            !db.has_patchset_by_msgid(sha_failed_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Failed patchset"
+        );
+
+        // 4. Create a patchset with a physical patch row, then mark patchset Cancelled
+        let sha_cancelled_patch = "b22b22b221234567890abcdef1234567890abcdef";
+        let t_cancelled = db
+            .create_thread("t_c", "Cancelled thread", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_cancelled@example.com",
+            t_cancelled,
+            None,
+            "Author <a@example.com>",
+            "Cancelled Subject",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_cancelled_patch,
+            t_cancelled,
+            Some("cover_cancelled@example.com"),
+            "Author <a@example.com>",
+            "Cancelled Patch Subject",
+            3001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_c = db
+            .create_patchset(
+                t_cancelled,
+                Some("cover_cancelled@example.com"),
+                sha_cancelled_patch,
+                "Cancelled Patch Subject",
+                "Author <a@example.com>",
+                3001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_c, sha_cancelled_patch, 1, "diff-cancel")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_c, "Cancelled").await.unwrap();
+
+        // Must return false when queried by the patch's SHA because its patchset is Cancelled
+        assert!(
+            !db.has_patchset_by_msgid(sha_cancelled_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Cancelled patchset"
+        );
+
+        // 5. Create a patchset with a physical patch row, then mark patchset Failed To Apply
+        let sha_fta_patch = "c33c33c331234567890abcdef1234567890abcdef";
+        let t_fta = db
+            .create_thread("t_fta", "Failed to apply thread", 4000)
+            .await
+            .unwrap();
+        db.create_message(
+            "cover_fta@example.com",
+            t_fta,
+            None,
+            "Author <a@example.com>",
+            "FTA Subject",
+            4000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            sha_fta_patch,
+            t_fta,
+            Some("cover_fta@example.com"),
+            "Author <a@example.com>",
+            "FTA Patch Subject",
+            4001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_fta = db
+            .create_patchset(
+                t_fta,
+                Some("cover_fta@example.com"),
+                sha_fta_patch,
+                "FTA Patch Subject",
+                "Author <a@example.com>",
+                4001,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_fta, sha_fta_patch, 1, "diff-fta")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_fta, "Failed To Apply")
+            .await
+            .unwrap();
+
+        // Must return false when queried by cover letter and by patch SHA
+        assert!(
+            !db.has_patchset_by_msgid("cover_fta@example.com")
+                .await
+                .unwrap(),
+            "has_patchset_by_msgid should return false for cover letter of Failed To Apply patchset"
+        );
+        assert!(
+            !db.has_patchset_by_msgid(sha_fta_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Failed To Apply patchset"
+        );
+    }
+
+    /// Verify that create_fetching_patchset resets patchsets in 'Failed To Apply'
+    /// status to 'Fetching' so that re-submitted patches can transition to 'Pending'.
+    #[tokio::test]
+    async fn test_failed_to_apply_patchset_resettable_and_reingestible() {
+        let db = setup_db().await;
+        let sha = "d44d44d441234567890abcdef1234567890abcdef";
+        let synthetic_cover = format!("{}@sashiko.local", sha);
+
+        // 1. Create a placeholder and ingest the patch
+        let ps_id = db
+            .create_fetching_patchset(
+                &synthetic_cover,
+                "Fetching initial",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let t = db
+            .create_thread("t_reingest", "Thread", 5000)
+            .await
+            .unwrap();
+        db.create_message(
+            sha,
+            t,
+            Some(&synthetic_cover),
+            "Author <a@example.com>",
+            "Patch Subject",
+            5000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ps_created = db
+            .create_patchset(
+                t,
+                Some(&synthetic_cover),
+                sha,
+                "Patch Subject",
+                "Author <a@example.com>",
+                5000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id, ps_created);
+
+        db.create_patch(ps_id, sha, 1, "diff-v1").await.unwrap();
+
+        // 2. Mark patchset Failed To Apply during review
+        db.update_patchset_status(ps_id, "Failed To Apply")
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["status"], "Failed To Apply");
+
+        // 3. User re-submits: create_fetching_patchset must reset status to Fetching
+        let ps_re_id = db
+            .create_fetching_patchset(
+                &synthetic_cover,
+                "Fetching retry",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps_re_id, ps_id);
+
+        let det_after_fetch = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_after_fetch["status"], "Fetching");
+
+        // 4. Ingestion re-runs create_patchset and create_patch
+        let ps_reingested = db
+            .create_patchset(
+                t,
+                Some(&synthetic_cover),
+                sha,
+                "Patch Subject Retry",
+                "Author <a@example.com>",
+                5010,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_reingested, ps_id);
+
+        db.create_patch(ps_id, sha, 1, "diff-v2").await.unwrap();
+
+        // Patchset must now successfully be in Pending status (ready for review)
+        let det_final = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_final["status"], "Pending");
+    }
+
+    /// Verify that an existing database at user_version = 1 with the legacy
+    /// UNIQUE(message_id) constraint is automatically migrated by db.migrate()
+    /// without requiring a user_version bump.
+    #[tokio::test]
+    async fn test_bug_crud_and_links() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug = NewBug {
+            bugid: "linux-test-1234".to_string(),
+            title: "Memory leak in e1000_probe()".to_string(),
+            lifecycle_status: BugLifecycleStatus::Open,
+            pipeline_state: BugPipelineState::Succeeded,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 123456789,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: Some("abc1234".to_string()),
+            source_ref: None,
+            vector_json: Some("[0.1, 0.2, 0.3]".to_string()),
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net/core")],
+        };
+
+        let bug_id = db.create_bug(&bug).await.unwrap();
+        assert!(bug_id > 0);
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456790,
+                content: None,
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{"file": "drivers/net/e1000.c", "line": 42}],
+                    "source_files": ["drivers/net/e1000.c"],
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "origin_discovery".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456791,
+                content: Some("11223344 (net: e1000: add probe)".to_string()),
+                data_json: Some(json!({
+                    "introducing_commit_sha": "11223344 (net: e1000: add probe)",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456792,
+                content: Some("Buffer is allocated but not freed on error path".to_string()),
+                data_json: Some(json!({
+                    "severity": "High",
+                    "severity_int": 3,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "report".to_string(),
+                tool: "sashiko".to_string(),
+                model: None,
+                author: None,
+                created_at: 123456793,
+                content: Some("> problematic_code();\nMemory is leaked here.".to_string()),
+                data_json: Some(json!({
+                    "format": "lkml_markdown",
+                })),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                tokens_cached: Some(25),
+                logs: Some("[{\"role\":\"system\",\"content\":\"test system\"}]".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "fix_candidate".to_string(),
+                tool: "human".to_string(),
+                model: None,
+                author: Some("Developer".to_string()),
+                created_at: 123456794,
+                content: None,
+                data_json: Some(json!({
+                    "status": "merged",
+                    "commit_sha": "55667788 (net: e1000: fix leak in probe)",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Fetch by id
+        let fetched = db.get_bug(bug_id).await.unwrap().expect("Bug should exist");
+        assert_eq!(fetched.bugid, "linux-test-1234");
+        assert_eq!(fetched.slug(), "linux-test-1234");
+        assert_eq!(fetched.problem(), "Memory leak in e1000_probe()");
+        assert_eq!(fetched.severity(), Severity::High);
+        assert_eq!(fetched.subsystems, vec!["net/core".to_string()]);
+        assert_eq!(
+            fetched.introduced_in_commit().as_deref(),
+            Some("11223344 (net: e1000: add probe)")
+        );
+        assert!(fetched.is_fixed());
+        assert_eq!(
+            fetched.fixed_in_commit().as_deref(),
+            Some("55667788 (net: e1000: fix leak in probe)")
+        );
+        assert_eq!(
+            fetched.inline_review(),
+            "> problematic_code();\nMemory is leaked here."
+        );
+        assert_eq!(fetched.tokens_in(), 100);
+        assert_eq!(fetched.tokens_out(), 50);
+        assert_eq!(fetched.tokens_cached(), 25);
+        assert_eq!(
+            fetched
+                .enrichments
+                .iter()
+                .filter(|e| e.kind != "audit")
+                .count(),
+            5
+        );
+
+        // Fetch by bugid and slug
+        let fetched_bugid = db
+            .get_bug_by_bugid("linux-test-1234")
+            .await
+            .unwrap()
+            .expect("Bug should exist");
+        assert_eq!(fetched_bugid.id, bug_id);
+        let fetched_slug = db
+            .get_bug_by_slug("linux-test-1234")
+            .await
+            .unwrap()
+            .expect("Bug should exist");
+        assert_eq!(fetched_slug.id, bug_id);
+        assert_eq!(
+            fetched_slug.introduced_in_commit().as_deref(),
+            Some("11223344 (net: e1000: add probe)")
+        );
+        assert!(fetched_slug.is_fixed());
+        assert_eq!(
+            fetched_slug.fixed_in_commit().as_deref(),
+            Some("55667788 (net: e1000: fix leak in probe)")
+        );
+
+        // List bugs with search and filter (logs omitted)
+        let (list, total) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                min_severity: Some(Severity::High),
+                subsystem: Some("net"),
+                lifecycle_status: Some(BugLifecycleStatus::Open),
+                search: Some("e1000"),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, bug_id);
+
+        // Test hierarchical subsystem matching: "net" should match "net/core"
+        let (list_hier, total_hier) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                subsystem: Some("net"),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_hier, 1);
+        assert_eq!(list_hier.len(), 1);
+
+        // Substring that is not a prefix should NOT match (e.g. "cor" shouldn't match "net/core")
+        let (_, total_no_match) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                subsystem: Some("cor"),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_no_match, 0);
+
+        // Test status mismatch filter
+        let (list_closed, total_closed) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                lifecycle_status: Some(BugLifecycleStatus::Dismissed),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_closed, 0);
+        assert_eq!(list_closed.len(), 0);
+
+        // Test min_severity filter (Critical is higher than High)
+        let (list_crit, total_crit) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                min_severity: Some(Severity::Critical),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_crit, 0);
+        assert_eq!(list_crit.len(), 0);
+
+        // Test sorting
+        let (list_sorted, _) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                sort_by: Some("severity"),
+                sort_order: Some("asc"),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list_sorted.len(), 1);
+
+        let (list_disc, _) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                sort_by: Some("discoveries"),
+                sort_order: Some("desc"),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list_disc.len(), 1);
+
+        // Test duplicate linking
+        let dup_bug = NewBug {
+            bugid: "linux-dup-1".to_string(),
+            title: "Duplicate of e1000 leak".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 100005,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net/core")],
+        };
+        let dup_id = db.create_bug(&dup_bug).await.unwrap();
+        let dup_params = MarkDuplicateBugParams {
+            preserve_triage: false,
+            ephemeral_id: dup_id,
+            canonical_id: bug_id,
+            reasoning: "Duplicate issue",
+            logs: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+        };
+        db.mark_bug_as_duplicate(dup_params).await.unwrap();
+
+        let duplicates = db.list_duplicates_for_bug(bug_id).await.unwrap();
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].id, dup_id);
+        assert_eq!(duplicates[0].duplicate_of_id, Some(bug_id));
+
+        // Dedicated log retrieval
+        let logs_str = db.get_bug_logs(bug_id).await.unwrap().unwrap();
+        assert!(logs_str.contains("test system"));
+        let logs_parsed: serde_json::Value = serde_json::from_str(&logs_str).unwrap();
+        assert_eq!(logs_parsed[0]["role"], "system");
+        assert_eq!(logs_parsed[0]["content"], "test system");
+
+        assert_eq!(
+            db.get_bug_logs_by_bugid("linux-test-1234").await.unwrap(),
+            Some(logs_str.clone())
+        );
+        assert_eq!(
+            db.get_bug_logs_by_slug("linux-test-1234").await.unwrap(),
+            Some(logs_str)
+        );
+
+        // Link to review
+        let thread_id = db.create_thread("t1", "subj", 100).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj", "auth", 100, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, None, "gemini", "model", None, None)
+            .await
+            .unwrap();
+
+        db.link_review_to_bug(review_id, bug_id, true)
+            .await
+            .unwrap();
+
+        let review_bugs = db.list_bugs_for_review(review_id).await.unwrap();
+        assert_eq!(review_bugs.len(), 1);
+        assert_eq!(review_bugs[0].0.id, bug_id);
+        assert!(review_bugs[0].1); // is_newly_discovered == true
+
+        let ps_bugs = db.list_bugs_for_patchset(ps_id).await.unwrap();
+        assert_eq!(ps_bugs.len(), 1);
+        assert_eq!(ps_bugs[0].0.id, bug_id);
+
+        let all_bugs = db.list_all_bugs_for_vector_search().await.unwrap();
+        assert_eq!(all_bugs.len(), 1);
+        assert_eq!(all_bugs[0].id, bug_id);
+    }
+
+    /// Builds a bug that is ready to be claimed for analysis.
+    async fn create_pending_bug(db: &Database, bugid: &str) -> i64 {
+        db.create_bug(&NewBug {
+            bugid: bugid.to_string(),
+            title: "Memory leak on crash".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 100000,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("kernel")],
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_migration_retires_folded_bugs_left_in_the_pipeline() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let canonical = create_pending_bug(&db, "linux-canonical").await;
+        let folded = create_pending_bug(&db, "linux-folded").await;
+
+        // Reproduce what folding used to leave behind: the triage state says
+        // the bug is a duplicate while the pipeline still says it is running.
+        db.conn
+            .execute(
+                "UPDATE bugs
+                    SET lifecycle_status = 'duplicate',
+                        duplicate_of_id = ?1,
+                        pipeline_state = 'running',
+                        locked_by = 'dead-worker:1',
+                        lease_expires_at = NULL
+                  WHERE id = ?2",
+                libsql::params![canonical, folded],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 3", ())
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT pipeline_state, locked_by FROM bugs WHERE id = ?",
+                libsql::params![folded],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "succeeded");
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
+
+        // A healed row is out of reach of the claim query, which is the whole
+        // point: it must not be analysed again to rediscover a finding the
+        // canonical bug already carries.
+        let claimed = db.claim_pending_bug("worker:1", 300, 3).await.unwrap();
+        assert_eq!(claimed.map(|b| b.id), Some(canonical));
+    }
+
+    #[tokio::test]
+    async fn test_recover_stale_running_bugs() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-crash-recovery").await;
+
+        // Claiming a bug moves it onto the running pipeline state and records
+        // who holds the lease.
+        let locked = db
+            .claim_pending_bug("worker-a", 3600, 10)
+            .await
+            .unwrap()
+            .expect("should claim bug");
+        assert_eq!(locked.id, bug_id);
+        assert_eq!(locked.pipeline_state, BugPipelineState::Running);
+
+        // A second worker must not get the same bug while the lease is live.
+        assert!(
+            db.claim_pending_bug("worker-b", 3600, 10)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // An unexpired lease is not disturbed by recovery.
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 0);
+
+        // Expire the lease, as if the worker holding it had died.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = 1 WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 1);
+
+        // Recovery only rewinds the pipeline axis, leaving triage untouched.
+        let rewound = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(rewound.pipeline_state, BugPipelineState::Pending);
+        assert_eq!(rewound.lifecycle_status, BugLifecycleStatus::New);
+
+        let claimed_again = db
+            .claim_pending_bug("worker-b", 3600, 10)
+            .await
+            .unwrap()
+            .expect("should re-claim recovered bug");
+        assert_eq!(claimed_again.id, bug_id);
+        assert_eq!(claimed_again.pipeline_state, BugPipelineState::Running);
+    }
+
+    /// The dedup stage folds a bug while it is still claimed, and the caller
+    /// then only drops the lease. Unless the fold itself retires the pipeline,
+    /// the row keeps a 'running' state with no lease, which no recovery query
+    /// can match, and the bug is stranded for good.
+    #[tokio::test]
+    async fn test_mark_duplicate_retires_running_pipeline() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let canonical_id = create_pending_bug(&db, "linux-canonical").await;
+        let dup_id = create_pending_bug(&db, "linux-folded").await;
+
+        // Reproduce the worker's sequence: claim the bug, fold it, release.
+        // Claim ordering between two bugs created in the same second is not
+        // guaranteed, so drain the queue rather than assuming which comes back.
+        let mut claimed_dup = false;
+        while let Some(bug) = db.claim_pending_bug("worker-a", 3600, 10).await.unwrap() {
+            if bug.id == dup_id {
+                assert_eq!(bug.pipeline_state, BugPipelineState::Running);
+                claimed_dup = true;
+            }
+        }
+        assert!(claimed_dup, "the bug being folded must have been claimed");
+
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: dup_id,
+            canonical_id,
+            reasoning: "Same root cause",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.release_bug_lease(dup_id).await.unwrap();
+
+        let folded = db.get_bug(dup_id).await.unwrap().unwrap();
+        assert_eq!(folded.lifecycle_status, BugLifecycleStatus::Duplicate);
+        assert_eq!(
+            folded.pipeline_state,
+            BugPipelineState::Succeeded,
+            "a folded bug owes no further analysis"
+        );
+
+        // The decisive check: nothing is left for recovery to find, and the row
+        // is not silently waiting on a lease that will never expire.
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 0);
+        let running_without_lease: i64 = db
+            .conn
+            .query(
+                "SELECT count(*) FROM bugs WHERE pipeline_state = 'running' AND lease_expires_at IS NULL",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(running_without_lease, 0);
+    }
+
+    /// A lease that is absent rather than expired must still be reclaimable.
+    /// NULL never satisfies `lease_expires_at < now`, so a predicate written
+    /// only against expiry leaves such a row running for good.
+    #[tokio::test]
+    async fn test_recovery_reclaims_running_bug_with_no_lease() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-leaseless").await;
+        db.claim_pending_bug("worker-a", 3600, 10)
+            .await
+            .unwrap()
+            .expect("should claim bug");
+
+        // Drop the lease but leave the pipeline running, which is what a
+        // release that forgets the state leaves behind.
+        db.release_bug_lease(bug_id).await.unwrap();
+        let stranded = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(stranded.pipeline_state, BugPipelineState::Running);
+        // The lease is not projected onto the read model, so read the column.
+        let lease: Option<i64> = db
+            .conn
+            .query(
+                "SELECT lease_expires_at FROM bugs WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert!(lease.is_none());
+
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 1);
+        let recovered = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(recovered.pipeline_state, BugPipelineState::Pending);
+
+        // Claiming must reach the same row even without the sweep above.
+        db.release_bug_lease(bug_id).await.unwrap();
+        db.conn
+            .execute(
+                "UPDATE bugs SET pipeline_state = 'running' WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+        let reclaimed = db
+            .claim_pending_bug("worker-b", 3600, 10)
+            .await
+            .unwrap()
+            .expect("a running bug with no lease must be claimable");
+        assert_eq!(reclaimed.id, bug_id);
+    }
+
+    /// A folded bug is a tombstone. Re-analysing it would spend the budget to
+    /// rediscover a finding that already lives on the canonical bug.
+    #[tokio::test]
+    async fn test_claim_skips_folded_bugs() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let canonical_id = create_pending_bug(&db, "linux-tombstone-canonical").await;
+        let dup_id = create_pending_bug(&db, "linux-tombstone-dup").await;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: dup_id,
+            canonical_id,
+            reasoning: "Same root cause",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Drain everything the worker would ever be offered.
+        let mut claimed = Vec::new();
+        while let Some(bug) = db.claim_pending_bug("worker-a", 3600, 10).await.unwrap() {
+            claimed.push(bug.id);
+        }
+        assert!(
+            claimed.contains(&canonical_id),
+            "the canonical bug still needs analysis"
+        );
+        assert!(
+            !claimed.contains(&dup_id),
+            "a folded bug must never be handed to a worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_outcome_write_rolls_back_every_result_and_remains_recoverable() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let id = create_pending_bug(&db, "linux-atomic-result").await;
+        db.claim_pending_bug("worker", 300, 3).await.unwrap();
+        let before = serde_json::to_value(db.get_bug(id).await.unwrap().unwrap()).unwrap();
+        // Fail late, after title, subsystem, vector, verification and severity
+        // writes would already have happened in the former implementation.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_report BEFORE INSERT ON bug_enrichments
+            WHEN NEW.kind = 'report' BEGIN SELECT RAISE(ABORT, 'report write failed'); END;",
+            )
+            .await
+            .unwrap();
+        let subsystems = vec![AttributedSubsystem::from_maintainers("NEW SECTION")];
+        let params = || UpdateBugOutcomeParams {
+            lifecycle_status: BugLifecycleStatus::Open,
+            problem: Some("new title"),
+            subsystems: Some(&subsystems),
+            vector_json: Some("{}"),
+            severity: Severity::High,
+            verified_on_sha: Some("abc123"),
+            introduced_in_commit: Some("def456"),
+            inline_review: "complete report",
+            ..Default::default()
+        };
+        assert!(db.update_bug_outcome(id, params()).await.is_err());
+        let after = serde_json::to_value(db.get_bug(id).await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            after, before,
+            "a failed result left partial writes or audit records"
+        );
+        let mut vectors = db
+            .conn
+            .query("SELECT count(*) FROM bug_vectors", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            vectors
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        drop(vectors);
+        // A process dying before its failure handler runs still leaves a
+        // recoverable running row, rather than an incomplete successful result.
+        db.conn
+            .execute("UPDATE bugs SET lease_expires_at = 1", ())
+            .await
+            .unwrap();
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 1);
+        assert!(
+            db.claim_pending_bug("replacement", 300, 3)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_report;")
+            .await
+            .unwrap();
+        db.update_bug_outcome(id, params()).await.unwrap();
+        let saved = db.get_bug(id).await.unwrap().unwrap();
+        assert_eq!(saved.pipeline_state, BugPipelineState::Succeeded);
+        assert_eq!(saved.lifecycle_status, BugLifecycleStatus::Open);
+        assert_eq!(saved.title, "new title");
+        assert_eq!(saved.inline_review(), "complete report");
+        assert_eq!(saved.severity(), Severity::High);
+        assert_eq!(saved.subsystems, vec!["NEW SECTION"]);
+    }
+
+    #[tokio::test]
+    async fn analysis_verdicts_preserve_existing_triage() {
+        for status in [
+            BugLifecycleStatus::New,
+            BugLifecycleStatus::Open,
+            BugLifecycleStatus::Closed,
+            BugLifecycleStatus::Dismissed,
+            BugLifecycleStatus::Fixed,
+            BugLifecycleStatus::Duplicate,
+        ] {
+            for verdict in [BugLifecycleStatus::Open, BugLifecycleStatus::Dismissed] {
+                let db = Database::new(&crate::settings::DatabaseSettings {
+                    url: ":memory:".into(),
+                    token: String::new(),
+                })
+                .await
+                .unwrap();
+                db.migrate().await.unwrap();
+                let id = create_pending_bug(&db, "linux-triaged").await;
+                let canonical = create_pending_bug(&db, "linux-canonical").await;
+                let other = create_pending_bug(&db, "linux-other").await;
+                db.claim_pending_bug("worker", 300, 3).await.unwrap();
+                if status == BugLifecycleStatus::Duplicate {
+                    db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+                        ephemeral_id: id,
+                        canonical_id: canonical,
+                        reasoning: "human triage",
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    db.change_bug_status_with_reason(id, status, Some("human triage"))
+                        .await
+                        .unwrap();
+                }
+                if status != BugLifecycleStatus::New {
+                    assert!(
+                        !db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+                            preserve_triage: true,
+                            ephemeral_id: id,
+                            canonical_id: other,
+                            reasoning: "automatic deduplication",
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                    );
+                }
+                db.update_bug_outcome(
+                    id,
+                    UpdateBugOutcomeParams {
+                        lifecycle_status: verdict,
+                        inline_review: "analysis report",
+                        verified_on_sha: Some("abc123"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let bug = db.get_bug(id).await.unwrap().unwrap();
+                assert_eq!(
+                    bug.lifecycle_status,
+                    if status == BugLifecycleStatus::New {
+                        verdict
+                    } else {
+                        status
+                    }
+                );
+                assert_eq!(bug.pipeline_state, BugPipelineState::Succeeded);
+                assert_eq!(
+                    bug.duplicate_of_id,
+                    (status == BugLifecycleStatus::Duplicate).then_some(canonical)
+                );
+                assert_eq!(bug.inline_review(), "analysis report");
+                assert!(
+                    bug.enrichments
+                        .iter()
+                        .any(|e| e.content.as_deref() == Some("human triage"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_analysis_cannot_write_or_clear_a_replacement_lease() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let settings = crate::settings::DatabaseSettings {
+            url: directory
+                .path()
+                .join("lease.db")
+                .to_string_lossy()
+                .into_owned(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+        let replacement_db = Database::new(&settings).await?;
+        let id = create_pending_bug(&db, "linux-lease-source").await;
+        let canonical = create_pending_bug(&db, "linux-lease-target").await;
+        db.set_bug_pipeline_state(canonical, BugPipelineState::Succeeded)
+            .await?;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patchsets (id) VALUES (1);
+            INSERT INTO reviews (id, patchset_id) VALUES (1, 1);",
+            )
+            .await?;
+        // Two different attempts in one process must not share an owner value.
+        let first = "host:123:first-attempt";
+        let second = "host:123:second-attempt";
+        assert_eq!(db.claim_pending_bug(first, 300, 3).await?.unwrap().id, id);
+        let stale = db
+            .with_bug_claim(id, first)
+            .with_bug_actor("reporter", "analysis", None);
+        stale
+            .add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "analysis".into(),
+                    content: Some("first stage".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            stale
+                .add_bug_enrichment(canonical, &NewBugEnrichment::default())
+                .await
+                .is_err()
+        );
+        db.conn
+            .execute("UPDATE bugs SET lease_expires_at = 1 WHERE id = ?", [id])
+            .await?;
+        // Expiration alone is sufficient to revoke writes and renewal.
+        assert!(
+            stale
+                .update_bug_outcome(id, UpdateBugOutcomeParams::default())
+                .await
+                .is_err()
+        );
+        assert!(!db.renew_bug_lease(id, first, 300).await?);
+        assert_eq!(
+            replacement_db
+                .claim_pending_bug(second, 300, 3)
+                .await?
+                .unwrap()
+                .id,
+            id
+        );
+        let before = serde_json::to_value(replacement_db.get_bug(id).await?.unwrap())?;
+        for handle in [
+            stale.with_bug_actor("new actor", "new tool", Some("model".into())),
+            stale,
+        ] {
+            assert!(
+                handle
+                    .add_bug_enrichment(
+                        id,
+                        &NewBugEnrichment {
+                            kind: "report".into(),
+                            content: Some("stale report".into()),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handle
+                    .update_bug_outcome(
+                        id,
+                        UpdateBugOutcomeParams {
+                            lifecycle_status: BugLifecycleStatus::Open,
+                            problem: Some("stale title"),
+                            inline_review: "stale report",
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handle
+                    .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                        ephemeral_id: id,
+                        canonical_id: canonical,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handle
+                    .link_review_to_bug(1, canonical, false)
+                    .await
+                    .is_err()
+            );
+            assert!(handle.fail_bug_analysis(id, "stale failure").await.is_err());
+            assert!(handle.release_bug_lease(id).await.is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(replacement_db.get_bug(id).await?.unwrap())?,
+            before
+        );
+        assert!(replacement_db.list_bugs_for_review(1).await?.is_empty());
+        assert!(replacement_db.renew_bug_lease(id, second, 300).await?);
+
+        let owner = replacement_db.with_bug_claim(id, second);
+        owner
+            .add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "analysis".into(),
+                    content: Some("replacement stage".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        owner
+            .update_bug_outcome(
+                id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    inline_review: "replacement report",
+                    ..Default::default()
+                },
+            )
+            .await?;
+        owner.link_review_to_bug(1, id, true).await?;
+        assert!(replacement_db.renew_bug_lease(id, second, 300).await?);
+        assert!(
+            owner
+                .fail_bug_analysis(id, "error after commit")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            replacement_db.get_bug(id).await?.unwrap().pipeline_state,
+            BugPipelineState::Succeeded
+        );
+        owner.release_bug_lease(id).await?;
+        assert!(!replacement_db.renew_bug_lease(id, second, 300).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automatic_duplicate_keeps_its_claim_until_linking_finishes() -> Result<()> {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        let id = create_pending_bug(&db, "linux-owned-duplicate").await;
+        let canonical = create_pending_bug(&db, "linux-owned-canonical").await;
+        db.set_bug_pipeline_state(canonical, BugPipelineState::Succeeded)
+            .await?;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patchsets (id) VALUES (1);
+            INSERT INTO reviews (id, patchset_id) VALUES (1, 1);",
+            )
+            .await?;
+        db.claim_pending_bug("attempt", 300, 3).await?;
+        let owner = db.with_bug_claim(id, "attempt");
+        assert!(
+            owner
+                .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                    preserve_triage: true,
+                    ephemeral_id: id,
+                    canonical_id: canonical,
+                    ..Default::default()
+                })
+                .await?
+        );
+        assert!(db.renew_bug_lease(id, "attempt", 300).await?);
+        owner.link_review_to_bug(1, canonical, false).await?;
+        owner.release_bug_lease(id).await?;
+        assert_eq!(db.list_bugs_for_review(1).await?[0].0.id, canonical);
+        assert!(!db.renew_bug_lease(id, "attempt", 300).await?);
+
+        let human_fold = create_pending_bug(&db, "linux-human-duplicate").await;
+        db.claim_pending_bug("another-attempt", 300, 3).await?;
+        let cancelled = db.with_bug_claim(human_fold, "another-attempt");
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: human_fold,
+            canonical_id: canonical,
+            ..Default::default()
+        })
+        .await?;
+        assert!(
+            !db.renew_bug_lease(human_fold, "another-attempt", 300)
+                .await?
+        );
+        assert!(
+            cancelled
+                .fail_bug_analysis(human_fold, "cancelled")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_bug(human_fold).await?.unwrap().pipeline_state,
+            BugPipelineState::Succeeded
+        );
+        Ok(())
+    }
+
+    /// The lease is short and the worker renews it while it works. Renewal has
+    /// to hold off other workers for as long as the analysis genuinely runs,
+    /// and has to refuse once the claim belongs to somebody else.
+    #[tokio::test]
+    async fn test_renew_bug_lease_holds_and_detects_takeover() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-long-running").await;
+        db.claim_pending_bug("worker-a", 300, 10)
+            .await
+            .unwrap()
+            .expect("should claim bug");
+
+        // Renew a live lease before it expires.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = unixepoch() + 10 WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.renew_bug_lease(bug_id, "worker-a", 300).await.unwrap(),
+            "the holder must be able to push its own lease forward"
+        );
+
+        // Having renewed, the bug is protected from both recovery paths.
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 0);
+        assert!(
+            db.claim_pending_bug("worker-b", 300, 10)
+                .await
+                .unwrap()
+                .is_none(),
+            "a renewed lease must keep other workers out"
+        );
+
+        // Once the lease really lapses another worker takes over, and the
+        // original holder must not be able to take it back.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = 1 WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+        let stolen = db
+            .claim_pending_bug("worker-b", 300, 10)
+            .await
+            .unwrap()
+            .expect("an expired lease is reclaimable");
+        assert_eq!(stolen.id, bug_id);
+        assert!(
+            !db.renew_bug_lease(bug_id, "worker-a", 300).await.unwrap(),
+            "a worker that lost the claim must not renew it"
+        );
+    }
+
+    /// One review can raise two candidates that later turn out to be the same
+    /// defect. Folding one into the other links the survivor back to that same
+    /// review as a rediscovery, which must not erase the fact that the review
+    /// discovered it in the first place.
+    #[tokio::test]
+    async fn test_link_review_to_bug_never_downgrades_discovery() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-two-symptoms").await;
+        // reviews.patchset_id is a foreign key, so the parent must exist.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, status) VALUES (1, 'test series', 'Reviewed')",
+                (),
+            )
+            .await
+            .unwrap();
+        let review_id = db
+            .conn
+            .query(
+                "INSERT INTO reviews (patchset_id, status) VALUES (1, 'Reviewed') RETURNING id",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+
+        // The review discovers the bug, then rediscovers it by folding a
+        // sibling candidate into it.
+        db.link_review_to_bug(review_id, bug_id, true)
+            .await
+            .unwrap();
+        db.link_review_to_bug(review_id, bug_id, false)
+            .await
+            .unwrap();
+
+        let flag: i64 = db
+            .conn
+            .query(
+                "SELECT is_newly_discovered FROM bug_reviews WHERE review_id = ? AND bug_id = ?",
+                libsql::params![review_id, bug_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(flag, 1, "a rediscovery must not erase the discovery");
+
+        // The reverse order must still end up crediting the discovery.
+        let other_id = create_pending_bug(&db, "linux-two-symptoms-b").await;
+        db.link_review_to_bug(review_id, other_id, false)
+            .await
+            .unwrap();
+        db.link_review_to_bug(review_id, other_id, true)
+            .await
+            .unwrap();
+        let flag: i64 = db
+            .conn
+            .query(
+                "SELECT is_newly_discovered FROM bug_reviews WHERE review_id = ? AND bug_id = ?",
+                libsql::params![review_id, other_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(flag, 1);
+    }
+
+    /// Assignment writes both columns together, because the schema requires
+    /// assigned_at to be present exactly when there is an assignee.
+    #[tokio::test]
+    async fn test_assign_and_unassign_bug() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-assignable").await;
+        let fresh = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert!(fresh.assignee.is_none());
+        assert!(fresh.assigned_at.is_none());
+
+        let scoped = db.with_bug_actor("triager@example.org", "web", None);
+        assert!(
+            scoped
+                .assign_bug(bug_id, Some("  dev@example.org  "), Some("Owns this area"))
+                .await
+                .unwrap()
+        );
+        let assigned = db.get_bug(bug_id).await.unwrap().unwrap();
+        // The address is stored trimmed so that filtering by exact match works.
+        assert_eq!(assigned.assignee.as_deref(), Some("dev@example.org"));
+        assert!(assigned.assigned_at.is_some());
+        assert!(
+            assigned.enrichments.iter().any(|e| e.kind == "audit"
+                && e.content.as_deref() == Some("Assigned to dev@example.org"))
+        );
+        assert!(
+            assigned
+                .enrichments
+                .iter()
+                .any(|e| e.kind == "comment" && e.content.as_deref() == Some("Owns this area"))
+        );
+
+        // Reassignment is recorded as a handover rather than as two events.
+        scoped
+            .assign_bug(bug_id, Some("other@example.org"), None)
+            .await
+            .unwrap();
+        let reassigned = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(reassigned.assignee.as_deref(), Some("other@example.org"));
+        assert!(reassigned.enrichments.iter().any(|e| {
+            e.content.as_deref() == Some("Reassigned from dev@example.org to other@example.org")
+        }));
+
+        // Clearing the assignee must clear the timestamp with it.
+        scoped.assign_bug(bug_id, None, None).await.unwrap();
+        let cleared = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert!(cleared.assignee.is_none());
+        assert!(cleared.assigned_at.is_none());
+
+        // An unknown bug reports failure instead of silently doing nothing.
+        assert!(!db.assign_bug(999_999, Some("x@y.org"), None).await.unwrap());
+    }
+
+    /// Filtering by assignee must be able to express both "mine" and
+    /// "nobody has picked this up yet".
+    #[tokio::test]
+    async fn test_list_bugs_by_assignee() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let mine = create_pending_bug(&db, "linux-mine").await;
+        let theirs = create_pending_bug(&db, "linux-theirs").await;
+        let nobody = create_pending_bug(&db, "linux-nobody").await;
+        db.assign_bug(mine, Some("me@example.org"), None)
+            .await
+            .unwrap();
+        db.assign_bug(theirs, Some("them@example.org"), None)
+            .await
+            .unwrap();
+
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                assignee: Some(AssigneeFilter::Is("me@example.org")),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, mine);
+
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                assignee: Some(AssigneeFilter::Unassigned),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, nobody);
+    }
+
+    /// A bug that keeps failing must not be retried forever, and once it stops
+    /// being retried it must say so rather than sitting in the queue looking
+    /// like work that is about to happen.
+    #[tokio::test]
+    async fn test_bug_analysis_retry_cap_and_dead_letter() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-always-fails").await;
+        let max_attempts = 2;
+
+        for attempt in 1..=max_attempts {
+            let claimed = db
+                .claim_pending_bug("worker-a", 3600, max_attempts)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("attempt {} should be claimable", attempt));
+            assert_eq!(claimed.id, bug_id);
+            db.fail_bug_analysis(bug_id, "boom").await.unwrap();
+            // A failed attempt leaves triage alone: a crashed run says nothing
+            // about whether the defect is real.
+            let failed = db.get_bug(bug_id).await.unwrap().unwrap();
+            assert_eq!(failed.pipeline_state, BugPipelineState::Failed);
+            assert_eq!(failed.lifecycle_status, BugLifecycleStatus::New);
+        }
+
+        // The cap is now reached, so the bug is no longer claimable.
+        assert!(
+            db.claim_pending_bug("worker-a", 3600, max_attempts)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(db.abandon_exhausted_bugs(max_attempts).await.unwrap(), 1);
+        let abandoned = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(abandoned.pipeline_state, BugPipelineState::Abandoned);
+        assert_eq!(abandoned.lifecycle_status, BugLifecycleStatus::New);
+
+        // Abandoning is idempotent and never resurrects the bug.
+        assert_eq!(db.abandon_exhausted_bugs(max_attempts).await.unwrap(), 0);
+        assert!(
+            db.claim_pending_bug("worker-a", 3600, max_attempts)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bug_enrichments_multi_tool_timeline() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // 1. Initial report from syzbot
+        let new_bug = NewBug {
+            bugid: "linux-syzbot-12345".to_string(),
+            title: "KASAN: use-after-free Read in sock_close".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "syzbot".to_string(),
+            reported_at: 1700000000,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: Some("c0ffee112233".to_string()),
+            source_ref: Some("https://syzkaller.appspot.com/bug?id=12345".to_string()),
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
+        };
+        let bug_id = db.create_bug(&new_bug).await.unwrap();
+
+        // Raw crash report enrichment from syzbot
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "report".to_string(),
+                tool: "syzbot".to_string(),
+                model: None,
+                author: None,
+                created_at: 1700000000,
+                content: Some("BUG: KASAN: use-after-free in sock_close+0x42/0x100".to_string()),
+                data_json: Some(json!({
+                    "crash_type": "use-after-free",
+                    "has_reproducer": true,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Reproducer enrichment from syzbot
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "reproducer".to_string(),
+                tool: "syzbot".to_string(),
+                model: None,
+                author: None,
+                created_at: 1700000010,
+                content: Some("#define _GNU_SOURCE\nint main() { ... }".to_string()),
+                data_json: Some(json!({
+                    "language": "C",
+                    "syz_repro": "syz_open_pts() ...",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 2. Sashiko automated verification with LLM
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "verification".to_string(),
+                tool: "sashiko".to_string(),
+                model: Some("gemini-1.5-pro".to_string()),
+                author: None,
+                created_at: 1700000050,
+                content: Some("Confirmed UAF in net/socket.c sock_close during concurrent disconnect".to_string()),
+                data_json: Some(json!({
+                    "is_valid": true,
+                    "locations": [{"file": "net/socket.c", "line": 642, "function_or_symbol": "sock_close"}],
+                    "source_files": ["net/socket.c"],
+                })),
+                tokens_in: Some(4000),
+                tokens_out: Some(500),
+                tokens_cached: Some(3000),
+                logs: Some("[{\"step\": 1, \"status\": \"verified\"}]".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 3. Sashiko severity calibration
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "sashiko".to_string(),
+                model: Some("gemini-1.5-pro".to_string()),
+                author: None,
+                created_at: 1700000060,
+                content: Some(
+                    "Privilege escalation potential through dangling socket file descriptor"
+                        .to_string(),
+                ),
+                data_json: Some(json!({
+                    "severity": "Critical",
+                    "severity_int": 4,
+                })),
+                tokens_in: Some(1500),
+                tokens_out: Some(200),
+                tokens_cached: Some(1000),
+                logs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 4. Sashiko origin discovery
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "origin_discovery".to_string(),
+                tool: "sashiko".to_string(),
+                model: Some("gemini-1.5-pro".to_string()),
+                author: None,
+                created_at: 1700000070,
+                content: Some("9876543210ab (net: socket: optimize close locking)".to_string()),
+                data_json: Some(json!({
+                    "introducing_commit_sha": "9876543210ab (net: socket: optimize close locking)",
+                })),
+                tokens_in: Some(2000),
+                tokens_out: Some(150),
+                tokens_cached: Some(1500),
+                logs: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 5. Human comment
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "comment".to_string(),
+                tool: "human".to_string(),
+                model: None,
+                author: Some("torvalds@linux-foundation.org".to_string()),
+                created_at: 1700000100,
+                content: Some(
+                    "I agree with the origin tracing, we should revert commit 9876543210ab."
+                        .to_string(),
+                ),
+                data_json: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 6. Fix candidate
+        db.add_bug_enrichment(
+            bug_id,
+            &NewBugEnrichment {
+                kind: "fix_candidate".to_string(),
+                tool: "human".to_string(),
+                model: None,
+                author: Some("davem@davemloft.net".to_string()),
+                created_at: 1700000200,
+                content: Some("Revert 9876543210ab and add proper socket refcounting".to_string()),
+                data_json: Some(json!({
+                    "status": "merged",
+                    "commit_sha": "fedcba098765 (net: socket: fix race in sock_close)",
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Query bug and verify all projections and enrichments
+        let bug = db.get_bug(bug_id).await.unwrap().expect("Bug must exist");
+        assert_eq!(bug.id, bug_id);
+        assert_eq!(bug.bugid, "linux-syzbot-12345");
+        assert_eq!(bug.reporter, "syzbot");
+        assert_eq!(bug.reported_at, 1700000000);
+        assert_eq!(
+            bug.source_ref.as_deref(),
+            Some("https://syzkaller.appspot.com/bug?id=12345")
+        );
+        assert_eq!(bug.problem(), "KASAN: use-after-free Read in sock_close");
+        assert_eq!(bug.severity(), Severity::Critical);
+        assert_eq!(
+            bug.severity_explanation().as_deref(),
+            Some("Privilege escalation potential through dangling socket file descriptor")
+        );
+        assert_eq!(bug.source_files(), Some(vec!["net/socket.c".to_string()]));
+        assert_eq!(
+            bug.introduced_in_commit().as_deref(),
+            Some("9876543210ab (net: socket: optimize close locking)")
+        );
+        assert!(bug.is_fixed());
+        assert_eq!(
+            bug.fixed_in_commit().as_deref(),
+            Some("fedcba098765 (net: socket: fix race in sock_close)")
+        );
+
+        // Verify aggregated token counters
+        assert_eq!(bug.tokens_in(), 4000 + 1500 + 2000);
+        assert_eq!(bug.tokens_out(), 500 + 200 + 150);
+        assert_eq!(bug.tokens_cached(), 3000 + 1000 + 1500);
+
+        // Verify enrichments timeline length and chronological order
+        assert_eq!(bug.enrichments.len(), 9);
+        let enrichments: Vec<_> = bug
+            .enrichments
+            .iter()
+            .filter(|e| e.kind != "audit")
+            .collect();
+        let kinds: Vec<&str> = enrichments.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "report",
+                "reproducer",
+                "verification",
+                "severity_calibration",
+                "origin_discovery",
+                "comment",
+                "fix_candidate",
+            ]
+        );
+
+        let tools: Vec<&str> = enrichments.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(
+            tools,
+            vec![
+                "syzbot", "syzbot", "sashiko", "sashiko", "sashiko", "human", "human"
+            ]
+        );
+
+        let models: Vec<Option<&str>> = enrichments.iter().map(|e| e.model.as_deref()).collect();
+        assert_eq!(
+            models,
+            vec![
+                None,
+                None,
+                Some("gemini-1.5-pro"),
+                Some("gemini-1.5-pro"),
+                Some("gemini-1.5-pro"),
+                None,
+                None,
+            ]
+        );
+
+        // Check dedicated enrichment query method
+        let enrichments = db.get_bug_enrichments(bug_id).await.unwrap();
+        assert_eq!(enrichments.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_patch_replying_to_earlier_cover_does_not_overwrite_own_cover() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("v1_cover", "Sensor fixes", 1000)
+            .await
+            .unwrap();
+        let author = "Sensor Dev <dev@example.com>";
+
+        // 1. Ingest v1 cover letter and patches
+        for (msg_id, subj, ts) in [
+            ("v1_cover", "[PATCH 0/2] hwmon: sensor fixes", 1000),
+            ("v1_p1", "[PATCH 1/2] hwmon: part 1", 1001),
+            ("v1_p2", "[PATCH 2/2] hwmon: part 2", 1002),
+            ("v2_cover", "[PATCH v2 0/2] hwmon: sensor fixes", 2000),
+            ("v2_p1", "[PATCH v2 1/2] hwmon: part 1", 2001),
+            ("v2_p2", "[PATCH v2 2/2] hwmon: fix validation", 2100),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                Some("v1_cover"),
+                "v1_cover",
+                "[PATCH 0/2] hwmon: sensor fixes",
+                author,
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_v1, "v1_p1", 1, "diff1").await.unwrap();
+        db.create_patch(ps_v1, "v1_p2", 2, "diff2").await.unwrap();
+
+        // 2. Ingest v2 cover letter and patch 1 in the same thread
+        let ps_v2 = db
+            .create_patchset(
+                thread_id,
+                Some("v2_cover"),
+                "v2_cover",
+                "[PATCH v2 0/2] hwmon: sensor fixes",
+                author,
+                2000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_v1, ps_v2);
+        db.create_patch(ps_v2, "v2_p1", 1, "diff1_v2")
+            .await
+            .unwrap();
+
+        // 3. v2 patch 2 arrives with In-Reply-To pointing to v1_cover
+        let ps_v2_p2 = db
+            .create_patchset(
+                thread_id,
+                Some("v1_cover"),
+                "v2_p2",
+                "[PATCH v2 2/2] hwmon: fix validation",
+                author,
+                2100,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_v2_p2, ps_v2);
+
+        // Verify v2 kept its own cover_letter_message_id ("v2_cover")
+        let det_v2 = db
+            .get_patchset_details(ps_v2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_v2["message_id"], "v2_cover");
+        assert_eq!(
+            db.find_patchset_id_by_msgid("v2_cover").await.unwrap(),
+            Some(ps_v2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_in_same_thread_does_not_merge_into_incomplete_v1() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("v1_root", "Series Thread", 10000)
+            .await
+            .unwrap();
+        let author = "Kernel Dev <kdev@example.com>";
+
+        for (msg_id, subj, ts) in [
+            ("v1_0", "[PATCH 0/2] Series", 10000),
+            ("v1_1", "[PATCH 1/2] Part 1", 10001),
+            ("v2_0", "[PATCH v2 0/2] Series", 11000),
+            ("v2_2", "[PATCH v2 2/2] Part 2", 11010),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Incomplete v1 (missing part 2/2)
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                Some("v1_0"),
+                "v1_0",
+                "[PATCH 0/2] Series",
+                author,
+                10000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_v1, "v1_1", 1, "diff1").await.unwrap();
+
+        // 2. v2 posted in the same thread
+        let ps_v2_0 = db
+            .create_patchset(
+                thread_id,
+                Some("v2_0"),
+                "v2_0",
+                "[PATCH v2 0/2] Series",
+                author,
+                11000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_v1, ps_v2_0);
+
+        // 3. v2 part 2 arrives; must attach to v2 and NEVER merge into incomplete v1
+        let ps_v2_2 = db
+            .create_patchset(
+                thread_id,
+                Some("v2_2"),
+                "v2_2",
+                "[PATCH v2 2/2] Part 2",
+                author,
+                11010,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_v2_2, ps_v2_0);
+        assert_ne!(ps_v2_2, ps_v1);
+    }
+
+    #[tokio::test]
+    async fn test_cover_letter_does_not_hijack_reviewed_coverless_series() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("p1_msg", "Coverless Series", 5000)
+            .await
+            .unwrap();
+        let author = "Author <a@example.com>";
+
+        for (msg_id, subj, ts) in [
+            ("p1_msg", "[PATCH 1/2] Part 1", 5000),
+            ("p2_msg", "[PATCH 2/2] Part 2", 5001),
+            ("new_cover", "[PATCH v2 0/2] Cover", 6000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Coverless v1 series (1/2 and 2/2), marked Reviewed
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                Some("p1_msg"),
+                "p1_msg",
+                "[PATCH 1/2] Part 1",
+                author,
+                5000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_v1, "p1_msg", 1, "diff1").await.unwrap();
+        db.create_patch(ps_v1, "p2_msg", 2, "diff2").await.unwrap();
+        db.update_patchset_status(ps_v1, "Reviewed").await.unwrap();
+
+        // 2. A cover letter arrives later in the same thread
+        let ps_new = db
+            .create_patchset(
+                thread_id,
+                Some("new_cover"),
+                "new_cover",
+                "[PATCH v2 0/2] Cover",
+                author,
+                6000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_v1, ps_new);
+
+        // Verify the Reviewed v1 series kept its original identity and subject
+        let det_v1 = db
+            .get_patchset_details(ps_v1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_v1["message_id"], "p1_msg");
+        assert_eq!(det_v1["subject"], "[PATCH 1/2] Part 1");
+        assert_eq!(
+            db.find_patchset_id_by_msgid("new_cover").await.unwrap(),
+            Some(ps_new)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_match_merge_preserves_cover_letter_from_newer_row() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("merge_root", "Merge Cover Test", 10000)
+            .await
+            .unwrap();
+        let author = "Merger <m@example.com>";
+
+        for (msg_id, subj, ts) in [
+            ("msg_2", "[PATCH 2/3] Part 2", 10000),
+            ("msg_0", "[PATCH 0/3] The Cover Letter", 120000),
+            ("msg_1", "[PATCH 1/3] Part 1", 65000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Part 2/3 arrives first at t=10000 -> creates row A (lowest id)
+        let ps_a = db
+            .create_patchset(
+                thread_id,
+                Some("msg_2"),
+                "msg_2",
+                "[PATCH 2/3] Part 2",
+                author,
+                10000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 2. Cover letter 0/3 arrives at t=120000 (> 86400s gap) -> creates disjoint row B
+        let ps_b = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/3] The Cover Letter",
+                author,
+                120000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_a, ps_b);
+
+        // 3. Part 1/3 arrives at bridging time t=65000 -> merges row B into row A
+        let ps_merged = db
+            .create_patchset(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/3] Part 1",
+                author,
+                65000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_merged, ps_a);
+
+        // Surviving row A must have inherited the cover letter identity and subject from row B
+        let det = db
+            .get_patchset_details(ps_a, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["message_id"], "msg_0");
+        assert_eq!(det["subject"], "[PATCH 0/3] The Cover Letter");
+        assert_eq!(
+            db.find_patchset_id_by_msgid("msg_0").await.unwrap(),
+            Some(ps_a)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_late_cover_letter_attaches_to_reviewed_series_without_reopening() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/2] Cover Letter", 1000)
+            .await
+            .unwrap();
+
+        // Patches 1/2 and 2/2 arrive first, replying to cover letter msg_0
+        db.create_message(
+            "msg_1",
+            thread_id,
+            Some("msg_0"),
+            "Author <a@b.c>",
+            "[PATCH 1/2] Part 1",
+            1001,
+            "body 1",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/2] Part 1",
+                "Author <a@b.c>",
+                1001,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_id, "msg_1", 1, "diff 1").await.unwrap();
+
+        db.create_message(
+            "msg_2",
+            thread_id,
+            Some("msg_0"),
+            "Author <a@b.c>",
+            "[PATCH 2/2] Part 2",
+            1002,
+            "body 2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id_2 = db
+            .create_patchset(
+                thread_id,
+                Some("msg_2"),
+                "msg_2",
+                "[PATCH 2/2] Part 2",
+                "Author <a@b.c>",
+                1002,
+                2,
+                1,
+                "",
+                "",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id, ps_id_2);
+        db.create_patch(ps_id, "msg_2", 2, "diff 2").await.unwrap();
+
+        // Mark series as Reviewed
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        // Late cover letter 0/2 arrives
+        db.create_message(
+            "msg_0",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH 0/2] Cover Letter",
+            2000,
+            "cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cover_ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/2] Cover Letter",
+                "Author <a@b.c>",
+                2000,
+                2,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cover_ps_id, ps_id);
+
+        // Embargo update if non-terminal should be a no-op on Reviewed patchset
+        db.set_patchset_embargo_until_if_non_terminal(ps_id, 999999)
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["message_id"], "msg_0");
+        assert_eq!(det["subject"], "[PATCH 0/2] Cover Letter");
+        assert_eq!(det["status"], "Reviewed");
+        assert!(det["embargo_until"].is_null());
+
+        // Ensure no extra shadow row was created
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patchsets", ())
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_replacement_patch_does_not_collide_on_cover_letter_id() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/2] Series", 1000)
+            .await
+            .unwrap();
+        let author = "Author <a@b.c>";
+
+        for (msg_id, subj, ts) in [
+            ("msg_0", "[PATCH 0/2] Series", 1000),
+            ("msg_1", "[PATCH 1/2] Part 1", 1001),
+            ("msg_1_v2", "[PATCH 1/2] Part 1 replacement", 1050),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Cover letter 0/2 and patch 1/2 arrive
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/2] Series",
+                author,
+                1000,
+                2,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_id, "msg_1", 1, "diff 1").await.unwrap();
+
+        // Replacement patch 1/2 arrives replying to msg_0 -> index_collision on part 1
+        let rep_ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_1_v2",
+                "[PATCH 1/2] Part 1 replacement",
+                author,
+                1050,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(rep_ps_id, ps_id);
+
+        // Original patchset still owns msg_0; replacement patchset owns msg_1_v2
+        assert_eq!(
+            db.find_patchset_id_by_msgid("msg_0").await.unwrap(),
+            Some(ps_id)
+        );
+        let rep_det = db
+            .get_patchset_details(rep_ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep_det["message_id"], "msg_1_v2");
+    }
+
+    #[tokio::test]
+    async fn test_multirow_merge_preserves_cover_letter_and_bug_provenance() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/3] Series", 1000)
+            .await
+            .unwrap();
+        let author = "Author <a@b.c>";
+
+        for (msg_id, subj, ts) in [
+            ("msg_1", "[PATCH 1/3] Part 1", 1000),
+            ("msg_0", "[PATCH 0/3] Cover", 100000),
+            ("msg_3", "[PATCH 3/3] Part 3", 55000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Row A created by patch 1/3 at t=1000 (named after msg_1, subject_index = 1)
+        let ps_a = db
+            .create_patchset(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/3] Part 1",
+                author,
+                1000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p1_a = db.create_patch(ps_a, "msg_1", 1, "diff 1").await.unwrap();
+
+        // Row B created at t=100000 by cover letter 0/3 (named after msg_0),
+        // then patch 2/3 and duplicate patch 1/3 are attached to Row B,
+        // and Row B's subject_index happens to be 2.
+        let ps_b = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/3] Cover",
+                author,
+                100000,
+                3,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Force ps_b to have subject_index = 2 while retaining cover_letter_message_id = msg_0
+        db.conn
+            .execute(
+                "UPDATE patchsets SET subject_index = 2, subject = '[PATCH 2/3] Part 2' WHERE id = ?",
+                libsql::params![ps_b],
+            )
+            .await
+            .unwrap();
+        let p1_b = db.create_patch(ps_b, "msg_1", 1, "diff 1").await.unwrap();
+
+        // Attach a bug referencing ps_b and duplicate patch p1_b
+        db.conn
+            .execute(
+                "INSERT INTO bugs (bugid, title, reporter, reported_at, created_at, updated_at, discovered_in_patchset_id, discovered_in_patch_id)
+                 VALUES ('bug-merge-test', 'test bug', 'tester@example.com', 1000, 1000, 1000, ?, ?)",
+                libsql::params![ps_b, p1_b],
+            )
+            .await
+            .unwrap();
+
+        // Bridging patch 3/3 arrives at t=55000 -> merges ps_b into ps_a
+        let ps_merged = db
+            .create_patchset(
+                thread_id,
+                Some("msg_3"),
+                "msg_3",
+                "[PATCH 3/3] Part 3",
+                author,
+                55000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                3,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_merged, ps_a);
+
+        // ps_a should have adopted msg_0 cover letter from ps_b despite ps_b having subject_index = 2 > ps_a's 1
+        assert_eq!(
+            db.find_patchset_id_by_msgid("msg_0").await.unwrap(),
+            Some(ps_a)
+        );
+
+        // Bug provenance should now point to ps_a and surviving patch p1_a
+        let mut bug_rows = db
+            .conn
+            .query(
+                "SELECT discovered_in_patchset_id, discovered_in_patch_id FROM bugs WHERE bugid = 'bug-merge-test'",
+                (),
+            )
+            .await
+            .unwrap();
+        let bug_row = bug_rows.next().await.unwrap().unwrap();
+        let bug_ps_id: i64 = bug_row.get(0).unwrap();
+        let bug_patch_id: i64 = bug_row.get(1).unwrap();
+        assert_eq!(bug_ps_id, ps_a);
+        assert_eq!(bug_patch_id, p1_a);
+    }
+
+    /// A patchset that is closed to new parts has to look closed to the
+    /// statements that ask in SQL as well, or an embargo lands on a series
+    /// the merge scan has already stopped feeding.
+    #[tokio::test]
+    async fn test_closed_to_new_parts_agrees_with_its_sql_form() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("predicate@example.com", "A subject", 1000)
+            .await
+            .unwrap();
+
+        let statuses = [
+            "Incomplete",
+            "Pending",
+            "In Review",
+            "Cancelled",
+            "Skipped",
+            "Reviewed",
+            "Failed",
+            "Failed To Apply",
+            "Fetching",
+        ];
+
+        for (index, status) in statuses.iter().enumerate() {
+            for (received, total) in [(0_u32, 3_u32), (3, 3)] {
+                let id = 100 + (index as i64 * 10) + i64::from(received);
+                db.conn
+                    .execute(
+                        "INSERT INTO patchsets (id, thread_id, subject, author, date, status,
+                                                total_parts, received_parts)
+                         VALUES (?, ?, 'A subject', 'An Author', 1000, ?, ?, ?)",
+                        libsql::params![id, thread_id, *status, total, received],
+                    )
+                    .await
+                    .unwrap();
+
+                let mut rows = db
+                    .conn
+                    .query(
+                        &format!("SELECT {CLOSED_TO_NEW_PARTS_SQL} FROM patchsets WHERE id = ?"),
+                        libsql::params![id],
+                    )
+                    .await
+                    .unwrap();
+                let sql_says: bool =
+                    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() != 0;
+
+                assert_eq!(
+                    Database::is_closed_to_new_parts(status, received, total),
+                    sql_says,
+                    "the two forms of the predicate disagree about {status} at {received}/{total}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_project_stamp_idempotent_and_rejects_mismatch() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // First stamp with Sashiko succeeds
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await
+            .unwrap();
+        // Repeating the same stamp is idempotent
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await
+            .unwrap();
+
+        // Attempting to open the database with Linux project fails clearly
+        let err = db
+            .ensure_project_stamp(crate::project::ProjectId::Linux)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("database project mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pull_request_commits_grouped_into_single_patchset_series() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let placeholder_id = "mr-501-aaa..bbb@sashiko.local";
+        let pr_url = "https://github.com/sashiko-dev/sashiko/pull/501";
+        let pr_title = "Make sure logging output isn't erased";
+        let slug = "sashiko-501";
+
+        let placeholder_ps_id = db
+            .create_fetching_patchset(
+                placeholder_id,
+                "Fetching GitHub PR/MR: Make sure logging output isn't erased",
+                None,
+                None,
+                Some(pr_url),
+                Some(pr_title),
+                Some(501),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .ensure_thread_for_message(placeholder_id, 1700000000)
+            .await
+            .unwrap();
+
+        // Ingest commit 1/2
+        let sha1 = "sha1111111111111111111111111111111111111";
+        db.create_message(
+            sha1,
+            thread_id,
+            Some(placeholder_id),
+            "Author One <one@example.com>",
+            "cli: commit one",
+            1700000001,
+            "body1",
+            "submitted",
+            "",
+            None,
+            Some("git-fetch"),
+        )
+        .await
+        .unwrap();
+
+        let ps_id_1 = db
+            .create_patchset(
+                thread_id,
+                Some(placeholder_id),
+                sha1,
+                "!501: Make sure logging output isn't erased",
+                "Author One <one@example.com>",
+                1700000001,
+                2,
+                1,
+                "submitted",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id_1, placeholder_ps_id);
+        db.create_patch(ps_id_1, sha1, 1, "diff1").await.unwrap();
+
+        // Ingest commit 2/2 (even with a v2 tag in version or different author)
+        let sha2 = "sha2222222222222222222222222222222222222";
+        db.create_message(
+            sha2,
+            thread_id,
+            Some(placeholder_id),
+            "Author Two <two@example.com>",
+            "cli: commit two v2",
+            1700000002,
+            "body2",
+            "submitted",
+            "",
+            None,
+            Some("git-fetch"),
+        )
+        .await
+        .unwrap();
+
+        let ps_id_2 = db
+            .create_patchset(
+                thread_id,
+                Some(placeholder_id),
+                sha2,
+                "!501: Make sure logging output isn't erased",
+                "Author Two <two@example.com>",
+                1700000002,
+                2,
+                1,
+                "submitted",
+                "",
+                Some(2),
+                2,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id_2, placeholder_ps_id);
+        db.create_patch(ps_id_2, sha2, 2, "diff2").await.unwrap();
+
+        let details = db
+            .get_patchset_details_by_slug(slug, None, None)
+            .await
+            .unwrap()
+            .expect("should find PR patchset by slug");
+        assert_eq!(details["id"].as_i64(), Some(placeholder_ps_id));
+        assert_eq!(details["total_parts"].as_i64(), Some(2));
+        assert_eq!(details["received_parts"].as_i64(), Some(2));
+        assert_eq!(
+            details["author"].as_str(),
+            Some("Author One <one@example.com>")
+        );
+        assert_eq!(details["patches"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pull_request_update_increments_version_and_rotates_slug() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let mr_number = 513;
+        let slug = "sashiko-513";
+        let title = "baseline: route iwl-net and iwl-next series to dev-queue";
+        let mr_url = "https://github.com/sashiko-dev/sashiko/pull/513";
+
+        let clid_v1 = "mr-513-shaAAAA..shaBBBB@sashiko.local";
+        let ps_v1 = db
+            .create_fetching_patchset(
+                clid_v1,
+                "Fetching PR #513",
+                None,
+                None,
+                Some(mr_url),
+                Some(title),
+                Some(mr_number),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+
+        let details_v1 = db
+            .get_patchset_details_by_slug(slug, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details_v1["id"].as_i64(), Some(ps_v1));
+        assert_eq!(
+            details_v1["subject"].as_str(),
+            Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
+        assert_eq!(
+            crate::patch::parse_subject_version(details_v1["subject"].as_str().unwrap())
+                .unwrap_or(1),
+            1
+        );
+
+        // Re-submitting the exact same commit range should reuse v1 and not increment
+        let ps_v1_repeat = db
+            .create_fetching_patchset(
+                clid_v1,
+                "Fetching PR #513",
+                None,
+                None,
+                Some(mr_url),
+                Some(title),
+                Some(mr_number),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps_v1_repeat, ps_v1);
+        assert_eq!(
+            db.get_mr_version_for_commit_range(mr_number, clid_v1)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Now PR #513 is updated with new commits (new head shaCCCC)
+        let clid_v2 = "mr-513-shaAAAA..shaCCCC@sashiko.local";
+        let ps_v2 = db
+            .create_fetching_patchset(
+                clid_v2,
+                "Fetching PR #513",
+                None,
+                None,
+                Some(mr_url),
+                Some(title),
+                Some(mr_number),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+        assert_ne!(ps_v2, ps_v1);
+
+        // Latest slug ("sashiko-513") now points to v2
+        let details_v2 = db
+            .get_patchset_details_by_slug(slug, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details_v2["id"].as_i64(), Some(ps_v2));
+        assert_eq!(
+            details_v2["subject"].as_str(),
+            Some("#513 [v2]: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
+        assert_eq!(
+            crate::patch::parse_subject_version(details_v2["subject"].as_str().unwrap()),
+            Some(2)
+        );
+
+        // Older v1 patchset rotated to "sashiko-513-v1"
+        let rotated_v1 = db
+            .get_patchset_details_by_slug("sashiko-513-v1", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated_v1["id"].as_i64(), Some(ps_v1));
+        assert_eq!(
+            rotated_v1["subject"].as_str(),
+            Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forge_outbox_lifecycle_and_deduplication() {
+        let db = setup_db().await;
+
+        let ps_id = db
+            .create_fetching_patchset(
+                "mr-515-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #515",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/515"),
+                Some("Sashiko fixups"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "### Sashiko review\n\nNo issues found.",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515",
+            "Embargoed",
+        )
+        .await
+        .unwrap();
+
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "different body",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        let released = db.release_embargoed_forge_outbox(ps_id).await.unwrap();
+        assert_eq!(released, 1);
+
+        let row = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("should lock pending row");
+        assert_eq!(row.patchset_id, ps_id);
+        assert_eq!(row.repo, "sashiko-dev/sashiko");
+        assert_eq!(row.pr_number, 515);
+        assert_eq!(row.status, "Sending");
+        assert!(row.body.contains("No issues found."));
+
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        let future_ts = chrono::Utc::now().timestamp() + 60;
+        db.set_forge_outbox_retry_at(row.id, future_ts, "502 Bad Gateway")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        let past_ts = chrono::Utc::now().timestamp() - 5;
+        db.set_forge_outbox_retry_at(row.id, past_ts, "502 Bad Gateway")
+            .await
+            .unwrap();
+        let retried = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("should re-lock after backoff elapsed");
+        assert_eq!(retried.id, row.id);
+        assert_eq!(retried.retry_count, 2);
+
+        db.mark_forge_outbox_sent(retried.id).await.unwrap();
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_superseded_pr_versions_cancel_all_previous_and_outbox() {
+        let db = setup_db().await;
+        let mr_url = "https://github.com/sashiko-dev/sashiko/pull/515";
+
+        // v1 (Incomplete), v2 (Pending), v3 (Reviewed with unsent outbox), v4 (In Review)
+        let v1 = db
+            .create_fetching_patchset(
+                "1111111111111111111111111111111111111111@sashiko.local",
+                "[PR #515 v1] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v1, "Incomplete").await.unwrap();
+
+        let v2 = db
+            .create_fetching_patchset(
+                "2222222222222222222222222222222222222222@sashiko.local",
+                "[PR #515 v2] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v2, "Pending").await.unwrap();
+
+        let v3 = db
+            .create_fetching_patchset(
+                "3333333333333333333333333333333333333333@sashiko.local",
+                "[PR #515 v3] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v3, "Reviewed").await.unwrap();
+        db.insert_forge_outbox(
+            v3,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("3333333333333333333333333333333333333333"),
+            "### Sashiko review v3\n\nStale v3 comment",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515-v3",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        let mut v3_id_rows = db
+            .conn
+            .query(
+                "SELECT id FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![v3],
+            )
+            .await
+            .unwrap();
+        let v3_outbox_id: i64 = v3_id_rows.next().await.unwrap().unwrap().get(0).unwrap();
+
+        let v4 = db
+            .create_fetching_patchset(
+                "4444444444444444444444444444444444444444@sashiko.local",
+                "[PR #515 v4] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(v4, "In Review").await.unwrap();
+        let v4_review_id = db
+            .create_review(v4, None, "gemini", "pro", None, None)
+            .await
+            .unwrap();
+        db.update_review_status(v4_review_id, "In Review", None)
+            .await
+            .unwrap();
+
+        // Now ingest v5 while v4 is In Review
+        let v5 = db
+            .create_fetching_patchset(
+                "5555555555555555555555555555555555555555@sashiko.local",
+                "[PR #515 v5] Improve review cancellation",
+                None,
+                None,
+                Some(mr_url),
+                Some("Improve review cancellation"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_status(v1).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            db.get_patchset_status(v2).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        // v3 had already completed review, so its patchset status stays Reviewed,
+        // but its unsent forge_outbox comment MUST be cancelled so v3 never posts after v4/v5.
+        assert_eq!(
+            db.get_patchset_status(v3).await.unwrap().as_deref(),
+            Some("Reviewed")
+        );
+        assert_eq!(
+            db.get_patchset_status(v4).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            db.get_patchset_status(v5).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+
+        // Verify v4's active review was marked Cancelled
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM reviews WHERE id = ?",
+                libsql::params![v4_review_id],
+            )
+            .await
+            .unwrap();
+        let review_status: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(review_status, "Cancelled");
+
+        // Verify v3's pending outbox row was cancelled and cannot be locked
+        let mut outbox_rows = db
+            .conn
+            .query(
+                "SELECT status FROM forge_outbox WHERE id = ?",
+                libsql::params![v3_outbox_id],
+            )
+            .await
+            .unwrap();
+        let outbox_status: String = outbox_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(outbox_status, "Cancelled");
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        // Even if an in-flight v3 outbox row failed with 502 and set_forge_outbox_retry_at
+        // moved it back to Pending, lock_pending_forge_outbox must cancel it and return None.
+        db.set_forge_outbox_retry_at(v3_outbox_id, 0, "502 Bad Gateway")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        // Attempting to insert a new forge_outbox entry for v4 (cancelled) or v3 (superseded)
+        // is skipped altogether.
+        db.insert_forge_outbox(
+            v4,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("4444444444444444444444444444444444444444"),
+            "### Sashiko review v4\n\nLate v4 comment",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515-v4",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        let mut v4_outbox_rows = db
+            .conn
+            .query(
+                "SELECT status FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![v4],
+            )
+            .await
+            .unwrap();
+        assert!(
+            v4_outbox_rows.next().await.unwrap().is_none(),
+            "superseded/cancelled v4 should not insert a forge_outbox row"
+        );
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        // Meanwhile v5 (the latest version) can enqueue and lock its comment normally.
+        db.update_patchset_status(v5, "Reviewed").await.unwrap();
+        db.insert_forge_outbox(
+            v5,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("5555555555555555555555555555555555555555"),
+            "### Sashiko review v5\n\nLatest v5 comment",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515",
+            "Pending",
+        )
+        .await
+        .unwrap();
+        let locked = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("v5 outbox should lock");
+        assert_eq!(locked.patchset_id, v5);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_series_versions_cancel_previous_versions() {
+        let db = setup_db().await;
+        let author = "Kernel Dev <kdev@example.com>";
+
+        let t3 = db
+            .create_thread("msg_v3_0", "[PATCH v3 0/2] net: foo: fix race", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_v3_0",
+            t3,
+            None,
+            author,
+            "[PATCH v3 0/2] net: foo: fix race",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v3 = db
+            .create_patchset(
+                t3,
+                Some("msg_v3_0"),
+                "msg_v3_0",
+                "[PATCH v3 0/2] net: foo: fix race",
+                author,
+                1000,
+                2,
+                3,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_v3, "In Review").await.unwrap();
+
+        let t4 = db
+            .create_thread("msg_v4_0", "[PATCH v4 0/2] net: foo: fix race", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_v4_0",
+            t4,
+            None,
+            author,
+            "[PATCH v4 0/2] net: foo: fix race",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v4 = db
+            .create_patchset(
+                t4,
+                Some("msg_v4_0"),
+                "msg_v4_0",
+                "[PATCH v4 0/2] net: foo: fix race",
+                author,
+                2000,
+                2,
+                4,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(ps_v3).await.unwrap().as_deref(),
+            Some("Cancelled"),
+            "v3 should be cancelled when v4 arrives"
+        );
+        db.update_patchset_status(ps_v4, "In Review").await.unwrap();
+
+        // Unrelated series by the same author
+        let t_other = db
+            .create_thread("msg_other", "[PATCH v1 1/1] mm: bar: unrelated fix", 2500)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_other",
+            t_other,
+            None,
+            author,
+            "[PATCH v1 1/1] mm: bar: unrelated fix",
+            2500,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_other = db
+            .create_patchset(
+                t_other,
+                None,
+                "msg_other",
+                "[PATCH v1 1/1] mm: bar: unrelated fix",
+                author,
+                2500,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_other, "Pending")
+            .await
+            .unwrap();
+
+        // Now ingest v5 of net: foo: fix race
+        let t5 = db
+            .create_thread("msg_v5_0", "[PATCH v5 0/2] net: foo: fix race", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_v5_0",
+            t5,
+            None,
+            author,
+            "[PATCH v5 0/2] net: foo: fix race",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v5 = db
+            .create_patchset(
+                t5,
+                Some("msg_v5_0"),
+                "msg_v5_0",
+                "[PATCH v5 0/2] net: foo: fix race",
+                author,
+                3000,
+                2,
+                5,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_status(ps_v4).await.unwrap().as_deref(),
+            Some("Cancelled"),
+            "v4 should be cancelled when v5 arrives"
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_v5).await.unwrap().as_deref(),
+            Some("Incomplete"),
+            "v5 should remain active"
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_other).await.unwrap().as_deref(),
+            Some("Pending"),
+            "unrelated series by same author must not be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_patchset_not_reopened_by_claim_or_status_update() {
+        let db = setup_db().await;
+        let ps_id = db
+            .create_fetching_patchset(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@sashiko.local",
+                "[PR #600] Test claim guard",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/600"),
+                Some("Test claim guard"),
+                Some(600),
+                Some("sashiko-600"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Pending").await.unwrap();
+
+        // Cancel the patchset while it is waiting in the Pending queue
+        assert!(db.cancel_patchset(ps_id, false).await.unwrap());
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+
+        // Attempting to claim for review or overwrite status to In Review / Reviewed must fail
+        assert!(!db.claim_patchset_for_review(ps_id).await.unwrap());
+        db.update_patchset_status(ps_id, "In Review").await.unwrap();
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Cancelled")
         );
     }
 }

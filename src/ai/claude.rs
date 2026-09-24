@@ -616,41 +616,6 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
     })
 }
 
-pub fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    use crate::ai::token_budget::TokenBudget;
-
-    let mut total = 0;
-
-    // Count system prompt tokens
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-
-    // Count message tokens
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-
-    // Count tool definition tokens
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-
-    total
-}
-
 // --- AiProvider Implementation ---
 
 #[async_trait]
@@ -675,11 +640,6 @@ impl AiProvider for ClaudeClient {
         translate_ai_response(&response)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        // Reuse existing cl100k_base tokenizer from token_budget.rs
-        estimate_tokens_generic(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
@@ -687,27 +647,34 @@ impl AiProvider for ClaudeClient {
         }
     }
 
+    fn cache_identity(&self) -> String {
+        // max_tokens is what truncates a response, so a raised limit has to
+        // miss the entry recorded under the lower one rather than replay it.
+        // base_url separates two endpoints serving the same model name.
+        let max_tokens = self.max_tokens.to_string();
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("thinking", self.thinking.as_deref()),
+                ("effort", self.effort.as_deref()),
+                ("max_tokens", Some(max_tokens.as_str())),
+                ("base_url", Some(self.base_url.as_str())),
+            ],
+        )
+    }
+
     // Optional caching methods - implement as no-ops for now
 }
 
 // --- StdioClaudeClient for IPC ---
 
-pub struct StdioClaudeClient {
-    registry: std::sync::Arc<crate::ai::IpcRegistry>,
-    writer: std::sync::Arc<crate::ai::AtomicWriter>,
-    reader_started: std::sync::atomic::AtomicBool,
-}
+// The registry and writer are process-wide, so holding them in fields would
+// only cache what the accessors already return.
+pub struct StdioClaudeClient;
 
 impl StdioClaudeClient {
     pub fn new() -> Self {
-        let registry = std::sync::Arc::new(crate::ai::IpcRegistry::new());
-        let writer = std::sync::Arc::new(crate::ai::AtomicWriter::new());
-
-        Self {
-            registry,
-            writer,
-            reader_started: std::sync::atomic::AtomicBool::new(false),
-        }
+        Self
     }
 }
 
@@ -720,14 +687,10 @@ impl Default for StdioClaudeClient {
 #[async_trait]
 impl AiProvider for StdioClaudeClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        if !self
-            .reader_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            crate::ai::start_stdin_reader(std::sync::Arc::downgrade(&self.registry));
-        }
+        crate::ai::ensure_stdin_reader();
 
-        let tx_id = self.registry.next_id();
+        let registry = crate::ai::ipc_registry();
+        let tx_id = registry.next_id();
         let envelope = serde_json::json!({
             "type": "ai_request",
             "tx_id": tx_id,
@@ -736,9 +699,9 @@ impl AiProvider for StdioClaudeClient {
 
         let line = serde_json::to_string(&envelope)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.registry.register(tx_id, tx).await;
+        registry.register(tx_id, tx).await?;
 
-        self.writer.write_line(&line).await?;
+        crate::ai::ipc_writer().write_line(&line).await?;
 
         match rx.await {
             Ok(Ok(resp)) => Ok(resp),
@@ -747,10 +710,6 @@ impl AiProvider for StdioClaudeClient {
                 "IPC channel disconnected waiting for response"
             )),
         }
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -769,6 +728,31 @@ mod tests {
         ToolCall,
     };
     use serde_json::json;
+
+    #[test]
+    fn cache_identity_tracks_the_knobs_outside_the_request() {
+        let client = |max_tokens, base_url: &str| {
+            ClaudeClient::new(
+                "claude-opus-4-7".to_string(),
+                false,
+                max_tokens,
+                base_url.to_string(),
+                None,
+                None,
+            )
+        };
+        let base = client(4096, "https://example.invalid/v1/messages");
+        assert_ne!(
+            base.cache_identity(),
+            client(65536, "https://example.invalid/v1/messages").cache_identity(),
+            "a raised max_tokens must not replay the truncated response"
+        );
+        assert_ne!(
+            base.cache_identity(),
+            client(4096, "https://proxy.invalid/v1/messages").cache_identity(),
+            "a changed base_url must not replay the old endpoint's response"
+        );
+    }
 
     fn make_request(messages: Vec<AiMessage>) -> AiRequest {
         AiRequest {

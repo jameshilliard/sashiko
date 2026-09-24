@@ -292,6 +292,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
+        return e.ai_error_class();
+    }
     AiErrorClass::Fatal
 }
 
@@ -313,7 +316,7 @@ pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
 }
 
 /// Token usage statistics for an AI interaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiUsage {
     /// Number of tokens in the input prompt.
     pub prompt_tokens: usize,
@@ -321,9 +324,24 @@ pub struct AiUsage {
     pub completion_tokens: usize,
     /// Total tokens used (prompt + completion).
     pub total_tokens: usize,
-    /// Optional number of tokens served from cache.
+    /// Number of tokens served from cache.  A breakdown of `prompt_tokens`
+    /// rather than an addend: a consumer subtracts it to get uncached input.
+    /// A provider whose API reports the cached prefix outside its prompt
+    /// total folds it in before filling these fields.  None when the
+    /// provider reports no cache hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<usize>,
+}
+
+impl AiUsage {
+    pub fn accumulate(&mut self, other: &AiUsage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+        if let Some(other_cached) = other.cached_tokens {
+            *self.cached_tokens.get_or_insert(0) += other_cached;
+        }
+    }
 }
 
 /// Information about the capabilities and constraints of an AI provider.
@@ -350,9 +368,6 @@ pub trait AiProvider: Send + Sync {
     /// Generates content based on the provided request.
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse>;
 
-    /// Estimates the number of tokens that will be consumed by the given request.
-    fn estimate_tokens(&self, request: &AiRequest) -> usize;
-
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
 
@@ -360,27 +375,91 @@ pub trait AiProvider: Send + Sync {
     fn cache_stats(&self) -> Option<CacheStats> {
         None
     }
+
+    /// Describes the configuration that shapes a response but travels outside
+    /// the request: the model, and any provider knob such as a reasoning
+    /// effort level. The response cache mixes this into its key, so changing
+    /// one of these settings misses the entries recorded under the old one
+    /// instead of replaying them.
+    fn cache_identity(&self) -> String {
+        self.get_capabilities().model_name
+    }
 }
 
-/// Creates an AI provider, optionally wrapping it with a local response cache.
-pub async fn create_provider_cached(
-    settings: &Settings,
-    enable_cache: bool,
-    cache_ttl_days: u64,
-) -> Result<Arc<dyn AiProvider>> {
-    let provider = create_provider(settings)?;
-    if enable_cache {
-        let cache_path = std::path::Path::new(&settings.database.url)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("response_cache.db");
-        let cached =
-            cache::CachingAiProvider::new(provider, &cache_path.to_string_lossy(), cache_ttl_days)
-                .await?;
-        Ok(Arc::new(cached))
-    } else {
-        Ok(provider)
+/// Appends the knobs a provider applies outside the request to its model name,
+/// forming the identity `cache_identity` returns. A knob left unset
+/// contributes nothing, so a provider configured with none of them keys its
+/// entries on the bare model name.
+///
+/// Keying on an identity at all invalidates every entry recorded before one
+/// existed, whose hash covered the request alone. That costs one re-run of
+/// the backlog on the first run after the upgrade, and the stale rows age out
+/// with the TTL sweep.
+pub fn cache_identity_with(model: &str, knobs: &[(&str, Option<&str>)]) -> String {
+    let mut identity = model.to_string();
+    for (name, value) in knobs {
+        if let Some(value) = value {
+            identity.push('|');
+            identity.push_str(name);
+            identity.push('=');
+            identity.push_str(value);
+        }
     }
+    identity
+}
+
+/// Where a run keeps its response cache: beside the database when it has one,
+/// and under the XDG data directory when it does not.
+///
+/// One rule rather than one per caller, so the file cannot end up named or
+/// placed differently depending on who asked for it.
+fn response_cache_path(database: Option<&str>, data_home: &std::path::Path) -> std::path::PathBuf {
+    // A remote database has no directory for the cache to sit beside, and its
+    // URL is not a path: deriving one would put the cache somewhere meaningless,
+    // and a URL that carries credentials would spell them into directory names
+    // on disk. See Database::new, which builds a remote connection for these.
+    let local = database.filter(|url| !url.contains("://"));
+
+    match local {
+        // A bare filename has no parent worth the name, and means the working
+        // directory: the database is there, so the cache goes there too.
+        Some(file) => std::path::Path::new(file)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .join("response_cache.db"),
+        None => data_home.join("sashiko").join("response_cache.db"),
+    }
+}
+
+/// Creates an AI provider, wrapping it with a response cache when
+/// `ai.response_cache` is set.
+///
+/// `database` is the caller's database, which decides where the cache lives.
+/// A local review passes None: it holds `AiSettings` alone, with no database
+/// for the cache to sit beside.
+pub async fn create_provider_cached(
+    ai: &AiSettings,
+    database: Option<&str>,
+) -> Result<Arc<dyn AiProvider>> {
+    let provider = create_provider_from_ai(ai)?;
+    // A daemon-spawned worker reaches the model through a stdio provider, and
+    // the daemon holds a cache on the far side of it. Caching here as well
+    // would give one run two of them, filled from the same responses.
+    if !ai.response_cache || ai.provider.starts_with("stdio-") {
+        return Ok(provider);
+    }
+    let cache_path = response_cache_path(database, &crate::utils::data_home()?);
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cached = cache::CachingAiProvider::new(
+        provider,
+        &cache_path.to_string_lossy(),
+        ai.response_cache_ttl_days,
+    )
+    .await?;
+    Ok(Arc::new(cached))
 }
 
 /// Creates an AI provider based on the application settings.
@@ -393,7 +472,10 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
     match ai.provider.to_lowercase().as_str() {
         "gemini" => {
             let model = ai.model.clone();
-            Ok(Arc::new(gemini::GeminiClient::new(model)))
+            Ok(Arc::new(gemini::GeminiClient::new_with_settings(
+                model,
+                ai.gemini.as_ref(),
+            )))
         }
         "stdio-gemini" => Ok(Arc::new(gemini::StdioGeminiClient::new())),
         "claude" => {
@@ -502,6 +584,30 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 think_mode,
             )?))
         }
+        "vllm" => {
+            let model = ai.model.clone();
+            let cfg = ai.vllm.as_ref();
+            let base_url = cfg
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(vllm::VllmClient::default_base_url);
+            let context_window = cfg
+                .and_then(|c| c.context_window_size)
+                .unwrap_or_else(|| vllm::VllmClient::default_context_window_for_model(&model));
+            let max_tokens = cfg.and_then(|c| c.max_tokens);
+            let enable_thinking = cfg.and_then(|c| c.enable_thinking);
+            let guided_json = cfg.map(|c| c.guided_json).unwrap_or(false);
+            let enable_tools = cfg.map(|c| c.enable_tools).unwrap_or(false);
+            Ok(Arc::new(vllm::VllmClient::new(
+                base_url,
+                model,
+                context_window,
+                max_tokens,
+                ai.api_timeout_secs,
+                enable_thinking,
+                guided_json,
+                enable_tools,
+            )?))
+        }
         "claude-cli" => {
             let cfg = ai.claude_cli.as_ref();
             Ok(Arc::new(claude_cli::ClaudeCliProvider {
@@ -525,6 +631,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         }
         "codex-cli" => Ok(Arc::new(codex_cli::CodexCliProvider {
             model: ai.model.clone(),
+            effort: ai.codex_cli.as_ref().and_then(|c| c.effort.clone()),
         })),
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
             model: ai.model.clone(),
@@ -538,6 +645,21 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                     .unwrap_or_else(|| "kiro-cli".to_string()),
                 agent: cfg.and_then(|c| c.agent.clone()),
                 context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(200_000),
+                timeout_secs: ai.api_timeout_secs,
+            }))
+        }
+        "goose" | "goose-cli" => {
+            let cfg = ai.goose_cli.as_ref();
+            Ok(Arc::new(goose_cli::GooseCliProvider {
+                model: ai.model.clone(),
+                binary: cfg
+                    .map(|c| c.binary.clone())
+                    .unwrap_or_else(|| "goose".to_string()),
+                goose_provider: cfg
+                    .map(|c| c.goose_provider.clone())
+                    .unwrap_or_else(|| "openai".to_string()),
+                env: cfg.map(|c| c.env.clone()).unwrap_or_default(),
+                context_window_size: cfg.map(|c| c.context_window_size).unwrap_or(128_000),
                 timeout_secs: ai.api_timeout_secs,
             }))
         }
@@ -575,16 +697,21 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         p => bail!("Unsupported AI provider: {}", p),
     }
 }
+pub mod acp;
+pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod concurrency_limited_provider;
 pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;
+pub mod goose_cli;
 pub mod kiro_cli;
+pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
 pub mod proxy;
@@ -592,8 +719,10 @@ pub mod quota;
 pub mod session;
 pub mod token_budget;
 pub mod truncator;
+pub mod vector_search;
 #[cfg(feature = "vertex")]
 pub mod vertex;
+pub mod vllm;
 pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
 
 /// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
@@ -627,6 +756,12 @@ pub(crate) struct IpcEnvelope {
 
 pub(crate) struct IpcRegistry {
     next_tx_id: std::sync::atomic::AtomicU64,
+    // Set by abort_all() when the reader stops.  Both the store and the load
+    // in register() happen under the pending lock, so a registration racing
+    // the shutdown either lands before the drain and is aborted by it, or
+    // observes the flag and fails instead of waiting for a reply that can no
+    // longer arrive.
+    closed: std::sync::atomic::AtomicBool,
     pending: tokio::sync::Mutex<
         std::collections::HashMap<
             u64,
@@ -639,8 +774,15 @@ impl IpcRegistry {
     pub fn new() -> Self {
         Self {
             next_tx_id: std::sync::atomic::AtomicU64::new(1),
+            closed: std::sync::atomic::AtomicBool::new(false),
             pending: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Advisory check for callers that want to skip work on a dead channel.
+    /// register() makes the authoritative decision under the pending lock.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn next_id(&self) -> u64 {
@@ -652,8 +794,14 @@ impl IpcRegistry {
         &self,
         tx_id: u64,
         tx: tokio::sync::oneshot::Sender<Result<AiResponse, RemoteAiError>>,
-    ) {
+    ) -> Result<(), RemoteAiError> {
         let mut map = self.pending.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            });
+        }
         if map.insert(tx_id, tx).is_some() {
             eprintln!(
                 "CRITICAL PROTOCOL ERROR: Duplicate transaction ID {} registered!",
@@ -661,6 +809,7 @@ impl IpcRegistry {
             );
             std::process::exit(1);
         }
+        Ok(())
     }
 
     pub async fn dispatch(&self, tx_id: u64, result: Result<AiResponse, RemoteAiError>) {
@@ -678,6 +827,7 @@ impl IpcRegistry {
 
     pub async fn abort_all(&self, err: RemoteAiError) {
         let mut map = self.pending.lock().await;
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         for (_tx_id, sender) in map.drain() {
             let _ = sender.send(Err(err.clone()));
         }
@@ -717,7 +867,49 @@ impl Default for AtomicWriter {
     }
 }
 
-pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
+// Concurrent reviews each build a fresh provider.  A registry per provider
+// would restart tx_ids at 1 and add a second reader on the shared stdin, so
+// a response could land in a registry that never issued that id.
+static IPC_REGISTRY: std::sync::OnceLock<Arc<IpcRegistry>> = std::sync::OnceLock::new();
+static IPC_WRITER: std::sync::OnceLock<Arc<AtomicWriter>> = std::sync::OnceLock::new();
+// Holding the join handle rather than a "started" flag lets
+// ensure_stdin_reader() tell a running reader from one that has stopped --
+// stdin EOF, a read error, or the runtime it was spawned on being dropped --
+// and replace it, so a later request never waits on a reply that nothing is
+// left to deliver.
+static IPC_READER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn ipc_registry() -> Arc<IpcRegistry> {
+    IPC_REGISTRY
+        .get_or_init(|| Arc::new(IpcRegistry::new()))
+        .clone()
+}
+
+pub(crate) fn ipc_writer() -> Arc<AtomicWriter> {
+    IPC_WRITER
+        .get_or_init(|| Arc::new(AtomicWriter::new()))
+        .clone()
+}
+
+/// Spawns the stdin reader unless one is already running on this runtime.
+pub(crate) fn ensure_stdin_reader() {
+    let registry = ipc_registry();
+
+    // Once the channel has closed it stays closed, so a replacement reader
+    // would do nothing but hit EOF again.  register() reports the failure.
+    if registry.is_closed() {
+        return;
+    }
+
+    let mut reader = IPC_READER.lock().unwrap();
+    if matches!(reader.as_ref(), Some(handle) if !handle.is_finished()) {
+        return;
+    }
+    *reader = Some(start_stdin_reader(registry));
+}
+
+pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let stdin = tokio::io::stdin();
@@ -725,20 +917,12 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
         let mut lines = reader.lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            let active_registry = match registry.upgrade() {
-                Some(r) => r,
-                None => {
-                    tracing::info!("IPC Registry dropped, shutting down stdin reader task.");
-                    break;
-                }
-            };
-
             if let Ok(envelope) = serde_json::from_str::<IpcEnvelope>(&line) {
                 match envelope.msg_type.as_str() {
                     "ai_response" => {
                         if let Ok(payload) = serde_json::from_value::<AiResponse>(envelope.payload)
                         {
-                            active_registry.dispatch(envelope.tx_id, Ok(payload)).await;
+                            registry.dispatch(envelope.tx_id, Ok(payload)).await;
                         } else {
                             eprintln!(
                                 "CRITICAL PROTOCOL ERROR: Failed to parse payload as AiResponse for tx_id {}",
@@ -751,7 +935,7 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
                         if let Ok(payload) =
                             serde_json::from_value::<RemoteAiErrorPayload>(envelope.payload)
                         {
-                            active_registry
+                            registry
                                 .dispatch(envelope.tx_id, Err(payload.into_error()))
                                 .await;
                         } else {
@@ -776,15 +960,13 @@ pub(crate) fn start_stdin_reader(registry: std::sync::Weak<IpcRegistry>) {
             }
         }
 
-        if let Some(active_registry) = registry.upgrade() {
-            active_registry
-                .abort_all(RemoteAiError {
-                    message: "IPC channel disconnected (stdin closed)".to_string(),
-                    class: AiErrorClass::Fatal,
-                })
-                .await;
-        }
-    });
+        registry
+            .abort_all(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            })
+            .await;
+    })
 }
 
 #[cfg(test)]
@@ -793,6 +975,77 @@ mod tests {
     use crate::worker::prompts::ReviewError;
     use anyhow::anyhow;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn test_a_run_that_caches_through_the_daemon_does_not_cache_again() {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.response_cache = true;
+        settings.ai.provider = "stdio-gemini".to_string();
+
+        // Nothing wraps the provider, so nothing is opened either: asking for
+        // a cache here would have written one under the data directory.
+        let provider = create_provider_cached(&settings.ai, None).await.unwrap();
+        assert!(provider.cache_stats().is_none());
+    }
+
+    #[test]
+    fn test_the_response_cache_follows_the_database_or_the_data_directory() {
+        // Composition only, taking the data directory as an argument: reading
+        // it from XDG_DATA_HOME here would race the prompt bundle's own test,
+        // which sets that variable in this same test binary.
+        let data_home = std::path::Path::new("/data");
+
+        assert_eq!(
+            response_cache_path(Some("/srv/sashiko.db"), data_home),
+            std::path::PathBuf::from("/srv/response_cache.db")
+        );
+        assert_eq!(
+            response_cache_path(None, data_home),
+            std::path::PathBuf::from("/data/sashiko/response_cache.db")
+        );
+
+        // A bare filename means the working directory, which is where the
+        // database is: said outright rather than left to an empty parent, whose
+        // join happens to produce a bare filename back.
+        assert_eq!(
+            response_cache_path(Some("sashiko.db"), data_home),
+            std::path::PathBuf::from("./response_cache.db")
+        );
+
+        // Whatever the database is, the cache lands somewhere with a directory
+        // that can be created. A bare filename used to leave an empty one, from
+        // Path::parent() answering Some("") rather than None, and a caller that
+        // creates the directory before opening the cache has nothing to work
+        // with then.
+        for database in [
+            Some("sashiko.db"),
+            Some("/srv/sashiko.db"),
+            Some("libsql://example.com/sashiko"),
+            None,
+        ] {
+            let path = response_cache_path(database, data_home);
+            let parent = path.parent().expect("a directory to create");
+            assert!(
+                !parent.as_os_str().is_empty(),
+                "{database:?} left no directory to create: {path:?}"
+            );
+        }
+
+        // A remote database has no directory to sit beside, so the cache goes to
+        // the data directory rather than to a path made out of the URL. A URL
+        // that carries credentials must not reach the filesystem at all.
+        for url in [
+            "libsql://user:hunter2@example.com/sashiko",
+            "https://example.com/sashiko",
+        ] {
+            let path = response_cache_path(Some(url), data_home);
+            assert_eq!(
+                path,
+                std::path::PathBuf::from("/data/sashiko/response_cache.db")
+            );
+            assert!(!path.to_string_lossy().contains("hunter2"), "{path:?}");
+        }
+    }
 
     #[test]
     fn test_ai_request_contract() -> Result<()> {
@@ -1158,5 +1411,76 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    // Providers built for concurrent reviews share one tx_id namespace.
+    // next_id() is deliberately not called here: the counter is process-wide,
+    // and advancing it would make any test that asserts a concrete tx_id
+    // depend on the order the test threads happen to run in.
+    #[test]
+    fn test_ipc_singletons_are_shared() {
+        assert!(Arc::ptr_eq(&ipc_registry(), &ipc_registry()));
+        assert!(Arc::ptr_eq(&ipc_writer(), &ipc_writer()));
+    }
+
+    // A request issued after the reader stopped fails instead of waiting for
+    // a reply that can no longer arrive.  Uses its own registry so the
+    // process-wide one is not closed for every other test in the binary.
+    #[tokio::test]
+    async fn test_register_after_disconnect_fails() {
+        let registry = IpcRegistry::new();
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        registry
+            .register(1, tx)
+            .await
+            .expect("an open registry accepts a registration");
+
+        registry
+            .abort_all(RemoteAiError {
+                message: "IPC channel disconnected (stdin closed)".to_string(),
+                class: AiErrorClass::Fatal,
+            })
+            .await;
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = registry
+            .register(2, tx)
+            .await
+            .expect_err("a closed registry rejects a registration");
+        assert!(matches!(err.class, AiErrorClass::Fatal));
+    }
+
+    #[test]
+    fn test_ai_usage_accumulate() {
+        let mut u1 = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(30),
+        };
+        let u2 = AiUsage {
+            prompt_tokens: 200,
+            completion_tokens: 80,
+            total_tokens: 280,
+            cached_tokens: Some(70),
+        };
+        u1.accumulate(&u2);
+        assert_eq!(u1.prompt_tokens, 300);
+        assert_eq!(u1.completion_tokens, 130);
+        assert_eq!(u1.total_tokens, 430);
+        assert_eq!(u1.cached_tokens, Some(100));
+
+        let u3 = AiUsage {
+            prompt_tokens: 50,
+            completion_tokens: 20,
+            total_tokens: 70,
+            cached_tokens: None,
+        };
+        u1.accumulate(&u3);
+        assert_eq!(u1.prompt_tokens, 350);
+        assert_eq!(u1.completion_tokens, 150);
+        assert_eq!(u1.total_tokens, 500);
+        assert_eq!(u1.cached_tokens, Some(100));
     }
 }
