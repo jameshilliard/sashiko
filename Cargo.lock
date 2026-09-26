@@ -3853,7 +3853,6 @@ dependencies = [
  "lettre",
  "libsql",
  "mail-parser",
- "percent-encoding",
  "rcgen",
  "regex",
  "reqwest",

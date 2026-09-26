@@ -105,7 +105,7 @@ impl LoreMboxClient {
     }
 
     pub(crate) async fn fetch_thread(&self, message_id: &str) -> Result<Vec<u8>> {
-        let url = self.thread_url(message_id);
+        let url = self.thread_url(message_id)?;
         self.fetch(
             self.client.get(url),
             &format!("thread for message ID {message_id}"),
@@ -113,18 +113,21 @@ impl LoreMboxClient {
         .await
     }
 
-    fn thread_url(&self, message_id: &str) -> Url {
+    fn thread_url(&self, message_id: &str) -> Result<Url> {
         let mut url = self.base_url.clone();
-        let path = format!(
-            "{}/{message_id}/t.mbox.gz",
-            url.path().trim_end_matches('/')
-        );
-        // Mutating only the path prevents a message ID from replacing the
-        // configured lore origin as an absolute URL.
-        url.set_path(&path);
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("lore base URL cannot contain path segments"))?;
+            segments.pop_if_empty();
+            // One encoded segment prevents an untrusted message ID from
+            // replacing the configured origin or changing the request path.
+            segments.push(message_id);
+            segments.push("t.mbox.gz");
+        }
         url.set_query(None);
         url.set_fragment(None);
-        url
+        Ok(url)
     }
 
     async fn fetch(&self, request: RequestBuilder, description: &str) -> Result<Vec<u8>> {
@@ -363,7 +366,7 @@ mod tests {
         let (base_url, server) = spawn_mbox_server(expected).await?;
         let client = LoreMboxClient::with_base_url(&base_url)?;
 
-        let raw = client.fetch_thread("message%2Fpart@example.com").await?;
+        let raw = client.fetch_thread("message/part@example.com").await?;
         let requests = server.await??;
 
         assert_eq!(raw, expected);
@@ -376,11 +379,26 @@ mod tests {
     fn thread_url_keeps_message_id_on_configured_origin() -> Result<()> {
         let client = LoreMboxClient::with_base_url("https://lore.example/all/")?;
 
-        let url = client.thread_url("http:169.254.169.254");
+        let url = client.thread_url("http:169.254.169.254")?;
 
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("lore.example"));
         assert_eq!(url.path(), "/all/http:169.254.169.254/t.mbox.gz");
+        Ok(())
+    }
+
+    #[test]
+    fn thread_url_encodes_message_id_as_one_path_segment() -> Result<()> {
+        let client = LoreMboxClient::with_base_url("https://lore.example/all/")?;
+
+        let url = client.thread_url("../message/part@example.com")?;
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("lore.example"));
+        assert_eq!(
+            url.as_str(),
+            "https://lore.example/all/..%2Fmessage%2Fpart@example.com/t.mbox.gz"
+        );
         Ok(())
     }
 

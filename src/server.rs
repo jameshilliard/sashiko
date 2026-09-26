@@ -381,6 +381,10 @@ pub async fn run_server(
     Ok(())
 }
 
+fn normalize_thread_message_id(message_id: &str) -> String {
+    message_id.trim_matches(['<', '>']).to_string()
+}
+
 fn generate_synthetic_id(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let start = SystemTime::now();
@@ -557,22 +561,9 @@ async fn submit_patch(
         }
         SubmitRequest::Thread { msgid } => {
             let id = generate_synthetic_id("thread");
-            // Percent-encode path-significant characters in the message-ID
-            // for safe inclusion in the lore.kernel.org fetch URL. This
-            // handles RFC 5322 message-IDs that contain `/` or other
-            // path-sensitive characters without rejecting them.
-            const PATH_SEGMENT_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
-                .add(b'/')
-                .add(b'\\')
-                .add(b'?')
-                .add(b'#')
-                .add(b' ')
-                .add(b'%');
-            let clean_msgid = percent_encoding::utf8_percent_encode(
-                msgid.trim_matches(|c| c == '<' || c == '>'),
-                PATH_SEGMENT_ENCODE,
-            )
-            .to_string();
+            // Keep the canonical message ID in application state. The Lore
+            // client encodes it exactly once when constructing the URL.
+            let clean_msgid = normalize_thread_message_id(&msgid);
             info!(
                 "Received thread fetch request: {} (msgid: {})",
                 id, clean_msgid
@@ -2275,6 +2266,14 @@ async fn bug_action(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_thread_message_id_remains_unencoded() {
+        assert_eq!(
+            normalize_thread_message_id("<message/part%25@example.com>"),
+            "message/part%25@example.com"
+        );
+    }
 
     #[test]
     fn test_generate_synthetic_id_format() {
