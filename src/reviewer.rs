@@ -23,9 +23,7 @@ use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
-use crate::prerequisites::{
-    PrerequisitePatch, parse_prerequisite_patch_ids, resolve_prerequisite_patches_from_lore,
-};
+use crate::prerequisites::{PrerequisitePatch, resolve_prerequisites_from_lore};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
@@ -646,6 +644,7 @@ impl Reviewer {
             patchset_id,
             &candidates,
             &diffs,
+            patchset.message_id.as_deref(),
             body.as_deref(),
         )
         .await;
@@ -1257,6 +1256,7 @@ impl Reviewer {
         patchset_id: i64,
         candidates: &[BaselineResolution],
         diffs: &[(i64, i64, String, String, String, i64, String)],
+        target_message_id: Option<&str>,
         prerequisite_metadata: Option<&str>,
     ) -> (
         Option<(i64, GitWorktree, String)>,
@@ -1264,16 +1264,20 @@ impl Reviewer {
         String,
     ) {
         let mut attempts: Vec<BaselineAttempt> = Vec::new();
-        let prerequisite_patch_ids = match prerequisite_metadata
-            .map(parse_prerequisite_patch_ids)
-            .transpose()
+        let prerequisites = match resolve_prerequisites_from_lore(
+            &ctx.db,
+            patchset_id,
+            target_message_id,
+            prerequisite_metadata.unwrap_or_default(),
+        )
+        .await
         {
-            Ok(ids) => ids.unwrap_or_default(),
+            Ok(patches) => patches,
             Err(e) => {
-                let message = format!("Failed to parse b4 prerequisites: {e}\n");
+                let message = format!("Failed to resolve prerequisites: {e}\n");
                 error!("{}", message.trim());
                 attempts.push(BaselineAttempt {
-                    baseline: "b4 prerequisites".to_string(),
+                    baseline: "prerequisites".to_string(),
                     status: "Failed".to_string(),
                     log: message,
                 });
@@ -1282,27 +1286,6 @@ impl Reviewer {
                     HashMap::new(),
                     serde_json::to_string(&attempts).unwrap_or_default(),
                 );
-            }
-        };
-        let prerequisites = if prerequisite_patch_ids.is_empty() {
-            Vec::new()
-        } else {
-            match resolve_prerequisite_patches_from_lore(&ctx.db, &prerequisite_patch_ids).await {
-                Ok(patches) => patches,
-                Err(e) => {
-                    let message = format!("Failed to resolve b4 prerequisites: {e}\n");
-                    error!("{}", message.trim());
-                    attempts.push(BaselineAttempt {
-                        baseline: "b4 prerequisites".to_string(),
-                        status: "Failed".to_string(),
-                        log: message,
-                    });
-                    return (
-                        None,
-                        HashMap::new(),
-                        serde_json::to_string(&attempts).unwrap_or_default(),
-                    );
-                }
             }
         };
         let repo_path = PathBuf::from(&ctx.settings.git.repository_path);
@@ -3359,7 +3342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prepare_baseline_applies_b4_prerequisite() -> Result<()> {
+    async fn test_prepare_baseline_applies_b4_and_based_on_prerequisites() -> Result<()> {
         let temp_dir = tempdir()?;
         let repo = temp_dir.path().join("repo");
         std::fs::create_dir_all(&repo)?;
@@ -3414,9 +3397,9 @@ mod tests {
         let prerequisite_patchset_id = db
             .create_patchset(
                 thread_id,
-                None,
-                "root",
-                "prerequisite",
+                Some("prerequisite@example.com"),
+                "prerequisite@example.com",
+                "[PATCH] prerequisite",
                 "Test Author <author@example.com>",
                 1_700_000_000,
                 1,
@@ -3463,31 +3446,48 @@ mod tests {
         )];
 
         let prerequisite_metadata = format!("prerequisite-patch-id: {prerequisite_id}");
-        let (found, patch_commits, logs) = Reviewer::prepare_baseline_worktree(
-            &ctx,
-            99,
-            &[candidate],
-            &diffs,
-            Some(&prerequisite_metadata),
-        )
-        .await;
-        let (_, worktree, review_baseline) =
-            found.ok_or_else(|| anyhow::anyhow!("baseline preparation failed: {logs}"))?;
+        for metadata in [
+            prerequisite_metadata.clone(),
+            "Based-on: prerequisite@example.com".to_string(),
+            format!("{prerequisite_metadata}\nBased-on: prerequisite@example.com"),
+            format!("{prerequisite_metadata}\nBased-on: target@example.com"),
+            format!("{prerequisite_metadata}\nBased-on: malformed"),
+        ] {
+            let (found, patch_commits, logs) = Reviewer::prepare_baseline_worktree(
+                &ctx,
+                99,
+                std::slice::from_ref(&candidate),
+                &diffs,
+                Some("target@example.com"),
+                Some(&metadata),
+            )
+            .await;
+            let (_, worktree, review_baseline) = found.ok_or_else(|| {
+                anyhow::anyhow!("baseline preparation failed for {metadata:?}: {logs}")
+            })?;
 
-        assert_ne!(review_baseline, base_sha);
-        let target_sha = patch_commits
-            .get(&1)
-            .expect("target patch commit should be recorded");
-        assert_eq!(
-            run_git(&worktree.path, &["rev-parse", &format!("{target_sha}^")])?,
-            review_baseline
-        );
-        assert_eq!(
-            std::fs::read_to_string(worktree.path.join("value.txt"))?,
-            "one\ntwo changed\n"
-        );
-        assert!(logs.contains("Applied prerequisite"));
-        worktree.remove().await?;
+            assert_eq!(
+                run_git(
+                    &worktree.path,
+                    &["rev-parse", &format!("{review_baseline}^")]
+                )?,
+                base_sha
+            );
+            assert_eq!(patch_commits.len(), 1);
+            let target_sha = patch_commits
+                .get(&1)
+                .expect("target patch commit should be recorded");
+            assert_eq!(
+                run_git(&worktree.path, &["rev-parse", &format!("{target_sha}^")])?,
+                review_baseline
+            );
+            assert_eq!(
+                std::fs::read_to_string(worktree.path.join("value.txt"))?,
+                "one\ntwo changed\n"
+            );
+            assert!(logs.contains("Applied prerequisite"));
+            worktree.remove().await?;
+        }
         Ok(())
     }
 
@@ -3587,7 +3587,7 @@ mod tests {
         )];
 
         let (found, _patch_commits, logs) =
-            Reviewer::prepare_baseline_worktree(&ctx, 99, &candidates, &diffs, None).await;
+            Reviewer::prepare_baseline_worktree(&ctx, 99, &candidates, &diffs, None, None).await;
         let (_, worktree, review_baseline) =
             found.ok_or_else(|| anyhow::anyhow!("baseline preparation failed: {logs}"))?;
 
@@ -4055,6 +4055,7 @@ fi
             &stale_head_candidates(&repo),
             &one_patch(diff),
             None,
+            None,
         )
         .await;
 
@@ -4086,6 +4087,7 @@ fi
             1,
             &stale_head_candidates(&repo),
             &one_patch(diff),
+            None,
             None,
         )
         .await;

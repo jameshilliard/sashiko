@@ -237,6 +237,27 @@ pub struct PatchsetRow {
     pub mr_number: Option<i64>,
 }
 
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredPrerequisitePatch {
+    pub(crate) git_patch_id: Option<String>,
+    pub(crate) message_id: String,
+    pub(crate) part_index: u32,
+    pub(crate) subject: String,
+    pub(crate) author: String,
+    pub(crate) date: i64,
+    pub(crate) diff: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredPrerequisiteSeries {
+    pub(crate) patchset_id: i64,
+    pub(crate) message_id: String,
+    pub(crate) body: String,
+    pub(crate) patches: Vec<StoredPrerequisitePatch>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReleaseReview {
     pub id: i64,
@@ -8275,6 +8296,127 @@ impl Database {
         }
     }
 
+    /// Load a complete prerequisite series whose message ID names its head.
+    ///
+    /// Incomplete local copies deliberately return `None` so callers can try
+    /// an archive. Malformed complete rows return an error rather than
+    /// silently supplying only part of the prerequisite.
+    pub(crate) async fn get_stored_prerequisite_series(
+        &self,
+        message_id: &str,
+        maximum_parts: usize,
+    ) -> Result<Option<StoredPrerequisiteSeries>> {
+        let mut head = None;
+        for candidate in Self::get_msgid_candidates(message_id) {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT ps.id, ps.cover_letter_message_id,
+                            ps.total_parts, ps.received_parts, m.body
+                     FROM patchsets ps
+                     LEFT JOIN messages m
+                       ON m.message_id = ps.cover_letter_message_id
+                     WHERE ps.cover_letter_message_id = ?
+                     ORDER BY ps.id ASC LIMIT 1",
+                    libsql::params![candidate],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                head = Some((
+                    row.get::<i64>(0)?,
+                    get_required_text(&row, 1)?,
+                    get_optional_integer(&row, 2)?,
+                    get_optional_integer(&row, 3)?,
+                    crate::compression::get_compressed_string_opt(&row, 4)?,
+                ));
+                break;
+            }
+        }
+
+        let Some((patchset_id, message_id, total_parts, received_parts, body)) = head else {
+            return Ok(None);
+        };
+        let (Some(total_parts), Some(received_parts), Some(body)) =
+            (total_parts, received_parts, body)
+        else {
+            return Ok(None);
+        };
+        if total_parts <= 0 || total_parts > u32::MAX.into() {
+            bail!("stored prerequisite series {message_id} has an invalid part count");
+        }
+        let total_parts_usize = usize::try_from(total_parts)
+            .map_err(|_| anyhow::anyhow!("stored prerequisite part count is too large"))?;
+        if total_parts_usize > maximum_parts {
+            bail!(
+                "stored prerequisite series {message_id} contains more than {maximum_parts} patches"
+            );
+        }
+        if received_parts < total_parts {
+            return Ok(None);
+        }
+        if received_parts > total_parts {
+            bail!("stored prerequisite series {message_id} has too many received parts");
+        }
+        let total_parts = total_parts as u32;
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.git_patch_id, p.message_id, p.part_index, p.diff,
+                        m.subject, m.author, m.date
+                 FROM patches p
+                 JOIN messages m ON m.message_id = p.message_id
+                 WHERE p.patchset_id = ?
+                 ORDER BY p.part_index ASC, p.id ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut patches = Vec::with_capacity(total_parts_usize);
+        let mut seen_parts = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let part_index = get_optional_integer(&row, 2)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stored prerequisite series {message_id} has a patch without a part number"
+                )
+            })?;
+            if part_index <= 0 || part_index > i64::from(total_parts) {
+                bail!(
+                    "stored prerequisite series {message_id} has invalid part {part_index}/{total_parts}"
+                );
+            }
+            let part_index = part_index as u32;
+            if !seen_parts.insert(part_index) {
+                bail!(
+                    "stored prerequisite series {message_id} has duplicate part {part_index}/{total_parts}"
+                );
+            }
+            let diff =
+                crate::compression::get_compressed_string_opt(&row, 3)?.ok_or_else(|| {
+                    anyhow::anyhow!("stored prerequisite part {part_index} has no diff")
+                })?;
+            patches.push(StoredPrerequisitePatch {
+                git_patch_id: get_optional_text(&row, 0)?,
+                message_id: get_required_text(&row, 1)?,
+                part_index,
+                diff,
+                subject: get_required_text(&row, 4)?,
+                author: get_required_text(&row, 5)?,
+                date: get_optional_integer(&row, 6)?.unwrap_or(0),
+            });
+        }
+
+        if patches.len() != total_parts_usize {
+            return Ok(None);
+        }
+
+        Ok(Some(StoredPrerequisiteSeries {
+            patchset_id,
+            message_id,
+            body,
+            patches,
+        }))
+    }
+
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
             "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, mr_url, mr_title, mr_number
@@ -10913,6 +11055,118 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    async fn insert_stored_prerequisite_series(db: &Database) -> Result<i64> {
+        let thread_id = db.create_thread("base-cover", "Base series", 10).await?;
+        db.create_message(
+            "base-cover",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "[PATCH 0/2] Base series",
+            10,
+            "Based-on: older@example.com",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        for part in 1..=2 {
+            db.create_message(
+                &format!("base-{part}"),
+                thread_id,
+                Some("base-cover"),
+                "Author <author@example.com>",
+                &format!("[PATCH {part}/2] Base part"),
+                10 + i64::from(part),
+                "patch body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await?;
+        }
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                Some("base-cover"),
+                "base-1",
+                "Base series",
+                "Author <author@example.com>",
+                10,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .expect("test prerequisite patchset should be created");
+        db.create_patch_with_git_patch_id(
+            patchset_id,
+            "base-1",
+            1,
+            "diff one",
+            Some("1111111111111111111111111111111111111111"),
+        )
+        .await?;
+        db.create_patch(patchset_id, "base-2", 2, "diff two")
+            .await?;
+        Ok(patchset_id)
+    }
+
+    #[tokio::test]
+    async fn stored_prerequisite_series_requires_its_complete_head() -> Result<()> {
+        let db = setup_db().await;
+        let patchset_id = insert_stored_prerequisite_series(&db).await?;
+
+        let series = db
+            .get_stored_prerequisite_series("<base-cover>", 128)
+            .await?
+            .expect("complete prerequisite series should be found");
+        assert_eq!(series.patchset_id, patchset_id);
+        assert_eq!(series.message_id, "base-cover");
+        assert_eq!(series.body, "Based-on: older@example.com");
+        assert_eq!(series.patches.len(), 2);
+        assert_eq!(series.patches[0].part_index, 1);
+        assert_eq!(series.patches[1].part_index, 2);
+        assert_eq!(
+            series.patches[0].git_patch_id.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert!(
+            db.get_stored_prerequisite_series("base-2", 128)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incomplete_stored_prerequisite_series_allows_fallback() -> Result<()> {
+        let db = setup_db().await;
+        let patchset_id = insert_stored_prerequisite_series(&db).await?;
+        db.conn
+            .execute(
+                "DELETE FROM patches WHERE patchset_id = ? AND part_index = 2",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        assert!(
+            db.get_stored_prerequisite_series("base-cover", 128)
+                .await?
+                .is_none()
+        );
+        Ok(())
     }
 
     /// A bare patchset row, for tests that only care about what is attributed

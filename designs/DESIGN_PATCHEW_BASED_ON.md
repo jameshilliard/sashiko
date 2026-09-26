@@ -7,10 +7,22 @@ before reviewing the dependent patchset. This extends the prerequisite
 support from exact b4 patch IDs to a message ID that names an entire series.
 
 The implementation supports metadata present in the cover letter or in the
-single patch body. It implements the `Based-on` convention without depending
-on the Patchew service or its database.
+single patch body. It uses `Based-on` when no valid b4 prerequisite patch IDs
+are present, without depending on the Patchew service or its database.
 
 ## Metadata
+
+Parse b4 `prerequisite-patch-id` entries first. A nonempty list is authoritative:
+preserve its declared order and do not parse or resolve `Based-on` metadata in
+the same body. Stale, malformed, or conflicting `Based-on` values cannot change
+the dependency set or prevent a valid b4 declaration from being used.
+
+When no valid prerequisite patch IDs are present, parse `Based-on` instead.
+Keep the existing b4 parser's handling of malformed, quoted, and indented lines;
+these do not select the b4 path. Bare `prerequisite-message-id` and
+`prerequisite-change-id` values remain outside the supported b4 metadata and do
+not suppress `Based-on`. Exceeding the b4 patch-ID limit is an error, not a
+reason to fall back to `Based-on`.
 
 Recognize an unquoted line at the beginning of a body line with this form:
 
@@ -57,14 +69,17 @@ dependencies recursively and apply the deepest series first. Detect cycles by
 normalized message ID, including a dependency back to the target series, and
 reject chains deeper than eight series.
 
-For each series, apply its nested `Based-on` chain, then its b4
-`prerequisite-patch-id` entries in declared order, then the series itself. For
-the target patchset, apply the expanded `Based-on` chain before its b4
-prerequisite patches. Deduplicate the resulting patch list by stable Git patch
-ID while preserving the first occurrence.
+Select one dependency source for each series, including the target. If it has
+valid b4 patch IDs, resolve only those patches in declared order. Otherwise,
+resolve its `Based-on` series recursively. Apply the selected prerequisites
+before the series itself. Deduplicate the resulting patch list by stable Git
+patch ID while preserving the first occurrence.
 
-This ordering makes `Based-on` the base of the dependent series and remains
-safe when both formats describe the same prerequisite patches.
+This keeps b4's exact patch list and application order authoritative instead
+of adding an unrelated series or allowing `Based-on` ordering to override it.
+The selected source is represented as an enum so resolution cannot combine
+both formats accidentally. A failed b4 lookup is fatal; it must not cause a
+fallback to `Based-on` and silently select different prerequisite content.
 
 ## Resource and Trust Boundaries
 
@@ -96,16 +111,17 @@ No schema migration is required.
 ## Testing
 
 - Parser tests cover angle brackets, case, duplicate tags, ambiguous tags,
-  malformed values, quoted lines, and b4 metadata coexistence.
+  malformed values, quoted lines, and b4 precedence over `Based-on` metadata.
 - Series extraction tests cover cover letters, coverless single patches,
   unrelated patches in the same Lore thread, missing and duplicate parts, and
   non-head message IDs.
 - Resolver tests cover local lookup, Lore fallback, nested dependencies,
   stable patch-ID deduplication, cycles, depth, and shared remote-operation
-  limits.
+  limits. Mixed-metadata tests verify b4 ordering, ignored `Based-on` values,
+  nested precedence, and no fallback after a failed b4 lookup.
 - Reviewer tests verify that a target patch which fails on the upstream base
-  applies after its `Based-on` series and still uses the prerequisite tip as
-  its effective review baseline.
+  applies after its selected prerequisites and still uses the prerequisite
+  tip as its effective review baseline, including when both formats appear.
 - Existing b4 prerequisite tests continue to protect patch-ID-only behavior.
 
 ## Out of Scope
