@@ -388,6 +388,21 @@ mod tests {
     }
 
     #[test]
+    fn thread_url_encodes_reserved_characters_exactly_once() -> Result<()> {
+        let client = LoreMboxClient::with_base_url("https://lore.example/all/")?;
+
+        let url = client.thread_url("message/part%25?#\\@example.com")?;
+
+        assert_eq!(
+            url.as_str(),
+            "https://lore.example/all/message%2Fpart%2525%3F%23%5C@example.com/t.mbox.gz"
+        );
+        assert_eq!(url.query(), None);
+        assert_eq!(url.fragment(), None);
+        Ok(())
+    }
+
+    #[test]
     fn thread_url_encodes_message_id_as_one_path_segment() -> Result<()> {
         let client = LoreMboxClient::with_base_url("https://lore.example/all/")?;
 

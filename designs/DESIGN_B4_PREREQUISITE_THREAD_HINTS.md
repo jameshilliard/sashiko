@@ -24,8 +24,9 @@ dependencies. A bare message-ID hint must not cause any patches to be applied.
 5. Return only the declared patches, in their original patch-ID order.
 
 Malformed hints are ignored, and unavailable, oversized, or irrelevant
-hinted threads permit the normal search fallback. Neither a hint nor a search
-may substitute a different patch or silently omit a required prerequisite.
+hinted threads permit the normal search fallback within the shared request
+budget. Neither a hint nor a search may substitute a different patch or
+silently omit a required prerequisite.
 Do not recursively follow metadata from hinted threads: b4 already specifies
 the exact flattened dependency list.
 
@@ -34,13 +35,16 @@ the exact flattened dependency list.
 Retain the 128-patch limit, 500-message per-response limit, compressed and
 decompressed byte limits, HTTP timeout/retries, and bounded patch-ID workers.
 Thread fetches and searches share the existing eight-operation budget;
-failed operations count too. Bound stored hints and deduplicate them before
-performing remote work. An exhausted budget remains an explicit failure.
+failed operations count too. Retain only the first eight unique, valid hints
+before performing remote work. An exhausted budget remains an explicit failure.
+Use the merged prerequisite resolver's counter and patch cache, including
+when a Based-on series contains b4 metadata. Based-on series retrieval, b4
+thread hints, and patch-ID searches all count toward the same budget.
 
 Accept canonical message IDs with optional enclosing angle brackets, reject
 whitespace/control characters and overlong IDs, and keep requests on Lore's
-configured origin. Reuse the URL path-segment encoding change from the
-Patchew work so all thread callers supply raw canonical IDs and encoding
+configured origin. Reuse the URL path-segment encoding change from the merged
+Patchew support so all thread callers supply raw canonical IDs and encoding
 happens exactly once in the shared client.
 
 Preserve the complete, redacted error chain in baseline failure logs so a
@@ -57,5 +61,7 @@ matching and ordering, local/cache hits, duplicate and malformed hints,
 missing/stale/oversized hints, search fallback, shared operation limits, and
 fixed-origin URL encoding. Include a case where broad search would exceed
 500 messages but scoped threads supply more than eight required patches in
-three requests. Recheck the real Rockchip prerequisites locally without
+three requests. Cover b4 priority when both formats appear, ignored metadata
+inside hinted threads, and the shared budget with nested Based-on series.
+Recheck the real Rockchip prerequisites locally without
 committing their emails or making live-server changes.

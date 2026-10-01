@@ -15,6 +15,7 @@
 use crate::db::{Database, StoredPrerequisiteSeries};
 use crate::mbox::{LoreMboxClient, split_mbox};
 use crate::patch::{Patch, PatchsetMetadata, authors_match, parse_email};
+use crate::utils::redact_secret;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -25,7 +26,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
-use tracing::info;
+use tracing::{info, warn};
 
 const MAX_MBOX_MESSAGES: usize = 500;
 const MAX_PREREQUISITE_PATCH_IDS: usize = 128;
@@ -48,7 +49,10 @@ pub(crate) struct PrerequisitePatch {
 
 #[derive(Debug, PartialEq, Eq)]
 enum PrerequisiteMetadata {
-    PatchIds(Vec<String>),
+    PatchIds {
+        patch_ids: Vec<String>,
+        message_ids: Vec<String>,
+    },
     BasedOn(String),
 }
 
@@ -122,9 +126,48 @@ fn parse_prerequisite_metadata(body: &str) -> Result<Option<PrerequisiteMetadata
     let patch_ids = parse_prerequisite_patch_ids(body)?;
     if !patch_ids.is_empty() {
         // Git's explicit patch list and order take precedence over Based-on.
-        return Ok(Some(PrerequisiteMetadata::PatchIds(patch_ids)));
+        return Ok(Some(PrerequisiteMetadata::PatchIds {
+            patch_ids,
+            message_ids: parse_prerequisite_message_ids(body),
+        }));
     }
     Ok(parse_based_on_message_id(body)?.map(PrerequisiteMetadata::BasedOn))
+}
+
+fn parse_prerequisite_message_ids(body: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    body.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("prerequisite-message-id") {
+                return None;
+            }
+            let value = value.trim();
+            let message_id = if let Some(value) = value.strip_prefix('<') {
+                value.strip_suffix('>')?
+            } else {
+                value
+            };
+            let (local, domain) = message_id.split_once('@')?;
+            if local.is_empty()
+                || domain.is_empty()
+                || message_id.len() > 998
+                || !message_id.is_ascii()
+                || message_id.contains(['<', '>'])
+                || message_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+            {
+                return None;
+            }
+            Some(message_id)
+        })
+        .filter(|message_id| seen.insert(*message_id))
+        // Hints are optional; retaining more than the request budget cannot
+        // help resolution and would let unrelated metadata grow this cache.
+        .take(MAX_LORE_OPERATIONS)
+        .map(str::to_string)
+        .collect()
 }
 
 pub(crate) fn parse_prerequisite_patch_ids(body: &str) -> Result<Vec<String>> {
@@ -596,6 +639,7 @@ async fn series_from_storage(stored: StoredPrerequisiteSeries) -> Result<Prerequ
 #[async_trait]
 trait PrerequisiteRemote: Send + Sync {
     async fn fetch_series(&self, message_id: &str) -> Result<PrerequisiteSeries>;
+    async fn fetch_thread_patches(&self, message_id: &str) -> Result<Vec<PrerequisitePatch>>;
     async fn search_patch_id(&self, patch_id: &str) -> Result<Vec<PrerequisitePatch>>;
 }
 
@@ -607,6 +651,15 @@ impl PrerequisiteRemote for LorePrerequisiteRemote {
         info!("Fetching prerequisite series {} from lore", message_id);
         let raw = LoreMboxClient::new()?.fetch_thread(message_id).await?;
         series_from_mbox(raw, message_id).await
+    }
+
+    async fn fetch_thread_patches(&self, message_id: &str) -> Result<Vec<PrerequisitePatch>> {
+        info!(
+            "Fetching prerequisite thread {} from lore",
+            redact_secret(message_id)
+        );
+        let raw = LoreMboxClient::new()?.fetch_thread(message_id).await?;
+        patches_from_mbox(raw).await
     }
 
     async fn search_patch_id(&self, patch_id: &str) -> Result<Vec<PrerequisitePatch>> {
@@ -690,44 +743,70 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
         Ok(series)
     }
 
-    async fn load_patch(&mut self, patch_id: &str) -> Result<PrerequisitePatch> {
-        let patch_id = normalize_patch_id(patch_id)?;
-        if let Some(patch) = self.patch_cache.get(&patch_id) {
-            return Ok(patch.clone());
+    async fn cache_local_patches(&mut self, patch_ids: &[String]) -> Result<()> {
+        for patch_id in patch_ids {
+            if self.patch_cache.contains_key(patch_id) {
+                continue;
+            }
+            if let Some((message_id, diff, subject, author, date)) =
+                self.db.get_patch_by_git_patch_id(patch_id).await?
+            {
+                info!(
+                    "Resolved prerequisite patch {} from local message {}",
+                    patch_id, message_id
+                );
+                self.patch_cache.insert(
+                    patch_id.clone(),
+                    PrerequisitePatch {
+                        git_patch_id: patch_id.clone(),
+                        message_id,
+                        subject,
+                        author,
+                        date,
+                        diff,
+                    },
+                );
+            }
         }
-        if let Some((message_id, diff, subject, author, date)) =
-            self.db.get_patch_by_git_patch_id(&patch_id).await?
-        {
-            info!(
-                "Resolved prerequisite patch {} from local message {}",
-                patch_id, message_id
-            );
-            return Ok(PrerequisitePatch {
-                git_patch_id: patch_id,
-                message_id,
-                subject,
-                author,
-                date,
-                diff,
-            });
-        }
+        Ok(())
+    }
 
-        self.count_remote_operation()?;
-        let fetched = self
-            .remote
-            .search_patch_id(&patch_id)
-            .await
-            .with_context(|| format!("failed to fetch prerequisite patch {patch_id} from lore"))?;
-        for mut patch in fetched {
+    fn cache_required_patches(
+        &mut self,
+        wanted: &HashSet<&str>,
+        patches: Vec<PrerequisitePatch>,
+    ) -> Result<()> {
+        for mut patch in patches {
             patch.git_patch_id = normalize_patch_id(&patch.git_patch_id)?;
-            self.patch_cache
-                .entry(patch.git_patch_id.clone())
-                .or_insert(patch);
+            if wanted.contains(patch.git_patch_id.as_str()) {
+                self.patch_cache
+                    .entry(patch.git_patch_id.clone())
+                    .or_insert(patch);
+            }
         }
-        self.patch_cache
-            .get(&patch_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("lore did not return prerequisite patch ID {patch_id}"))
+        Ok(())
+    }
+
+    async fn cache_hinted_patches(
+        &mut self,
+        wanted: &HashSet<&str>,
+        message_ids: &[String],
+    ) -> Result<()> {
+        for message_id in message_ids {
+            if wanted.iter().all(|id| self.patch_cache.contains_key(*id)) {
+                break;
+            }
+            self.count_remote_operation()?;
+            match self.remote.fetch_thread_patches(message_id).await {
+                Ok(patches) => self.cache_required_patches(wanted, patches)?,
+                Err(error) => warn!(
+                    "Prerequisite thread hint {} could not be used: {}",
+                    redact_secret(message_id),
+                    redact_secret(&format!("{error:#}")),
+                ),
+            }
+        }
+        Ok(())
     }
 
     fn append_patch(&mut self, mut patch: PrerequisitePatch) -> Result<()> {
@@ -747,9 +826,39 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
         Ok(())
     }
 
-    async fn resolve_patch_ids(&mut self, patch_ids: &[String]) -> Result<()> {
-        for patch_id in patch_ids {
-            let patch = self.load_patch(patch_id).await?;
+    async fn resolve_patch_ids(
+        &mut self,
+        patch_ids: &[String],
+        message_ids: &[String],
+    ) -> Result<()> {
+        if patch_ids.len() > MAX_PREREQUISITE_PATCH_IDS {
+            bail!("cannot resolve more than {MAX_PREREQUISITE_PATCH_IDS} prerequisite patch IDs");
+        }
+        let patch_ids = patch_ids
+            .iter()
+            .map(|id| normalize_patch_id(id))
+            .collect::<Result<Vec<_>>>()?;
+        let wanted = patch_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        self.cache_local_patches(&patch_ids).await?;
+        self.cache_hinted_patches(&wanted, message_ids).await?;
+
+        // Thread order and extra patches never change b4's declared dependency set.
+        for patch_id in &patch_ids {
+            if !self.patch_cache.contains_key(patch_id) {
+                self.count_remote_operation()?;
+                let fetched = self
+                    .remote
+                    .search_patch_id(patch_id)
+                    .await
+                    .with_context(|| {
+                        format!("failed to fetch prerequisite patch {patch_id} from lore")
+                    })?;
+                self.cache_required_patches(&wanted, fetched)?;
+            }
+            let patch =
+                self.patch_cache.get(patch_id).cloned().ok_or_else(|| {
+                    anyhow!("lore did not return prerequisite patch ID {patch_id}")
+                })?;
             self.append_patch(patch)?;
         }
         Ok(())
@@ -761,7 +870,10 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
         depth: usize,
     ) -> Result<()> {
         match metadata {
-            PrerequisiteMetadata::PatchIds(patch_ids) => self.resolve_patch_ids(&patch_ids).await,
+            PrerequisiteMetadata::PatchIds {
+                patch_ids,
+                message_ids,
+            } => self.resolve_patch_ids(&patch_ids, &message_ids).await,
             PrerequisiteMetadata::BasedOn(message_id) => {
                 self.resolve_series(message_id, depth).await
             }
@@ -863,13 +975,73 @@ pub(crate) async fn resolve_prerequisites_from_lore(
 mod tests {
     use super::*;
     use crate::settings::DatabaseSettings;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum PrerequisiteLookup {
+        Thread(String),
+        PatchId(String),
+    }
+
+    struct LookupRemote<F>(Mutex<F>);
+
+    #[async_trait]
+    impl<F, Fut> PrerequisiteRemote for LookupRemote<F>
+    where
+        F: FnMut(PrerequisiteLookup) -> Fut + Send,
+        Fut: Future<Output = Result<Vec<PrerequisitePatch>>> + Send,
+    {
+        async fn fetch_series(&self, _message_id: &str) -> Result<PrerequisiteSeries> {
+            panic!("b4 thread hints must not resolve Based-on series")
+        }
+
+        async fn fetch_thread_patches(&self, message_id: &str) -> Result<Vec<PrerequisitePatch>> {
+            let future = self.0.lock().expect("lookup mutex poisoned")(PrerequisiteLookup::Thread(
+                message_id.to_string(),
+            ));
+            future.await
+        }
+
+        async fn search_patch_id(&self, patch_id: &str) -> Result<Vec<PrerequisitePatch>> {
+            let future = self.0.lock().expect("lookup mutex poisoned")(
+                PrerequisiteLookup::PatchId(patch_id.to_string()),
+            );
+            future.await
+        }
+    }
+
+    async fn resolve_prerequisite_patches<F, Fut>(
+        db: &Database,
+        patch_ids: &[String],
+        message_ids: &[String],
+        fetch: F,
+    ) -> Result<Vec<PrerequisitePatch>>
+    where
+        F: FnMut(PrerequisiteLookup) -> Fut + Send,
+        Fut: Future<Output = Result<Vec<PrerequisitePatch>>> + Send,
+    {
+        let body = patch_ids
+            .iter()
+            .map(|id| format!("prerequisite-patch-id: {id}"))
+            .chain(
+                message_ids
+                    .iter()
+                    .map(|id| format!("prerequisite-message-id: {id}")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let remote = LookupRemote(Mutex::new(fetch));
+        resolve_prerequisites(db, &remote, 99, None, &body).await
+    }
 
     #[derive(Default)]
     struct FakeRemote {
         series: HashMap<String, PrerequisiteSeries>,
+        thread_results: HashMap<String, Vec<PrerequisitePatch>>,
         patch_results: HashMap<String, Vec<PrerequisitePatch>>,
         series_calls: AtomicUsize,
+        thread_calls: AtomicUsize,
         patch_calls: AtomicUsize,
     }
 
@@ -881,6 +1053,14 @@ mod tests {
                 .get(message_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("no fake series for {message_id}"))
+        }
+
+        async fn fetch_thread_patches(&self, message_id: &str) -> Result<Vec<PrerequisitePatch>> {
+            self.thread_calls.fetch_add(1, Ordering::SeqCst);
+            self.thread_results
+                .get(message_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("no fake thread for {message_id}"))
         }
 
         async fn search_patch_id(&self, patch_id: &str) -> Result<Vec<PrerequisitePatch>> {
@@ -1192,10 +1372,10 @@ mod tests {
             ] {
                 assert_eq!(
                     parse_prerequisite_metadata(&body)?,
-                    Some(PrerequisiteMetadata::PatchIds(vec![
-                        second.to_string(),
-                        first.to_string()
-                    ]))
+                    Some(PrerequisiteMetadata::PatchIds {
+                        patch_ids: vec![second.to_string(), first.to_string()],
+                        message_ids: Vec::new(),
+                    })
                 );
             }
         }
@@ -1234,6 +1414,76 @@ mod tests {
                 "metadata should be rejected: {body:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_normalized_unique_thread_hints() {
+        let body = "prerequisite-message-id: <first@example.com>\r\n\
+                    Prerequisite-Message-Id: second/part%25@example.com\r\n\
+                    prerequisite-message-id: first@example.com\r\n\
+                    > prerequisite-message-id: quoted@example.com\r\n\
+                    \tprerequisite-message-id: indented@example.com\r\n";
+        assert_eq!(
+            parse_prerequisite_message_ids(body),
+            vec!["first@example.com", "second/part%25@example.com"]
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_thread_hints() {
+        let invalid = [
+            "",
+            "no-at-sign",
+            "@example.com",
+            "local@",
+            "a b@example.com",
+            "a\t@example.com",
+            "a\0@example.com",
+            "é@example.com",
+            "<a@example.com",
+            "a@example.com>",
+            "<<a@example.com>>",
+            "a@example.com (comment)",
+        ];
+        for value in invalid {
+            let body = format!("prerequisite-message-id: {value}");
+            assert!(
+                parse_prerequisite_message_ids(&body).is_empty(),
+                "{value:?}"
+            );
+        }
+        let body = format!("prerequisite-message-id: {}@example.com", "x".repeat(998));
+        assert!(parse_prerequisite_message_ids(&body).is_empty());
+    }
+
+    #[test]
+    fn bounds_stored_thread_hints_after_deduplication() {
+        let body = (0..=MAX_LORE_OPERATIONS)
+            .flat_map(|index| {
+                [
+                    format!("prerequisite-message-id: <{index}@example.com>"),
+                    format!("prerequisite-message-id: {index}@example.com"),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hints = parse_prerequisite_message_ids(&body);
+        assert_eq!(hints.len(), MAX_LORE_OPERATIONS);
+        assert_eq!(hints.last().unwrap(), "7@example.com");
+    }
+
+    #[tokio::test]
+    async fn bare_thread_hints_do_not_declare_prerequisite_patches() -> Result<()> {
+        let db = memory_db().await?;
+        let patches = resolve_prerequisites_from_lore(
+            &db,
+            99,
+            None,
+            "prerequisite-message-id: unused@example.com\nprerequisite-patch-id: invalid",
+        )
+        .await?;
+        assert!(patches.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1546,13 +1796,16 @@ mod tests {
             &remote,
             99,
             None,
-            &format!("prerequisite-patch-id: {patch_id}"),
+            &format!(
+                "prerequisite-patch-id: {patch_id}\nprerequisite-message-id: unused@example.com"
+            ),
         )
         .await?;
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].message_id, "local@example.com");
         assert_eq!(remote.patch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.thread_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -2130,6 +2383,419 @@ mod tests {
             remote.patch_calls.load(Ordering::SeqCst),
             MAX_LORE_OPERATIONS - 1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b4_hints_keep_precedence_and_ignore_hinted_thread_metadata() -> Result<()> {
+        let db = memory_db().await?;
+        let raw = [
+            mbox_message(
+                "hint@example.com",
+                "[PATCH 0/1] prerequisite",
+                None,
+                "Based-on: target@example.com\nprerequisite-patch-id: ffffffffffffffffffffffffffffffffffffffff",
+            ),
+            mbox_message(
+                "hint-patch@example.com",
+                "[PATCH 1/1] prerequisite",
+                Some("hint@example.com"),
+                &patch_body("file", "old", "new"),
+            ),
+        ]
+        .concat();
+        let patches = patches_from_mbox(raw.into_bytes()).await?;
+        let wanted = patches[0].git_patch_id.clone();
+        let remote = FakeRemote {
+            thread_results: HashMap::from([("hint@example.com".to_string(), patches)]),
+            ..FakeRemote::default()
+        };
+        let body = format!(
+            "Based-on: target@example.com\nprerequisite-patch-id: {wanted}\nprerequisite-message-id: <hint@example.com>"
+        );
+
+        let resolved =
+            resolve_prerequisites(&db, &remote, 99, Some("target@example.com"), &body).await?;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].git_patch_id, wanted);
+        assert_eq!(remote.thread_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.patch_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_b4_hints_share_the_based_on_operation_budget() -> Result<()> {
+        let db = memory_db().await?;
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let hints = (0..MAX_LORE_OPERATIONS - 2)
+            .map(|index| format!("prerequisite-message-id: missing-{index}@example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body =
+            format!("prerequisite-patch-id: {first}\nprerequisite-patch-id: {second}\n{hints}");
+        let remote = FakeRemote {
+            series: HashMap::from([(
+                "base@example.com".to_string(),
+                sample_series(
+                    "base@example.com",
+                    &body,
+                    vec![sample_patch(
+                        "cccccccccccccccccccccccccccccccccccccccc",
+                        "base-patch@example.com",
+                    )],
+                ),
+            )]),
+            patch_results: HashMap::from([(
+                first.to_string(),
+                vec![sample_patch(first, "first@example.com")],
+            )]),
+            ..FakeRemote::default()
+        };
+
+        let error = resolve_prerequisites(&db, &remote, 99, None, "Based-on: base@example.com")
+            .await
+            .expect_err("series, hints, and searches must share one operation budget");
+
+        assert!(
+            error
+                .to_string()
+                .contains("more than 8 remote Lore operations")
+        );
+        assert_eq!(remote.series_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote.thread_calls.load(Ordering::SeqCst),
+            MAX_LORE_OPERATIONS - 2
+        );
+        assert_eq!(remote.patch_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hints_preserve_patch_id_order_and_ignore_unrequested_patches() -> Result<()> {
+        let db = memory_db().await?;
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let extra = "cccccccccccccccccccccccccccccccccccccccc";
+        let hints = parse_prerequisite_message_ids(
+            "prerequisite-message-id: <series@example.com>\n\
+             prerequisite-message-id: series@example.com\n\
+             prerequisite-message-id: unused@example.com",
+        );
+        let mut calls = Vec::new();
+        let resolved = resolve_prerequisite_patches(
+            &db,
+            &[second.to_string(), first.to_string()],
+            &hints,
+            |lookup| {
+                calls.push(lookup);
+                async {
+                    Ok(vec![
+                        sample_patch(first, "first@example.com"),
+                        sample_patch(extra, "unrelated@example.com"),
+                        sample_patch(second, "second@example.com"),
+                    ])
+                }
+            },
+        )
+        .await?;
+        assert_eq!(
+            calls,
+            vec![PrerequisiteLookup::Thread("series@example.com".into())]
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|p| p.git_patch_id.as_str())
+                .collect::<Vec<_>>(),
+            [second, first]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_hits_are_preserved_when_fetching_other_prerequisites() -> Result<()> {
+        let db = memory_db().await?;
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        insert_local_patch(&db, "local@example.com", "local diff", second).await?;
+        let resolved = resolve_prerequisite_patches(
+            &db,
+            &[first.to_string(), second.to_string()],
+            &["series@example.com".into()],
+            |_| async {
+                Ok(vec![
+                    sample_patch(first, "remote@example.com"),
+                    sample_patch(second, "duplicate@example.com"),
+                ])
+            },
+        )
+        .await?;
+        assert_eq!(resolved[0].message_id, "remote@example.com");
+        assert_eq!(resolved[1].message_id, "local@example.com");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_and_irrelevant_hints_fall_back_to_patch_id_search() -> Result<()> {
+        let db = memory_db().await?;
+        let wanted = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unrelated = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let hints = vec!["missing@example.com".into(), "stale@example.com".into()];
+        let mut calls = Vec::new();
+        let resolved = resolve_prerequisite_patches(&db, &[wanted.to_string()], &hints, |lookup| {
+            calls.push(lookup.clone());
+            async move {
+                match lookup {
+                    PrerequisiteLookup::Thread(id) if id == "missing@example.com" => {
+                        bail!("HTTP 404")
+                    }
+                    PrerequisiteLookup::Thread(_) => {
+                        Ok(vec![sample_patch(unrelated, "wrong@example.com")])
+                    }
+                    PrerequisiteLookup::PatchId(id) => {
+                        assert_eq!(id, wanted);
+                        Ok(vec![sample_patch(wanted, "right@example.com")])
+                    }
+                }
+            }
+        })
+        .await?;
+        assert_eq!(
+            calls,
+            vec![
+                PrerequisiteLookup::Thread(hints[0].clone()),
+                PrerequisiteLookup::Thread(hints[1].clone()),
+                PrerequisiteLookup::PatchId(wanted.to_string()),
+            ]
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].message_id, "right@example.com");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_hints_and_search_results_share_the_exact_patch_cache() -> Result<()> {
+        let db = memory_db().await?;
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let third = "cccccccccccccccccccccccccccccccccccccccc";
+        let ids = [first, second, third].map(str::to_string);
+        let mut calls = Vec::new();
+        let resolved =
+            resolve_prerequisite_patches(&db, &ids, &["series@example.com".into()], |lookup| {
+                calls.push(lookup.clone());
+                async move {
+                    match lookup {
+                        PrerequisiteLookup::Thread(_) => {
+                            Ok(vec![sample_patch(second, "second@example.com")])
+                        }
+                        PrerequisiteLookup::PatchId(id) => {
+                            assert_eq!(id, first);
+                            Ok(vec![
+                                sample_patch(third, "third@example.com"),
+                                sample_patch(first, "first@example.com"),
+                            ])
+                        }
+                    }
+                }
+            })
+            .await?;
+        assert_eq!(
+            calls,
+            vec![
+                PrerequisiteLookup::Thread("series@example.com".into()),
+                PrerequisiteLookup::PatchId(first.to_string()),
+            ]
+        );
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|patch| patch.git_patch_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn last_allowed_hint_can_complete_resolution() -> Result<()> {
+        let db = memory_db().await?;
+        let wanted = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hints = (0..MAX_LORE_OPERATIONS)
+            .map(|i| format!("{i}@example.com"))
+            .collect::<Vec<_>>();
+        let mut calls = 0;
+        let resolved = resolve_prerequisite_patches(&db, &[wanted.to_string()], &hints, |lookup| {
+            calls += 1;
+            let last_hint = PrerequisiteLookup::Thread(hints.last().unwrap().clone());
+            async move {
+                if lookup == last_hint {
+                    Ok(vec![sample_patch(wanted, "found@example.com")])
+                } else {
+                    bail!("unavailable hint")
+                }
+            }
+        })
+        .await?;
+        assert_eq!(calls, MAX_LORE_OPERATIONS);
+        assert_eq!(resolved[0].git_patch_id, wanted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_hints_and_searches_share_the_operation_budget() -> Result<()> {
+        let db = memory_db().await?;
+        let ids = vec![format!("{:040x}", 1), format!("{:040x}", 2)];
+        let hints = (0..MAX_LORE_OPERATIONS - 1)
+            .map(|i| format!("{i}@example.com"))
+            .collect::<Vec<_>>();
+        let mut calls = Vec::new();
+        let error = resolve_prerequisite_patches(&db, &ids, &hints, |lookup| {
+            calls.push(lookup.clone());
+            async move {
+                match lookup {
+                    PrerequisiteLookup::Thread(_) => bail!("unavailable hint"),
+                    PrerequisiteLookup::PatchId(id) => {
+                        Ok(vec![sample_patch(&id, "found@example.com")])
+                    }
+                }
+            }
+        })
+        .await
+        .expect_err("the second search must exceed the shared budget");
+        assert!(
+            error
+                .to_string()
+                .contains("more than 8 remote Lore operations")
+        );
+        assert_eq!(calls.len(), MAX_LORE_OPERATIONS);
+        assert_eq!(
+            calls.last(),
+            Some(&PrerequisiteLookup::PatchId(ids[0].clone()))
+        );
+        Ok(())
+    }
+
+    fn synthetic_mbox(patch_indexes: &[usize], message_count: usize) -> Vec<u8> {
+        let mut mbox = String::new();
+        for index in 0..message_count {
+            mbox.push_str(&format!(
+                "From mboxrd@z Thu Jan  1 00:00:00 1970\nFrom: Author <author@example.com>\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nMessage-ID: <message-{index}@example.com>\n"
+            ));
+            if let Some(patch_index) = patch_indexes.get(index) {
+                mbox.push_str(&format!(
+                    "Subject: [PATCH] prerequisite {patch_index}\n\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old-{patch_index}\n+new-{patch_index}\n\n"
+                ));
+            } else {
+                mbox.push_str("Subject: Re: [PATCH] prerequisite\n\nA discussion reply.\n\n");
+            }
+        }
+        mbox.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn scoped_threads_resolve_large_series_without_expanding_search_results() -> Result<()> {
+        let db = memory_db().await?;
+        let threads = [
+            synthetic_mbox(&(0..16).collect::<Vec<_>>(), 98),
+            synthetic_mbox(&(16..27).collect::<Vec<_>>(), 69),
+            synthetic_mbox(&(27..33).collect::<Vec<_>>(), 37),
+        ];
+        let mut ids = Vec::new();
+        for raw in &threads {
+            ids.extend(
+                patches_from_mbox(raw.clone())
+                    .await?
+                    .into_iter()
+                    .map(|p| p.git_patch_id),
+            );
+        }
+        // Application order must come from the metadata, not thread order.
+        ids.reverse();
+        let broad_search = synthetic_mbox(&(0..33).collect::<Vec<_>>(), 756);
+        let error = patches_from_mbox(broad_search.clone()).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("756 messages, exceeding the limit of 500")
+        );
+        let hints = (0..3)
+            .map(|i| format!("series-{i}@example.com"))
+            .collect::<Vec<_>>();
+        let mut calls = Vec::new();
+        let resolved = resolve_prerequisite_patches(&db, &ids, &hints, |lookup| {
+            calls.push(lookup.clone());
+            let raw = match lookup {
+                PrerequisiteLookup::Thread(id) => {
+                    threads[hints.iter().position(|hint| hint == &id).unwrap()].clone()
+                }
+                PrerequisiteLookup::PatchId(_) => broad_search.clone(),
+            };
+            async move { patches_from_mbox(raw).await }
+        })
+        .await?;
+        assert_eq!(
+            calls,
+            hints
+                .into_iter()
+                .map(PrerequisiteLookup::Thread)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(resolved.len(), 33);
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|p| p.git_patch_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_hint_falls_back_without_relaxing_the_mbox_limit() -> Result<()> {
+        let db = memory_db().await?;
+        let wanted = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut calls = Vec::new();
+        let resolved = resolve_prerequisite_patches(
+            &db,
+            &[wanted.to_string()],
+            &["large@example.com".into()],
+            |lookup| {
+                calls.push(lookup.clone());
+                async move {
+                    match lookup {
+                        PrerequisiteLookup::Thread(_) => {
+                            patches_from_mbox(synthetic_mbox(&[], MAX_MBOX_MESSAGES + 1)).await
+                        }
+                        PrerequisiteLookup::PatchId(id) => {
+                            Ok(vec![sample_patch(&id, "found@example.com")])
+                        }
+                    }
+                }
+            },
+        )
+        .await?;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(resolved[0].git_patch_id, wanted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_failure_preserves_the_underlying_message_limit_error() -> Result<()> {
+        let db = memory_db().await?;
+        let wanted = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let error = resolve_prerequisite_patches(&db, &[wanted.to_string()], &[], |_| async {
+            patches_from_mbox(synthetic_mbox(&[], MAX_MBOX_MESSAGES + 1)).await
+        })
+        .await
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains(wanted));
+        assert!(detail.contains("501 messages, exceeding the limit of 500"));
         Ok(())
     }
 

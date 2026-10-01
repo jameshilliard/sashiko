@@ -28,9 +28,10 @@ prerequisite-patch-id: 8723aa599dcf5b836fb81cf1efb6c9096bf60b7a
 prerequisite-patch-id: 12754335ccf210bcdeaa8a5d60b2280618d50993
 ```
 
-The stable patch IDs identify the exact patch content. The change-ID and
-message-ID markers remain useful to people, but the expanded patch IDs are
-sufficient for Sashiko to resolve and apply the dependencies.
+The stable patch IDs identify the exact patch content and application order.
+Message-ID markers are optional retrieval hints, as described in the
+[thread-hint design](DESIGN_B4_PREREQUISITE_THREAD_HINTS.md). They never add
+dependencies beyond the expanded patch-ID list.
 
 ## Ingestion and Local Lookup
 
@@ -60,29 +61,32 @@ order and discard duplicate IDs. Reject metadata with more than 128 unique
 IDs instead of silently reviewing an incomplete dependency set.
 
 The reviewer already loads the cover-letter body, or the single patch body
-when there is no cover. Resolve each parsed ID in this order:
+when there is no cover. Resolve the parsed IDs in this order:
 
-1. Look for a matching `patches.git_patch_id` in Sashiko's database.
-2. If it is absent, POST a `patchid:<id>` search to lore's public-inbox mbox
-   endpoint, using the same query b4 uses.
-3. Parse the returned thread, calculate stable IDs for its patch messages,
-   and select the exact requested patch.
+1. Look for every required `patches.git_patch_id` in Sashiko's database.
+2. If any IDs are missing, fetch the named `prerequisite-message-id` threads,
+   stopping as soon as all required IDs are found.
+3. For each remaining ID, POST a `patchid:<id>` search to lore's public-inbox
+   mbox endpoint, using the same query b4 uses.
+4. Calculate stable IDs for downloaded patches and retain only exact required
+   matches. Return the patches in their original patch-ID order.
 
-A lore search returns the full matching thread. Cache all patch messages from
-that response for the current resolution operation so multiple prerequisites
-from one series normally require one request. Downloads have compressed and
+A lore search returns the full matching thread. Cache required patch messages
+from that response for the current resolution operation so prerequisites from
+one series normally require one request. Downloads have compressed and
 decompressed size limits and an HTTP timeout. Lore requests share one
 process-wide HTTP client so concurrent and successive reviews reuse pooled
 connections. Connection failures, timeouts, rate limits, and server errors are
 retried twice with bounded backoff before dependency resolution fails.
 Decompression, mbox parsing, and large UTF-8 validation run on the blocking
-pool rather than occupying an asynchronous runtime worker. Thread URLs mutate
-only the path of the configured lore URL, so an untrusted message ID cannot
-replace the request origin.
-One resolution may perform at most eight lore searches. A search normally
-returns an entire prerequisite series, so cached results can satisfy many
-patch IDs without additional requests while unrelated attacker-controlled IDs
-cannot produce an unbounded request stream.
+pool rather than occupying an asynchronous runtime worker. Thread URLs encode
+message IDs as one path segment of the configured lore URL, so untrusted IDs
+cannot replace the request origin or alter the path structure.
+One resolution may perform at most eight lore operations, shared between
+thread hints and searches, including failed lookups. Each response is limited
+to 500 messages. Cached results can satisfy many patch IDs without additional
+requests while unrelated attacker-controlled IDs cannot produce an unbounded
+request stream.
 
 When multiple locally stored revisions have the same stable patch ID, use the
 newest matching message; equal stable patch IDs represent equivalent content

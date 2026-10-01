@@ -1274,7 +1274,10 @@ impl Reviewer {
         {
             Ok(patches) => patches,
             Err(e) => {
-                let message = format!("Failed to resolve prerequisites: {e}\n");
+                let message = format!(
+                    "Failed to resolve prerequisites: {}\n",
+                    redact_secret(&format!("{e:#}")),
+                );
                 error!("{}", message.trim());
                 attempts.push(BaselineAttempt {
                     baseline: "prerequisites".to_string(),
